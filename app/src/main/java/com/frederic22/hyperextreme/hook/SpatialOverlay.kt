@@ -81,6 +81,11 @@ internal object SpatialOverlay {
         uniform float2 uShift;
         uniform float uDkTh;
         uniform float uDim;
+        // 显示区域（2026-11-05）：uv' = uv * uUvScale + uUvOffset。
+        // ⚠️ **两路都必须变换**（深度场 + 颜色），只改一处会让主体轮廓与位移场错位 ——
+        // 和 `SpatialGlCore.FRAG` 那边是同一条约束。
+        uniform float2 uUvScale;
+        uniform float2 uUvOffset;
 
         // **手写 4-tap 双线性**（2026-10-29，问题 3）。
         //
@@ -103,6 +108,7 @@ internal object SpatialOverlay {
             float2 q0 = float2(atan(ndc.x * uK.x) / uSpan.x,
                                atan(ndc.y * uK.y) / uSpan.y);
             float2 uv0 = float2(q0.x * 0.5 + 0.5, 0.5 - q0.y * 0.5);
+            uv0 = uv0 * uUvScale + uUvOffset;
 
             float2 duv = uv0 * uDepthSize;
             float kb = uDepth.eval(duv).r;
@@ -112,6 +118,7 @@ internal object SpatialOverlay {
 
             float2 q = q0 - uShift * k;
             float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+            uv = uv * uUvScale + uUvOffset;
             if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
                 return half4(0.0);
             }
@@ -642,6 +649,10 @@ internal object SpatialOverlay {
                 s.setFloatUniform("uViewSize", w, h)
                 s.setFloatUniform("uK", g[0], g[1])
                 s.setFloatUniform("uSpan", g[2], g[3])
+                // 显示区域：与 GL 同一份值（同一帧读一次，两路共用）
+                val crop = SpatialRenderer.cropUniforms()
+                s.setFloatUniform("uUvScale", crop[0], crop[0])
+                s.setFloatUniform("uUvOffset", crop[1], crop[2])
                 // 位移与 GL **同一公式**（[SpatialRenderer.currentShift]：nx·PAN_RAD/span）。
                 // 这里自己再算一遍迟早漂移 —— 一律走它，主体才跟得住背景。
                 val shift = SpatialRenderer.currentShift(g[2], g[3])

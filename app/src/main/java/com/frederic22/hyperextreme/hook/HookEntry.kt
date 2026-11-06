@@ -110,6 +110,13 @@ class HookEntry : XposedModule() {
             // 改为 SystemUI 的 TYPE_WALLPAPER 窗口实现（见 ParallaxWallpaperWindow）。
             return
         }
+        if (param.packageName == AICR_PACKAGE) {
+            // AICR 服务端兜底（2026-11-05）：部分设备直连 getPluginBinder 返回空 + Status=-1。
+            // 这里只挂服务端方法，诊断 + 插件管理器兜底；拿不到类就静默跳过。
+            HookRuntime.log("AICR 包就绪：安装插件兜底 hook")
+            guard("AICR 插件兜底") { AicrHook.install(this, param.classLoader) }
+            return
+        }
         if (param.packageName != TARGET_PACKAGE) return
         val loader = param.classLoader
         HookRuntime.log("目标包就绪：${param.packageName}，开始安装 hook")
@@ -256,6 +263,57 @@ class HookEntry : XposedModule() {
                 } catch (t: Throwable) {
                     // 轮询线程不许死
                     HookRuntime.log("SPATIAL 轮询异常：${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
+        }.apply { isDaemon = true }.start()
+        // 「光栅壁纸」渲染器开关轮询（2026-11-04）：与上面空间壁纸那条**完全独立** ——
+        // 两套壁纸各自一个渲染器、各自一组属性（`raster_*` vs `spatial_*`），互不读对方。
+        // 每秒看一次；active/key/scope 一起读，避免"active 已刷新、scope 还是旧的"。
+        Thread {
+            var lastKey: String? = null
+            var lastScope = Int.MIN_VALUE
+            var tick = 0
+            HookRuntime.log(
+                "RASTER 轮询已启动（监听属性 ${com.frederic22.hyperextreme.data.RasterFlag.PROP_ACTIVE}）",
+            )
+            while (true) {
+                try {
+                    Thread.sleep(1000)
+                    tick++
+                    val active = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.RasterFlag.PROP_ACTIVE,
+                    ).trim() == "1"
+                    val key = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.RasterFlag.PROP_KEY,
+                    ).trim()
+                    val scope = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.RasterFlag.PROP_SCOPE,
+                    ).trim().toIntOrNull()?.takeIf { it in 0..2 } ?: MaskPrefs.SPATIAL_SCOPE_LOCK
+                    if (tick <= 3 || tick % 60 == 0) {
+                        HookRuntime.log(
+                            "RASTER 轮询 tick=$tick active=$active key=$key scope=$scope " +
+                                "last=$lastKey/$lastScope",
+                        )
+                    }
+                    if (active && key.isNotEmpty()) {
+                        if (key != lastKey || scope != lastScope) {
+                            val ctx = HookRuntime.appContext()
+                            if (ctx != null) {
+                                HookRuntime.log("RASTER 开关=开 key=$key scope=$scope → 启动渲染器")
+                                RasterRenderer.start(ctx, key, scope)
+                                lastKey = key
+                                lastScope = scope
+                            }
+                        }
+                    } else if (lastKey != null) {
+                        HookRuntime.log("RASTER 开关=关 → 停止渲染器")
+                        RasterRenderer.stop()
+                        lastKey = null
+                        lastScope = Int.MIN_VALUE
+                    }
+                } catch (t: Throwable) {
+                    // 轮询线程不许死
+                    HookRuntime.log("RASTER 轮询异常：${t.javaClass.simpleName}: ${t.message}")
                 }
             }
         }.apply { isDaemon = true }.start()
@@ -1392,13 +1450,21 @@ class HookEntry : XposedModule() {
          * 起因：排查时连续几轮都只能看到旧的「已挂」日志，无法区分"没装新包"和"新逻辑没跑到"。
          * **每次改动都更新它。**
          */
-        const val BUILD_TAG = "2026-11-02.13-40 v1.5.99（关于页开源许可清单收口：libxposed 地址改官方仓库、DA V2 补 Small、HyperChanger 标 v1.1.3（上游已换 AGPL）、补 ONNX Runtime 与 PatchMatch 两条 MIT）"
+        const val BUILD_TAG = "2026-11-06.19-40 v1.17.7 / v0.5 Beta2（新增 com.xiaomi.aicr 作用域：4.13.8 访问校验绕过改为「自实现 case 1 分发」—— 反射调父类 Stub 会因 Method.invoke 虚分派递归栈溢出，改成自己读 Parcel 调实现再按 AIDL 原格式写回；首次下载 Status=1 时最多等 45s 轮询。空间/光栅：AOD 归位/压暗 tick 加代际校验 + 亮屏兜底解冻，修传感器偶发不恢复；AOD 直接解锁不经过 onExitAod ⇒ 解锁无条件复位压暗与冻结；「仅桌面档」挂共用 leash 时不再丢掉唯一一份桌面层，锁屏态用 alpha 自隐。视差：主体位移加标记，只在实际动过之后复位，避免覆盖系统 AOD 的 0.95 缩放。光栅/空间组顺序持久化：应用 / 新建置顶、关闭不清，修「重开跳回原位」）"
 
         /** 第二个作用域（2026-09-28 起）：只为了锁屏那个「自定义锁屏」按钮的层级。 */
         const val SYSTEM_UI_PACKAGE = "com.android.systemui"
 
         /** 第三个作用域（2026-10-21 起）：壁纸进程，只装「同一张壁纸」只读探针（WPROBE）。 */
         const val WALLPAPER_PACKAGE = "com.miui.miwallpaper"
+
+        /**
+         * 第四个作用域（2026-11-05 起）：小米澎湃 AI 引擎。
+         *
+         * 只装 [AicrHook]（服务端 `getPluginBinder` 诊断 + 插件管理器兜底），
+         * 不碰它的任何业务逻辑；拿不到类就直接跳过。
+         */
+        const val AICR_PACKAGE = "com.xiaomi.aicr"
 
         /** 锁屏编辑子进程（`com.miui.aod:keyguardeditor`）—— 编辑器扩展（时钟深浅）只装这里，见 [isKeyguardEditorProcess]。 */
         const val KEYGUARD_EDITOR_PROCESS = "com.miui.aod:keyguardeditor"

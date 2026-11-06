@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -64,6 +65,7 @@ import com.frederic22.hyperextreme.data.MiuiHomePackageName
 import com.frederic22.hyperextreme.data.MiuiWallpaperPackageName
 import com.frederic22.hyperextreme.data.SystemUiPackageName
 import com.frederic22.hyperextreme.hook.HookRuntime
+import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
@@ -232,6 +234,14 @@ internal fun FunctionHome(onOpen: (DetailPage) -> Unit) {
             packageName = MiuiWallpaperPackageName,
             title = "空间壁纸",
             onClick = { onOpen(DetailPage.SpatialWallpaper) },
+        )
+        // 「光栅壁纸」（2026-11-03）：转动手机在 2~4 张图之间渐变过渡 + 主体景深。
+        // 渲染层计划复用空间壁纸那套 GL；图标/包名与空间壁纸保持一致（同样是壁纸层的事）。
+        // 当前二级页只是**主体验证**（系统 AI 能不能给遮罩），还不是完整功能。
+        AppEntryCard(
+            packageName = MiuiWallpaperPackageName,
+            title = "光栅壁纸",
+            onClick = { onOpen(DetailPage.RasterWallpaper) },
         )
         AppEntryCard(
             packageName = SystemUiPackageName,
@@ -479,8 +489,10 @@ internal fun ParallaxBgDetail(state: MaskUiState, onPick: () -> Unit) {
     val haptic = rememberClickHaptic()
     val ctx = LocalContext.current
     val prefs = remember { MaskPrefs(ctx) }
-    // 功能冲突弹窗（空间壁纸正在生效时点「立即替换」）
+    val scope = rememberCoroutineScope()
+    // 功能冲突弹窗（2026-11-04 起三侧统一：空间 / 光栅任一在跑都不许应用）
     var showConflict by remember { mutableStateOf(false) }
+    var conflictOther by remember { mutableStateOf<RunningWallpaper?>(null) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -519,9 +531,17 @@ internal fun ParallaxBgDetail(state: MaskUiState, onPick: () -> Unit) {
                                 state.parallaxActive -> state.disableParallax()
                                 // **最后**才查互斥：激活 / busy 这些「本来就能不能开」的条件
                                 // 已经过了（它们不满足时自己会弹 toast），这时才轮到外部状态。
-                                prefs.spatialActive && prefs.spatialKey.isNotEmpty() ->
-                                    showConflict = true
-                                else -> state.enableParallax()
+                                else -> {
+                                    // 统一检测（空间 / 光栅，含两种挂载模式）；
+                                    // 「正在运行的名字要对」—— 文案由实际命中的那条拼。
+                                    val other = WallpaperConflict.running(ctx, state, WallpaperChain.PARALLAX)
+                                    if (other != null) {
+                                        conflictOther = other
+                                        showConflict = true
+                                    } else {
+                                        state.enableParallax()
+                                    }
+                                }
                             }
                         }
                     },
@@ -544,11 +564,16 @@ internal fun ParallaxBgDetail(state: MaskUiState, onPick: () -> Unit) {
     // **不继续**本次替换；要再点一次「立即替换」才生效（用户 2026-10-29 定）。
     FeatureConflictDialog(
         show = showConflict,
-        summary = "当前空间壁纸已生效，应用视差壁纸需先关闭",
-        onDismissRequest = { showConflict = false },
-        onConfirmClose = {
+        summary = conflictOther?.let { WallpaperConflict.summary(it, WallpaperChain.PARALLAX) } ?: "",
+        onDismissRequest = {
             showConflict = false
-            SpatialControl.disable(ctx)
+            conflictOther = null
+        },
+        onConfirmClose = {
+            val other = conflictOther
+            showConflict = false
+            conflictOther = null
+            if (other != null) scope.launch { WallpaperConflict.disable(ctx, state, other) }
         },
     )
 }
@@ -752,7 +777,7 @@ private fun ParallaxParamsCard(state: MaskUiState, modifier: Modifier = Modifier
  * 模糊半径滑块同款排布 / 字体）。
  */
 @Composable
-private fun ParallaxSliderRow(
+internal fun ParallaxSliderRow(
     title: String,
     /** 右侧实时数值（倍率 "1.15" / 幅度 "45 px"）。 */
     text: String,
@@ -793,7 +818,7 @@ private fun ParallaxSliderRow(
 }
 
 /** 滑块的步进数（"步进 1 个单位" = 段数−1；段数按范围跨度取整）——幅度（px）与角度（°）共用。 */
-private fun sliderSteps(range: ClosedFloatingPointRange<Float>): Int =
+internal fun sliderSteps(range: ClosedFloatingPointRange<Float>): Int =
     ((range.endInclusive - range.start).roundToInt() - 1).coerceAtLeast(0)
 
 /** 倍率显示（"1.15"；Locale.US 防止小数点被本地化成逗号）。 */

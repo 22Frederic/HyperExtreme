@@ -99,6 +99,87 @@ internal object SpatialDepth {
     /** 深度缓存根目录。 */
     fun cacheRoot(ctx: Context): File = File(ctx.filesDir, "spatial")
 
+    /**
+     * 一张**候选图**（2026-11-04，二级页改卡片式后引入）。
+     *
+     * 候选就是 `files/spatial/<key>/` 这个目录本身 —— **不需要新的数据结构**：
+     * 深度、层图、原图副本全在里面，key 就是身份。
+     */
+    internal data class SpatialCandidate(
+        val key: String,
+        /** 卡片封面：优先原图副本 `source`，退化到层图 `layers/layer0.png`。都没有 = null（只显示底色）。 */
+        val cover: File?,
+        /** 有没有原图副本。**没有的不能重算深度**（`generate` 需要原图 uri）。 */
+        val hasSource: Boolean,
+        /** 深度 + 层图是否齐（决定「应用」能不能用、按钮三态）。 */
+        val hasLayers: Boolean,
+        /** 这张图的「显示区域」参数（`crop.json`，没有就是默认 = 不调整）。 */
+        val crop: SpatialCrop.Crop = SpatialCrop.DEFAULT,
+        /**
+         * 封面图的**宽高比**（w/h）。
+         *
+         * 卡片要把 crop 反映到封面上，需要用它 + 屏幕比例算出 `Geometry.visibleHalf`。
+         * 读的是文件头（`inJustDecodeBounds`），几乎零成本；读不出来回 1f。
+         */
+        val aspect: Float = 1f,
+    )
+
+    /**
+     * 枚举所有候选（2026-11-04）。
+     *
+     * ## 为什么要 `source → layer0` 退路
+     *
+     * 真机实测 5 个缓存目录里，**3 个只有深度和层图、没有 `source`**（早期版本不写原图副本）。
+     * 这些图仍然可用、可替换，只是不能重算深度 —— 封面必须能从 `layer0.png` 拿到，
+     * 否则卡片一片空白。
+     *
+     * @param order 用户排定的顺序（`MaskPrefs.spatialCandidateOrder`）。不在里面的
+     *   （新导入 / 老数据 / 手动拷入）按**目录修改时间倒序**追加到末尾。
+     */
+    fun listCandidates(ctx: Context, order: List<String> = emptyList()): List<SpatialCandidate> {
+        val found = runCatching {
+            cacheRoot(ctx).listFiles()
+                ?.asSequence()
+                ?.filter { it.isDirectory && it.name.length == 16 }
+                ?.mapNotNull { dir ->
+                    val source = File(dir, SOURCE_NAME).takeIf { it.isFile && it.length() > 0L }
+                    val layers = File(dir, "layers")
+                    val layer0 = File(layers, "layer0.png").takeIf { it.isFile }
+                    val cover = source ?: layer0
+                    // 三样都没有 ⇒ 空壳目录（删了一半 / 生成失败），不算候选
+                    if (cover == null && !File(dir, "depth.png").isFile) return@mapNotNull null
+                    SpatialCandidate(
+                        key = dir.name,
+                        cover = cover,
+                        hasSource = source != null,
+                        hasLayers = SpatialLayers.hasLayers(dir),
+                        crop = SpatialCrop.read(ctx, dir.name),
+                        aspect = aspectOf(cover),
+                    ) to dir.lastModified()
+                }
+                ?.toList()
+                .orEmpty()
+        }.getOrDefault(emptyList())
+
+        if (order.isEmpty()) return found.sortedByDescending { it.second }.map { it.first }
+        val rank = order.withIndex().associate { (i, k) -> k to i }
+        // `order` 里有的按 rank；没有的排到末尾，彼此之间按 mtime 倒序（新的在前）。
+        return found
+            .sortedWith(
+                compareBy({ rank[it.first.key] ?: Int.MAX_VALUE }, { -it.second }),
+            )
+            .map { it.first }
+    }
+
+
+    /** 读文件头拿宽高比（`inJustDecodeBounds`，不解码像素）。读不出来回 1f。 */
+    private fun aspectOf(file: File?): Float = runCatching {
+        if (file == null || !file.isFile) return 1f
+        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, o)
+        if (o.outWidth > 0 && o.outHeight > 0) o.outWidth.toFloat() / o.outHeight else 1f
+    }.getOrDefault(1f)
+
     /** 图片内容哈希（缓存键）。UI 用它判断「这张图有没有缓存」。 */
     fun cacheKey(ctx: Context, uri: Uri): String = sha16(ctx, uri)
 

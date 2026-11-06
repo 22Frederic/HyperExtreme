@@ -81,6 +81,117 @@ class MaskPrefs(context: Context) {
     }
 
     /**
+     * 光栅壁纸**当前使用中的组 id**；空串 = 还没应用任何一套。
+     *
+     * 组的内容不在这里（`files/raster/` 目录即真相），这里只留一个指针。
+     * 渲染链接进来后，hook 侧透过 [MaskProvider] 的 `config` 快照也读它。
+     */
+    val rasterActiveId: String
+        get() = prefs.getString(KEY_RASTER_ACTIVE, "").orEmpty()
+
+    /** 写入当前使用的光栅组 id；传 null = 取消应用。 */
+    fun setRasterActiveId(id: String?) {
+        prefs.edit().putString(KEY_RASTER_ACTIVE, id.orEmpty()).commit()
+    }
+
+    /**
+     * 光栅壁纸的**挂载模式**（0 = LSPosed / 1 = 系统壁纸服务）。
+     *
+     * 两种模式互斥：LSPosed 走 hook 链（属性 → SystemUI 里挂 leash），服务模式走
+     * 自己的 [com.frederic22.hyperextreme.wallpaper.RasterWallpaperService]（免 root，
+     * 由系统壁纸页决定生效范围）。运行中不允许切换。
+     */
+    val rasterMountMode: Int
+        get() = prefs.getInt(KEY_RASTER_MOUNT_MODE, 0).coerceIn(0, 1)
+
+    fun setRasterMountMode(value: Int) {
+        prefs.edit().putInt(KEY_RASTER_MOUNT_MODE, value).commit()
+    }
+
+    /** 光栅壁纸生效范围（0 锁屏 / 1 桌面 / 2 全局）；**只对 LSPosed 模式有效**。 */
+    val rasterScope: Int
+        get() = prefs.getInt(KEY_RASTER_SCOPE, 0).takeIf { it in 0..2 } ?: 0
+
+    fun setRasterScope(value: Int) {
+        prefs.edit().putInt(KEY_RASTER_SCOPE, value).commit()
+    }
+
+    /** 启用光栅壁纸锁屏景深（默认关）；**只对 LSPosed 模式有效**。 */
+    val rasterLockDepth: Boolean
+        get() = prefs.getBoolean(KEY_RASTER_LOCK_DEPTH, false)
+
+    fun setRasterLockDepth(value: Boolean) {
+        prefs.edit().putBoolean(KEY_RASTER_LOCK_DEPTH, value).commit()
+    }
+
+    /**
+     * 光栅壁纸的**最大幅度角度**（度，15..45，默认 25）—— 2026-11-04 用户要求。
+     *
+     * 语义：从第一张擦到最后一张需要的**横向转角**。值越大越"钝"（要转更多才换一张）。
+     *
+     * 默认 25 就是 `RasterGlCore.PAN_MAX_RAD` 的值 —— 加这个选项之前的唯一行为。
+     * 与视差页的「最大幅度角度」（`PARALLAX_GYRO_DEG_*`）量程 / 步进 / 默认完全一致，
+     * 但**存的是两个独立的值**：两条链的渲染目标不同，耦合在一起会互相改。
+     *
+     * 生效时机与「生效范围」一致：生效中改只写 prefs，下一次「应用 / 跳转系统页」才下发。
+     */
+    val rasterMaxAngle: Int
+        get() = prefs.getInt(KEY_RASTER_MAX_ANGLE, RASTER_ANGLE_DEFAULT)
+            .coerceIn(RASTER_ANGLE_MIN, RASTER_ANGLE_MAX)
+
+    fun setRasterMaxAngle(value: Int) {
+        prefs.edit().putInt(KEY_RASTER_MAX_ANGLE, value.coerceIn(RASTER_ANGLE_MIN, RASTER_ANGLE_MAX))
+            .commit()
+    }
+
+    /**
+     * 「停顿时就近归位」（默认**开**）—— 2026-11-04 用户要求。
+     *
+     * 开 = 现有行为：静止 `SNAP_DELAY_MS` 后，若停在两张之间（擦了一半），就近补完这一擦
+     * （过半擦到下一张，不到一半退回上一张）。
+     *
+     * 关 = **停在一半不动**：两张图的过渡态就保持在那儿，用户可以自己决定停在哪。
+     * 两种挂载模式都有效（服务版从 `RasterServiceTarget` 的 `settle` 读）。
+     */
+    val rasterSettle: Boolean
+        get() = prefs.getBoolean(KEY_RASTER_SETTLE, true)
+
+    fun setRasterSettle(value: Boolean) {
+        prefs.edit().putBoolean(KEY_RASTER_SETTLE, value).commit()
+    }
+
+    /**
+     * **光栅壁纸的「壁纸基准」**（2026-11-05 加）。
+     *
+     * 用途与 [spatialWallpaperFp] 完全同构：aod 侧的换壁纸检测拿它当基准，
+     * 判据一变就自动关闭光栅壁纸（**没有开关，无条件关**）。
+     *
+     * * 写入时机：点「应用」成功时记一次；
+     * * 清空时机：手动 / 自动关闭时；
+     * * 空 / `FINGERPRINT_WEAK` ⇒ hook 侧**惰性补记、不动作**（老版本升上来的升级保护）。
+     */
+    val rasterWallpaperFp: String
+        get() = prefs.getString(KEY_RASTER_FP, "").orEmpty()
+
+    fun setRasterWallpaperFp(value: String) {
+        if (value == rasterWallpaperFp) return
+        prefs.edit().putString(KEY_RASTER_FP, value).commit()
+    }
+
+    /**
+     * 「切到系统壁纸服务模式」的功能提醒**是否已被用户勾掉**（默认 false）。
+     *
+     * ⚠️ 与 [spatialMountWarned] **完全独立**：两套壁纸各有各的提示。用户在空间壁纸那边
+     * 勾了"以后不再弹"，不代表他看过光栅这边的说明 —— 共用一个值会让后者静默错过。
+     */
+    val rasterMountWarned: Boolean
+        get() = prefs.getBoolean(KEY_RASTER_MOUNT_WARNED, false)
+
+    fun setRasterMountWarned(value: Boolean) {
+        prefs.edit().putBoolean(KEY_RASTER_MOUNT_WARNED, value).commit()
+    }
+
+    /**
      * 空间壁纸「**启用空间壁纸锁屏景深**」（默认关，2026-10-29 用户要求）。
      *
      * 开 = 主体层额外画进 SystemUI 窗口的 `keyguard_foreground_layer`，压在锁屏时钟**之上**
@@ -164,6 +275,26 @@ class MaskPrefs(context: Context) {
     }
 
     /**
+     * 上一次「应用」时记下的 **key 与 crop.json 的 mtime**（2026-11-05）。
+     *
+     * 用途：判断「同一张图、但显示区域被改过」—— 这种情况必须让 SystemUI 重建渲染器
+     * （crop 是启动时读一次的，同 key 的推送会被轮询层直接跳过）。
+     * 两个值要一起看：换了 key 的场景本来就会重建，不需要这条兜底。
+     */
+    val spatialAppliedCropKey: String
+        get() = prefs.getString(KEY_SPATIAL_APPLIED_CROP_KEY, "").orEmpty()
+
+    val spatialAppliedCropStamp: Long
+        get() = prefs.getLong(KEY_SPATIAL_APPLIED_CROP_STAMP, 0L)
+
+    fun setSpatialAppliedCrop(key: String, stamp: Long) {
+        prefs.edit().apply {
+            putString(KEY_SPATIAL_APPLIED_CROP_KEY, key)
+            putLong(KEY_SPATIAL_APPLIED_CROP_STAMP, stamp)
+        }.commit()
+    }
+
+    /**
      * **最近一次生成成功**的图层缓存键（即使还没生效也记着）。
      *
      * 为什么要持久化：页面里的 `picked` 是 `remember`，一退页面就没了、缓存键也跟着丢，
@@ -179,14 +310,52 @@ class MaskPrefs(context: Context) {
     /**
      * 最近一次**选中**的图（候选）的缓存键；空串 = 当前没有选中任何图。
      *
-     * 「清空选择」清的就是它（以及页面里的预览），**不动** `spatialLastKey` ——
-     * 已经生成好的层图仍可以「立即替换」，只是候选框空着。
+     * 「清空选择」清的就是它（以及页面里的预览）—— 2026-11-03 起**连 `spatialLastKey` 一起清**：
+     * 清空后点「立即替换」应当提示「请先选择图片」，而不是拿上一次的缓存直接替换。
+     * 磁盘上的层图不删，重新选同一张图仍命中缓存。
      */
     val spatialSourceKey: String
         get() = prefs.getString(KEY_SPATIAL_SOURCE_KEY, "").orEmpty()
 
     fun setSpatialSourceKey(key: String?) {
         prefs.edit().putString(KEY_SPATIAL_SOURCE_KEY, key.orEmpty()).commit()
+    }
+
+    /**
+     * 候选图的**排列顺序**（2026-11-04，二级页改卡片式后引入）。
+     *
+     * 候选本身来自 `files/spatial/<key>/` 的目录扫描，顺序不能靠文件系统（不稳定）。
+     * 这里只存 key 的先后（逗号分隔的 16 位 hex）；不在列表里的目录按 mtime 追加到末尾。
+     * 新导入的图**追加到最前**（用户 2026-11-04：新建卡点出来的图直接是最新那张）。
+     */
+    val spatialCandidateOrder: List<String>
+        get() = prefs.getString(KEY_SPATIAL_CANDIDATE_ORDER, "").orEmpty()
+            .split(',')
+            .filter { it.length == 16 }
+
+    fun setSpatialCandidateOrder(keys: List<String>) {
+        prefs.edit()
+            .putString(KEY_SPATIAL_CANDIDATE_ORDER, keys.filter { it.length == 16 }.joinToString(","))
+            .commit()
+    }
+
+    /**
+     * 光栅壁纸组的**显示顺序**（2026-11-05）。
+     *
+     * 以前「正在应用的组置顶」只是加载时的内存排序（`sortedByDescending { id == active }`）
+     * ⇒ 一关应用顺序就跳回创建时间序，卡片"跑回原位"。
+     * 改成持久化：应用 / 新建时把 id 写到最前，**关闭不动它**。
+     * 不在列表里的组（老数据 / 手动拷进来的目录）按创建时间倒序追加到末尾。
+     */
+    val rasterGroupOrder: List<String>
+        get() = prefs.getString(KEY_RASTER_GROUP_ORDER, "").orEmpty()
+            .split(',')
+            .filter { it.isNotEmpty() }
+
+    fun setRasterGroupOrder(ids: List<String>) {
+        prefs.edit()
+            .putString(KEY_RASTER_GROUP_ORDER, ids.filter { it.isNotEmpty() }.joinToString(","))
+            .commit()
     }
 
     /**
@@ -771,6 +940,10 @@ class MaskPrefs(context: Context) {
         const val KEY_SPATIAL_SHORT_SIDE = "spatial_short_side"
         /** 空间壁纸是否生效（SystemUI 侧轮询）。 */
         const val KEY_SPATIAL_ACTIVE = "spatial_active"
+
+        /** 「应用」时记下的 crop 指纹（见 `spatialAppliedCropKey`）。 */
+        const val KEY_SPATIAL_APPLIED_CROP_KEY = "spatial_applied_crop_key"
+        const val KEY_SPATIAL_APPLIED_CROP_STAMP = "spatial_applied_crop_stamp"
         /** 当前生效的图层缓存键（图片 sha256 前 16 位）。 */
         const val KEY_SPATIAL_KEY = "spatial_key"
         /** 最近一次**生成成功**的图层缓存键（不管有没有生效）。 */
@@ -783,10 +956,53 @@ class MaskPrefs(context: Context) {
          * 用户选的那张原图，避免出现「预览显示着、实际却没选中」的状态。
          */
         const val KEY_SPATIAL_SOURCE_KEY = "spatial_source_key"
+
+        /** 候选图的排列顺序（逗号分隔的 16 位 hex key）。 */
+        const val KEY_SPATIAL_CANDIDATE_ORDER = "spatial_candidate_order"
         /** 空间壁纸生效范围（0 锁屏 / 1 桌面 / 2 全局）。 */
         const val KEY_SPATIAL_SCOPE = "spatial_scope"
         /** 「启用空间壁纸锁屏景深」（默认关；关时渲染逻辑与加它之前完全一致）。 */
         const val KEY_SPATIAL_LOCK_DEPTH = "spatial_lock_depth"
+
+        /**
+         * 光栅壁纸**当前使用中的组 id**（空 = 没有应用任何一套）。
+         *
+         * 组本身的数据只存在 `files/raster/<id>/`（目录即真相，见 `RasterStore`），
+         * 这里只记一个 id —— 它不参与渲染判定（渲染链还没做），
+         * 但界面靠它区分「正在使用 / 应用」，将来渲染链也直接读这一份。
+         */
+        const val KEY_RASTER_ACTIVE = "raster_active_id"
+
+        /** 光栅壁纸的挂载模式 / 生效范围 / 锁屏景深 / 最大幅度角度 / 停顿时就近归位。 */
+        const val KEY_RASTER_MOUNT_MODE = "raster_mount_mode"
+        const val KEY_RASTER_SCOPE = "raster_scope"
+        const val KEY_RASTER_LOCK_DEPTH = "raster_lock_depth"
+        const val KEY_RASTER_MAX_ANGLE = "raster_max_angle"
+        const val KEY_RASTER_SETTLE = "raster_settle"
+
+        /** 光栅组的显示顺序（逗号分隔的组 id）—— 应用 / 新建置顶后持久化，2026-11-05。 */
+        const val KEY_RASTER_GROUP_ORDER = "raster_group_order"
+
+        /**
+         * 光栅壁纸的**壁纸基准**（2026-11-05 加）。
+         *
+         * 与空间的 [KEY_SPATIAL_FP] 完全同构：aod 侧的换壁纸检测拿它当比对值，
+         * 判据一变就自动关闭光栅壁纸（**没有开关，无条件关** —— 与空间同语义）。
+         */
+        const val KEY_RASTER_FP = "raster_wallpaper_fp"
+
+        /** 光栅「最大幅度角度」量程与默认值（与视差页同名项一致：15~45°、步进 1°、默认 25°）。 */
+        const val RASTER_ANGLE_MIN = 15
+        const val RASTER_ANGLE_MAX = 45
+        const val RASTER_ANGLE_DEFAULT = 25
+
+        /**
+         * 光栅壁纸「功能提醒」弹窗的「以后不再弹出」。
+         *
+         * ⚠️ 与 [KEY_SPATIAL_MOUNT_WARNED] **必须是两个独立的值**（用户 2026-11-04 明确）：
+         * 两套壁纸的提示内容不同，勾掉一套不该让另一套静默消失。
+         */
+        const val KEY_RASTER_MOUNT_WARNED = "raster_mount_warned"
 
         /**
          * **挂载模式**（2026-10-30）：空间壁纸怎么加载。
@@ -823,6 +1039,11 @@ class MaskPrefs(context: Context) {
         const val SPATIAL_MOUNT_SERVICE = 1
         /** 合法档位白名单 —— 读到意外的值就回默认（LSPosed）。 */
         private val SPATIAL_MOUNT_CHOICES = intArrayOf(SPATIAL_MOUNT_LSPOSED, SPATIAL_MOUNT_SERVICE)
+
+        /** 光栅挂载模式：LSPosed（hook 链，默认）。 */
+        const val RASTER_MOUNT_LSPOSED = 0
+        /** 光栅挂载模式：系统壁纸服务（免 root，由系统壁纸页决定生效范围）。 */
+        const val RASTER_MOUNT_SERVICE = 1
         /** 空间壁纸推理短边默认值（合法档位与 `SpatialDepth.SHORT_SIDES` 保持一致）。 */
         const val SPATIAL_SHORT_DEFAULT = 768
         /** 合法档位白名单 —— 读到意外的值就回默认，避免下拉栏 index 越界。 */

@@ -255,7 +255,19 @@ internal object SpatialRenderer {
     @Volatile
     private var sharedLeash = false
 
-    /** 上次应用的探针值（热切换用）。 */
+    /**
+     * **仅桌面档 + 共用 leash**（2026-11-05，问题一）。
+     *
+     * 同一张壁纸时桌面 token 为 null，仅桌面档又只有桌面一份 mount ——
+     * 原来会被"共用 leash 丢弃桌面份"的规则丢掉，`mounted` 为空 ⇒ 渲染器直接失败，
+     * 表现为「点应用不生效」。现在保留它并挂到唯一那条 leash 上，
+     * 再由 [setDeskOnlyAlpha] 在锁屏时隐掉（否则"仅桌面"会变成"全局"）。
+     */
+    @Volatile
+    private var desktopOnlyShared = false
+
+    /** 仅桌面档在共用 leash 上的当前 alpha（-1 = 还没设过，强制写一次）。 */
+    private var deskOnlyAlpha = -1f
 
     /**
      * **锁屏那一份**的 SC —— 解锁淡出 / 复位只作用于它。
@@ -274,6 +286,8 @@ internal object SpatialRenderer {
     private var uK = 0
     private var uSpan = 0
     private var uShift = 0
+    private var uUvScale = 0
+    private var uUvOffset = 0
     private var uTex = 0
     private var uOpaque = 0
     private var uDepth = 0
@@ -355,8 +369,27 @@ internal object SpatialRenderer {
      */
     internal fun lockDepthOn(): Boolean = runningKey != null && runningLockDepth
 
+    // ── 显示区域（2026-11-04）──
+    //
+    // 由独立编辑页 `SpatialCropActivity` 写进 `files/spatial/<key>/crop.json`，
+    // 这里**启动读一次**换算成 shader 的两个 uniform（uv' = uv * scale + offset）。
+    // 与「生效范围 / 最大幅度角度」同语义：生效中改不重载，下一次替换才生效。
+    @Volatile private var runningCropScale = 1f
+    @Volatile private var runningCropOffX = 0f
+    @Volatile private var runningCropOffY = 0f
+
     /** 选择性融合的深度差阈值 —— AGSL 侧必须与 GL 用同一个值。 */
     internal fun dkThreshold(): Float = DK_TH
+
+    /**
+     * 当前「显示区域」的三个 uniform：`[scale, offsetX, offsetY]`。
+     *
+     * 景深主体层（[SpatialOverlay]）必须用**同一组**值给自己的两路采样做仿射，
+     * 否则背景被裁、主体不裁 ⇒ 主体整体错位。
+     * 和 [geometry] 一样：同一帧只读一次，两个 uniform 共用。
+     */
+    internal fun cropUniforms(): FloatArray =
+        floatArrayOf(runningCropScale, runningCropOffX, runningCropOffY)
 
     /** 当前姿态（弧度）：`[yaw, pitch]`。 */
     internal fun attitude(): FloatArray = floatArrayOf(yaw, pitch)
@@ -476,6 +509,28 @@ internal object SpatialRenderer {
     /** AOD 归位驱动（null = 没有在跑）。只在 GL 线程读写。 */
     private var aodHomeTick: Runnable? = null
 
+    /**
+     * **归位 / 压暗动画的代际号**（2026-11-05 v1.17.6）。
+     *
+     * 为什么需要：两条动画都是 handler tick，`removeCallbacks` 只能摘掉**还没出队**的那条；
+     * 只要 tick 已经出队正在跑，取消就落空，它会在结尾把 `aodFrozen` 又写成 true、
+     * 把 `aodDim` 又拉回 0.5。真机日志里就是这个顺序：
+     *
+     * ```
+     * 54.459  解锁：压暗复位 1.0          ← fadeOutOnUnlock 把 aodFrozen 设成 false
+     * 54.612  AOD 归位完成 → 冻结         ← 归位 tick 后落地，又设回 true ⇒ 传感器冻死
+     * ```
+     *
+     * ⇒ 取消时自增代际，tick 每次进 `run()` 先比对；过期直接退出、**不写任何状态**。
+     */
+    private var aodGen = 0
+
+    /** 压暗渐变的 tick（null = 没在跑）。只在 GL 线程读写。 */
+    private var dimTick: Runnable? = null
+
+    /** 压暗动画的代际号（语义同 [aodGen]）。 */
+    private var dimGen = 0
+
     private const val AOD_ANIM_MS = 300L
     private const val AOD_STEP_MS = 16L
 
@@ -514,11 +569,34 @@ internal object SpatialRenderer {
     fun fadeOutOnUnlock() {
         val h = handler ?: return
         h.post {
-            if (runningKey == null || lockScs.isEmpty()) return@post
+            if (runningKey == null) return@post
+            // **AOD 归位 / 压暗动画必须先作废**（2026-11-05 v1.17.6，真机日志实证）：
+            // 这两条 tick 是 handler 异步节拍，归位一次要跑几百毫秒到几秒（GL 忙时被拉长）。
+            // AOD 直接解锁不经过 `onExitAod()` ⇒ 没人取消它们 ⇒ 归位落地时会把刚复位的
+            // `aodFrozen` 又写成 true（**传感器从此不恢复**，直到下次进出 AOD），
+            // 压暗 tick 落地则会把亮度再拉回 0.5（偶发压暗回弹）。
+            cancelAodHomeLocked()
+            cancelDimAnimLocked()
+            // **AOD 直接解锁**（不经过锁屏）走的是
+            // `startKeyguardExitAnimationByInteractiveOrFullAODUnlockAnimation`，
+            // 不会调 `doWallpaperBlackAnim(show=true)` ⇒ `onExitAod()` 不执行 ⇒
+            // 压暗与 AOD 冻结都停在原地。必须在这里无条件复位（2026-11-05 真机问题二）。
+            val hadDim = aodDim < 0.999f
+            if (hadDim) {
+                applyDimLocked(1f)
+                HookRuntime.log("SPATIAL 解锁：压暗复位 1.0（AOD 直接解锁不经过 onExitAod）")
+            }
+            aodFrozen = false
             // 幂等：两个触发点（退场动画起点 / 锁屏状态跳变）都会到，先到者生效。
             // 少了这句，第二次触发会把已淡到一半的 alpha 重置回 1（看得见的回弹）。
             if (fadeTick != null) return@post
             cancelFadeLocked()
+            // 仅桌面档（没有锁屏份）：不需要淡出。解锁后这份该显示 ⇒ alpha 1.0。
+            if (lockScs.isEmpty()) {
+                setDeskOnlyAlpha(1f)
+                if (screenOn()) forceDraw()
+                return@post
+            }
             // **灭屏触发的 showing→false 不是解锁**，不能走淡出：
             // 那时所有 surface 都不可见，下面任何一次 swap 都会阻塞并把 GL 线程卡死。
             if (!screenOn()) {
@@ -688,8 +766,11 @@ internal object SpatialRenderer {
         homeStartAt = SystemClock.elapsedRealtime()
         homeStartYaw = yaw
         homeStartPitch = pitch
+        val gen = ++aodGen
         val tick = object : Runnable {
             override fun run() {
+                // 已被取消 / 被新一次归位顶掉 ⇒ 立刻退出，**绝不写 aodFrozen**
+                if (gen != aodGen) return
                 if (runningKey == null) {
                     aodHomeTick = null
                     return
@@ -721,27 +802,45 @@ internal object SpatialRenderer {
     }
 
     private fun cancelAodHomeLocked() {
+        aodGen++
         aodHomeTick?.let { handler?.removeCallbacks(it) }
         aodHomeTick = null
+        // 归位没跑完就取消 ⇒ 别让 `homing` 继续锁死输入；传感器路径会按「静止归位」自己接上。
+        homing = false
+    }
+
+    /** 作废正在跑的压暗渐变（解锁 / 出 AOD 时调用，避免旧目标值把亮度再拉回去）。 */
+    private fun cancelDimAnimLocked() {
+        dimGen++
+        dimTick?.let { handler?.removeCallbacks(it) }
+        dimTick = null
     }
 
     /** 压暗渐变（handler 节拍，[AOD_STEP_MS] 一步）。 */
     private fun animateDimLocked(h: Handler, target: Float, durationMs: Long) {
+        // 同一时刻只允许一条渐变：否则进/出 AOD 挨得近时两条 tick 会互相覆盖，终值不可预期。
+        cancelDimAnimLocked()
         val from = aodDim
         if (kotlin.math.abs(target - from) < 0.001f) {
             applyDimLocked(target)
             return
         }
+        val gen = dimGen
         val t0 = SystemClock.elapsedRealtime()
         val tick = object : Runnable {
             override fun run() {
-                if (runningKey == null) return
+                if (gen != dimGen) return
+                if (runningKey == null) {
+                    dimTick = null
+                    return
+                }
                 val t = ((SystemClock.elapsedRealtime() - t0).toFloat() / durationMs)
                     .coerceIn(0f, 1f)
                 applyDimLocked(from + (target - from) * t)
-                if (t < 1f) h.postDelayed(this, AOD_STEP_MS)
+                if (t < 1f) h.postDelayed(this, AOD_STEP_MS) else dimTick = null
             }
         }
+        dimTick = tick
         h.post(tick)
     }
 
@@ -835,6 +934,8 @@ internal object SpatialRenderer {
         // **前景主体复位**（2026-10-30，v1.5.74）：必须无条件调 —— GL 锁屏份的 alpha
         // 可能本来就是 1（`currentAlpha < 0.99f` 不成立），而主体已被上一次解锁淡到 0。
         SpatialOverlay.resetAlpha()
+        // 仅桌面档：回锁屏要把挂在共用 leash 上的桌面份隐掉。
+        setDeskOnlyAlpha(if (showingDesktop) 1f else 0f)
         val scs = lockScs
         if (scs.isEmpty()) return
         if (currentAlpha < 0.99f) {
@@ -960,6 +1061,33 @@ internal object SpatialRenderer {
         }.onFailure { HookRuntime.log("SPATIAL 设 alpha 失败：${it.javaClass.simpleName}: ${it.message}") }
     }
 
+    /**
+     * **仅桌面档在共用 leash 上的可见性**（2026-11-05，问题一）。
+     *
+     * 这份层锁屏时也在屏幕上（系统只有一条 leash），所以锁屏 alpha 0、桌面 alpha 1。
+     * 不复用 [applyAlphaTo]：那个通道带 `currentAlpha` 与淡出锁存窗口，是给锁屏份用的；
+     * 这里是一份"不该在锁屏出现"的桌面层，两态互斥、没有渐变。
+     */
+    private fun setDeskOnlyAlpha(target: Float, force: Boolean = false) {
+        if (!desktopOnlyShared) return
+        val t = target.coerceIn(0f, 1f)
+        if (!force && kotlin.math.abs(t - deskOnlyAlpha) < 0.01f) return
+        val scs = mounts.filter { !it.locked }.map { it.sc }
+        if (scs.isEmpty()) return
+        runCatching {
+            val tx = txAlpha ?: return
+            val obj = tx.first.getConstructor().newInstance()
+            scs.forEach { tx.second.invoke(obj, it, t) }
+            tx.third.invoke(obj)
+            deskOnlyAlpha = t
+            HookRuntime.log(
+                "SPATIAL 仅桌面 alpha=${if (t > 0.5f) "1.0（桌面）" else "0.0（锁屏隐藏）"}",
+            )
+        }.onFailure {
+            HookRuntime.log("SPATIAL 仅桌面 alpha 失败：${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
     /** **启动（幂等）**：key 与 scope 都没变就直接返回；任一变化都要重建（挂载点会变）。 */
     fun start(ctx: Context?, key: String, scope: Int) {
         if (key == runningKey && scope == runningScope) return
@@ -1002,6 +1130,24 @@ internal object SpatialRenderer {
         HookRuntime.log(
             "SPATIAL 锁屏景深=${if (runningLockDepth) 1 else 0}" +
                 "（${com.frederic22.hyperextreme.data.SpatialFlag.PROP_LOCKDEPTH}）",
+        )
+
+        // 「显示区域」从**系统属性**读（`SpatialFlag.PROP_CROP` = "scale,offx,offy"）。
+        //
+        // ⚠️ **不能读 `crop.json`**：本类跑在 SystemUI 进程，`ctx.filesDir` 是 SystemUI
+        // 自己的私有目录，读不到模块的文件 —— 2026-11-05 真机实测连四次启动都拿到
+        // 默认值（zoom=1.00 c=(0.500,0.500)），而这里写的日志当时也是这么打的。
+        // 属性所有进程都能读，并且与 active / key / scope 同一批推送，天然是同一次配置。
+        val cropVals = com.frederic22.hyperextreme.spatial.SpatialCrop.decodeProp(
+            HookRuntime.systemProperty(com.frederic22.hyperextreme.data.SpatialFlag.PROP_CROP),
+        )
+        runningCropScale = cropVals?.get(0) ?: 1f
+        runningCropOffX = cropVals?.get(1) ?: 0f
+        runningCropOffY = cropVals?.get(2) ?: 0f
+        HookRuntime.log(
+            "SPATIAL 显示区域：scale=${"%.4f".format(runningCropScale)} " +
+                "offset=(${"%.4f".format(runningCropOffX)}, ${"%.4f".format(runningCropOffY)})" +
+                if (cropVals == null) "（属性缺失，按不裁剪处理）" else "",
         )
 
         val dm = android.content.res.Resources.getSystem().displayMetrics
@@ -1083,6 +1229,8 @@ internal object SpatialRenderer {
         uK = GLES20.glGetUniformLocation(program, "uK")
         uSpan = GLES20.glGetUniformLocation(program, "uSpan")
         uShift = GLES20.glGetUniformLocation(program, "uShift")
+        uUvScale = GLES20.glGetUniformLocation(program, "uUvScale")
+        uUvOffset = GLES20.glGetUniformLocation(program, "uUvOffset")
         uTex = GLES20.glGetUniformLocation(program, "uTex")
         uOpaque = GLES20.glGetUniformLocation(program, "uOpaque")
         uDepth = GLES20.glGetUniformLocation(program, "uDepth")
@@ -1135,6 +1283,9 @@ internal object SpatialRenderer {
         // ⇒ 真机现象：「点立即替换回到桌面看不到我们的层，进一次锁屏再回来才有」。
         // 此时 SC 还没 reparent（无父层、buffer 队列空），每份 swap 一次不会阻塞。
         showingDesktop = readShowingDesktop(ctx)
+        sharedLeash = false
+        desktopOnlyShared = false
+        deskOnlyAlpha = -1f
         check(drawEveryMount()) { "swapBuffers 失败" }
         HookRuntime.log(
             "SPATIAL 首帧：所有挂载目标各写一帧（当前视为${if (showingDesktop) "桌面" else "锁屏"}态）",
@@ -1171,20 +1322,28 @@ internal object SpatialRenderer {
         }
 
         val leashLock = leashOf(true)
+        // 仅桌面档 + 共用 leash：只有桌面一份，**不能丢**（2026-11-05 问题一）。
+        val hasLockMount = mounts.any { it.locked }
         var fallbackToLock = false
         val mounted = ArrayList<Mount>(mounts.size)
         for (m in mounts) {
             var leash = leashOf(m.locked)
             if (leash == null && !m.locked && leashLock != null) {
                 // 同一张壁纸：桌面没有独立 leash，系统让桌面复用锁屏那条。
-                // **不能再挂一份上去**——两份完全重叠，被遮住的那份 swap 会阻塞（见 sharedLeash）。
                 sharedLeash = true
-                fallbackToLock = true
-                HookRuntime.log(
-                    "SPATIAL 共用 leash：桌面 token 不存在 → 只保留锁屏那一份" +
-                        "（两份挂同一 leash 会互相遮挡并阻塞 swap）",
-                )
-                continue
+                if (hasLockMount) {
+                    // 还有锁屏份：不能再挂一份上去（两份完全重叠，被遮住的那份 swap 会阻塞）。
+                    fallbackToLock = true
+                    HookRuntime.log(
+                        "SPATIAL 共用 leash：桌面 token 不存在 → 只保留锁屏那一份" +
+                            "（两份挂同一 leash 会互相遮挡并阻塞 swap）",
+                    )
+                    continue
+                }
+                // 仅桌面档：没有第二份可保留 ⇒ 挂到唯一这条 leash 上，锁屏时再隐掉。
+                desktopOnlyShared = true
+                leash = leashLock
+                HookRuntime.log("SPATIAL 共用 leash：仅桌面档 → 保留桌面份并挂到唯一 leash")
             }
             if (leash == null) {
                 HookRuntime.log("SPATIAL 挂载跳过：showWhenLocked=${m.locked} 既没有 token 也没有可回退的 leash")
@@ -1226,6 +1385,13 @@ internal object SpatialRenderer {
             mounts.addAll(mounted)
         }
         check(mounts.isNotEmpty()) { "全部目标挂载失败（scope=$scope）" }
+        if (desktopOnlyShared) {
+            HookRuntime.log(
+                "SPATIAL 仅桌面档：挂到共用 leash 后按锁屏态设 alpha" +
+                    "（当前=${if (showingDesktop) "桌面 1.0" else "锁屏 0.0"}）",
+            )
+            setDeskOnlyAlpha(if (showingDesktop) 1f else 0f, force = true)
+        }
         if (fallbackToLock) {
             HookRuntime.log(
                 "SPATIAL 提示：当前壁纸组合下锁屏/桌面共用一条 leash ⇒ 只挂一份、" +
@@ -1285,7 +1451,17 @@ internal object SpatialRenderer {
             override fun onReceive(c: Context?, i: Intent?) {
                 if (i?.action != Intent.ACTION_SCREEN_ON) return
                 HookRuntime.log("SPATIAL 亮屏 → 重新注册传感器")
-                handler?.post { reregisterSensor(c ?: ctx) }
+                handler?.post {
+                    // **亮屏兜底解冻**（2026-11-05 v1.17.6，与光栅 `RasterRenderer.watchScreen` 对齐）：
+                    // 亮屏意味着 AOD 一定结束了 ⇒ 任何残留的冻结 / 归位 / 压暗动画都该作废。
+                    // 少了这句，只要某条解锁路径没走到 `onExitAod()`、而 `fadeOutOnUnlock()` 又被
+                    // 后落地的归位 tick 覆盖，传感器就会一直冻着，直到下一次进出 AOD。
+                    cancelAodHomeLocked()
+                    cancelDimAnimLocked()
+                    aodFrozen = false
+                    unfreezeTransition()
+                    reregisterSensor(c ?: ctx)
+                }
             }
         }
         val filter = IntentFilter(Intent.ACTION_SCREEN_ON)
@@ -1518,9 +1694,12 @@ internal object SpatialRenderer {
         pendingRaise = false
         raiseScheduled = false
         sharedLeash = false
+        desktopOnlyShared = false
+        deskOnlyAlpha = -1f
         unfreezeTransition()
-        // AOD 状态一起收口：归位 runnable 必须摘掉，否则会往已销毁的 GL 上 post。
+        // AOD 状态一起收口：归位 / 压暗两条 runnable 必须摘掉，否则会往已销毁的 GL 上 post。
         cancelAodHomeLocked()
+        cancelDimAnimLocked()
         aodFrozen = false
         aodDim = 1f
         currentAlpha = 1f
@@ -1754,6 +1933,10 @@ internal object SpatialRenderer {
     /**
      * **替系统补调它自己的两个模糊函数**（2026-10-29，验证中）。
      *
+     * ⚠️ 2026-11-04：改成 `internal`，**光栅壁纸也走这一份**（`RasterRenderer.onKeyguardBlurArgs`
+     * 无条件转发过来）。理由见下：它俩在系统侧是同一个处境 —— 都挂在壁纸 leash 上、
+     * 都是 miwallpaper 那两个 Surface 的兄弟层。反射解析缓存也就只需要一份。
+     *
      * ## 为什么需要
      *
      * `KeyguardPanelViewController#doBlurAndDim(ratio, z, z2, z3)` 里两条路都由
@@ -1772,7 +1955,7 @@ internal object SpatialRenderer {
      *
      * ⚠️ 只在景深**关**时调。景深开时系统自己会调，重复调用 = 双重模糊。
      */
-    private fun applySystemBlur(ratio: Float, fgLayer: android.view.View) {
+    internal fun applySystemBlur(ratio: Float, fgLayer: android.view.View) {
         val v = ratio.coerceIn(0f, 1f)
         // 首次（或换了 loader）时解析一次；之后直接用缓存的 Method。
         // ⚠️ **不能用 `fgLayer.javaClass.classLoader`**：那是个 `FrameLayout`，
@@ -1968,6 +2151,9 @@ internal object SpatialRenderer {
         val g = SpatialGlCore.geometry(screenW, screenH, layerW, layerH)
         GLES20.glUniform2f(uK, g.kx, g.ky)
         GLES20.glUniform2f(uSpan, g.spanX, g.spanY)
+        // 显示区域（2026-11-04）：uv' = uv * scale + offset，深度场与颜色共用。
+        GLES20.glUniform2f(uUvScale, runningCropScale, runningCropScale)
+        GLES20.glUniform2f(uUvOffset, runningCropOffX, runningCropOffY)
 
         // 归一化姿态 −1..1（相对满量程）
         val nx = (yaw / FULL_SCALE_RAD).coerceIn(-1f, 1f)

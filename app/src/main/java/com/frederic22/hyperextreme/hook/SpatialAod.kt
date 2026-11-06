@@ -87,7 +87,13 @@ internal object SpatialAod {
                         ?: args.filterIsInstance<Boolean>().firstOrNull()
                     val black = args.filterIsInstance<Float>().firstOrNull()
                     val result = chain.proceed()
-                    if (show == null || black == null || !enabled()) return result
+                    if (show == null || black == null) return result
+                    // **光栅壁纸也要这套时机**（2026-11-04）：它不做静止归位，只在这里重设基点。
+                    // 与空间壁纸的开关无关，各自判各自在不在跑（没跑就是空操作）。
+                    runCatching {
+                        if (show) RasterRenderer.onExitAod() else RasterRenderer.onEnterAod(black)
+                    }
+                    if (!enabled()) return result
                     runCatching {
                         if (show) {
                             logOnce("exit", "退出 AOD（回锁屏）→ 亮度复位 + 解冻")

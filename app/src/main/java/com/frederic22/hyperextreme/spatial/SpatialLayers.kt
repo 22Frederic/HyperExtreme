@@ -1249,6 +1249,10 @@ internal object SpatialLayers {
         fun blurNum(): FloatArray = numBuf ?: FloatArray(n).also { numBuf = it }
         fun blurDen(): FloatArray = denBuf ?: FloatArray(n).also { denBuf = it }
 
+        /** 四块懒分配有没有真的分出去（`memStat` 用来算池的准确体积）。 */
+        fun hasLazy(): Boolean =
+            distBuf != null || srcBuf != null || numBuf != null || denBuf != null
+
         /**
          * 丢掉四块懒分配的 scratch（各 `4n`，1022×2268 ⇒ 合计 35.4MB）。
          *
@@ -1287,9 +1291,16 @@ internal object SpatialLayers {
         val javaMax = rt.maxMemory() shr 20
         val nativeUsed = android.os.Debug.getNativeHeapAllocatedSize() shr 20
         val nativeSize = android.os.Debug.getNativeHeapSize() shr 20
-        // 池常驻：ints/depth/rgb/alpha/kBg/scratch/baseFill 各 4B + bodyMask/bool/bytes 各 1B
-        val poolMb = (pool?.let { it.n * 33L } ?: 0L) shr 20
-        return "java=${javaUsed}/${javaMax}MB native=${nativeUsed}/${nativeSize}MB pool=${poolMb}MB"
+        // 池常驻**分两段报**（2026-11-03 修正）：原来写死 `n * 33`，比真实值小 41%，
+        // 会把「池已经 130MB」看成「才 72MB」，判断内存余量时严重误导。
+        //   立即分配 40n = 9 个 4B（ints/depth/rgb/alpha/kBg/scratch/tmpF/tmpF2/baseFill）
+        //               + 4 个 1B（bool/bytes/bodyMask/fillRegion）
+        //   懒分配   16n = 4 个 4B（dist/near/blurNum/blurDen），跑过一轮流水线后必然存在
+        val pn = pool?.n ?: 0
+        val baseMb = (pn * 40L) shr 20
+        val lazyMb = if (pool?.hasLazy() == true) (pn * 16L) shr 20 else 0L
+        return "java=${javaUsed}/${javaMax}MB native=${nativeUsed}/${nativeSize}MB " +
+            "pool=${baseMb}+${lazyMb}MB"
     }
 
     /** 取同尺寸缓冲；尺寸变了就重建。 */

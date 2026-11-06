@@ -280,6 +280,7 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                 DetailPage.MaskReplace -> "锁屏遮罩替换"
                 DetailPage.ParallaxBg -> "视差壁纸"
                 DetailPage.SpatialWallpaper -> "空间壁纸"
+                DetailPage.RasterWallpaper -> "光栅壁纸"
                 DetailPage.SystemUi -> "系统界面"
                 DetailPage.Desktop -> "系统桌面"
             },
@@ -291,6 +292,8 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                 DetailPage.ParallaxBg -> ParallaxBgDetail(state = state, onPick = pickParallaxBg)
                 // 「空间壁纸」：**独立链**，暂不接收选图回调（深度模型流程还没接）。
                 DetailPage.SpatialWallpaper -> SpatialWallpaperDetail(state)
+                // 「光栅壁纸」（2026-11-03）：目前只是**主体验证页**，渲染链还没接。
+                DetailPage.RasterWallpaper -> RasterWallpaperDetail(state)
                 DetailPage.SystemUi -> SystemUiDetail(state)
                 DetailPage.Desktop -> DesktopDetail(state)
             }

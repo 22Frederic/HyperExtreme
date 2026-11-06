@@ -89,6 +89,13 @@ class SpatialWallpaperService : WallpaperService() {
         private var uDepthCh = 0
         private var uDkTh = 0
         private var uDim = 0
+        // 显示区域（2026-11-05）：uv' = uv * uUvScale + uUvOffset
+        private var uUvScale = 0
+        private var uUvOffset = 0
+        private var cropScale = 1f
+        private var cropOffX = 0f
+        private var cropOffY = 0f
+        private var loadedCropStamp = Long.MIN_VALUE
         private var quad: FloatBuffer? = null
 
         // ── 内容 ──
@@ -408,6 +415,8 @@ class SpatialWallpaperService : WallpaperService() {
             uDepthCh = GLES20.glGetUniformLocation(p, "uDepthCh")
             uDkTh = GLES20.glGetUniformLocation(p, "uDkTh")
             uDim = GLES20.glGetUniformLocation(p, "uDim")
+            uUvScale = GLES20.glGetUniformLocation(p, "uUvScale")
+            uUvOffset = GLES20.glGetUniformLocation(p, "uUvOffset")
             val verts = floatArrayOf(
                 -1f, -1f, 0f, 1f,
                 1f, -1f, 1f, 1f,
@@ -471,6 +480,28 @@ class SpatialWallpaperService : WallpaperService() {
                 return
             }
             val stamp = SpatialServiceTarget.stamp(ctx)
+            // 「显示区域」也可能单独变（用户只调了裁剪）：它的 mtime 一起纳入判据，
+            // 否则 target 没重写就永远不重读（2026-11-05）。
+            val cropStamp = com.frederic22.hyperextreme.spatial.SpatialCrop
+                .fileOf(ctx, key).lastModified()
+            if (!force && key == loadedKey && stamp == loadedStamp &&
+                cropStamp == loadedCropStamp
+            ) {
+                return
+            }
+            // 先更新 crop（**不重载纹理**）：改裁剪只是换两个 uniform，
+            // 走下面那条路会白读三张层图（每张上千像素），明显卡一下。
+            val cropUpdated = cropStamp != loadedCropStamp
+            if (cropUpdated) {
+                val crop = com.frederic22.hyperextreme.spatial.SpatialCrop.read(ctx, key)
+                cropScale = com.frederic22.hyperextreme.spatial.SpatialCrop.scaleOf(crop)
+                cropOffX = com.frederic22.hyperextreme.spatial.SpatialCrop.offsetXOf(crop)
+                cropOffY = com.frederic22.hyperextreme.spatial.SpatialCrop.offsetYOf(crop)
+                loadedCropStamp = cropStamp
+                log("显示区域：zoom=${crop.zoom} c=(${crop.cx}, ${crop.cy})")
+            }
+            // 只有 key / target 变了才需要重载层图；单纯 crop 变化到此为止
+            // （调用方紧接着会 drawFrame，用新 uniform 出帧）。
             if (!force && key == loadedKey && stamp == loadedStamp) return
             val dir = File(SpatialDepth.cacheRoot(ctx), key)
             if (!SpatialLayers.hasLayers(dir)) {
@@ -624,6 +655,8 @@ class SpatialWallpaperService : WallpaperService() {
             val g = SpatialGlCore.geometry(screenW, screenH, layerW, layerH)
             GLES20.glUniform2f(uK, g.kx, g.ky)
             GLES20.glUniform2f(uSpan, g.spanX, g.spanY)
+            GLES20.glUniform2f(uUvScale, cropScale, cropScale)
+            GLES20.glUniform2f(uUvOffset, cropOffX, cropOffY)
 
             val nx = (yaw / SpatialGlCore.FULL_SCALE_RAD).coerceIn(-1f, 1f)
             val np = (pitch / SpatialGlCore.FULL_SCALE_RAD).coerceIn(-1f, 1f)

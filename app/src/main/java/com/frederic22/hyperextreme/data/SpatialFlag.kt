@@ -73,15 +73,78 @@ object SpatialFlag {
      */
     const val PROP_RENDERING = "debug.hyperextreme.spatial_rendering"
 
+    /**
+     * 重启间隔（秒）。**必须大于 SystemUI 侧的轮询周期 1s**，否则它可能一次都没读到
+     * `active=0`，两条属性被合并成最终状态，等于没重启。
+     */
+    private const val RESTART_GAP_S = 1.3f
+
+    /**
+     * 「先关 → 等一个轮询周期 → 再开」= **强制 SystemUI 重建渲染器**（2026-11-05）。
+     *
+     * ## 为什么需要
+     *
+     * `SpatialRenderer.start()` 的判据是 `key + scope` 都没变就直接返回，而「显示区域」
+     * （crop.json）是**启动时读一次**的 ⇒ 同一个 key 改了 crop 再应用，属性推送过去，
+     * SystemUI 轮询发现 key 没变，**连 `start()` 都不会调**，crop 自然不会重读。
+     *
+     * ## 为什么不连着调两次 [push]
+     *
+     * 两次都是独立的 `su setprop`（各自起一个线程），**执行顺序没有保证** ——
+     * 可能反过来，结果是"关了没开"。这里放进**一条脚本**，由 shell 保证先后。
+     *
+     * 代价：中间 [RESTART_GAP_S] 秒没有空间壁纸（露出系统壁纸），即用户说的"闪一下"。
+     */
+    fun pushRestart(
+        active: Boolean,
+        key: String?,
+        scope: Int,
+        lockDepth: Boolean,
+        crop: String = "",
+    ) {
+        Thread {
+            val script = "setprop $PROP_ACTIVE 0; " +
+                "sleep $RESTART_GAP_S; " +
+                "setprop $PROP_ACTIVE ${if (active) 1 else 0}; " +
+                "setprop $PROP_KEY ${key.orEmpty()}; " +
+                "setprop $PROP_SCOPE $scope; " +
+                "setprop $PROP_LOCKDEPTH ${if (lockDepth) 1 else 0}; " +
+                "setprop $PROP_CROP ${crop.trim()}"
+            val r = runCatching { RootShell.run(script) }.getOrNull()
+            if (r == null || !r.ok) {
+                android.util.Log.w(
+                    "HyperExtreme",
+                    "SpatialFlag: pushRestart 失败（${r?.output?.take(160) ?: "异常"}）",
+                )
+            }
+        }.start()
+    }
+
+    /**
+     * 「显示区域」：`"scale,offx,offy"`（2026-11-05）。
+     *
+     * 为什么单独传属性而不是让渲染器读 `crop.json`：渲染器在 **SystemUI 进程**，
+     * 那里的 `ctx.filesDir` 是 SystemUI 自己的私有目录，读不到模块的文件
+     * （真机实测四次启动都拿到默认值）。属性所有进程都能读。
+     */
+    const val PROP_CROP = "debug.hyperextreme.spatial_crop"
+
     /** 异步写属性；root 不可用时静默失败（界面上的开关状态仍然正确，只是不生效）。 */
-    fun push(active: Boolean, key: String?, scope: Int, lockDepth: Boolean) {
+    fun push(
+        active: Boolean,
+        key: String?,
+        scope: Int,
+        lockDepth: Boolean,
+        crop: String = "",
+    ) {
         Thread {
             val r = runCatching {
                 RootShell.run(
                     "setprop $PROP_ACTIVE ${if (active) 1 else 0}; " +
                         "setprop $PROP_KEY ${key.orEmpty()}; " +
                         "setprop $PROP_SCOPE $scope; " +
-                        "setprop $PROP_LOCKDEPTH ${if (lockDepth) 1 else 0}",
+                        "setprop $PROP_LOCKDEPTH ${if (lockDepth) 1 else 0}; " +
+                        "setprop $PROP_CROP ${crop.trim()}",
                 )
             }.getOrNull()
             if (r == null || !r.ok) {

@@ -162,14 +162,23 @@ internal object SpatialWallpaperAlpha {
 
     /** 与 SystemUI 侧同一判据：生效中且不是「桌面」档。读不到属性按关处理。 */
     private fun enabled(): Boolean {
-        val active = HookRuntime.systemProperty(
-            com.frederic22.hyperextreme.data.SpatialFlag.PROP_ACTIVE,
-        ).trim() == "1"
-        if (!active) return false
+        // 空间壁纸生效中
         val scope = HookRuntime.systemProperty(
             com.frederic22.hyperextreme.data.SpatialFlag.PROP_SCOPE,
         ).trim().toIntOrNull() ?: MaskPrefs.SPATIAL_SCOPE_LOCK
-        return scope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
+        val spatialOn = HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.SpatialFlag.PROP_ACTIVE,
+        ).trim() == "1" && scope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
+        if (spatialOn) return true
+        // **光栅壁纸也要**（2026-11-04）：它同样是 leash 的兄弟层，解锁时不会跟着淡，
+        // 需要这条真值来对齐淡出曲线。
+        val rScope = HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.RasterFlag.PROP_SCOPE,
+        ).trim().toIntOrNull() ?: MaskPrefs.SPATIAL_SCOPE_LOCK
+        val rasterOn = HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.RasterFlag.PROP_ACTIVE,
+        ).trim() == "1" && rScope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
+        return rasterOn
     }
 
     private fun log(msg: String) = HookRuntime.log("SPATIAL 壁纸alpha $msg")

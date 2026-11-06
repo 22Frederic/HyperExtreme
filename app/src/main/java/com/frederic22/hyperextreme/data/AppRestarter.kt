@@ -29,6 +29,15 @@ const val MiuiHomePackageName = "com.miui.home"
  */
 const val MiuiWallpaperPackageName = "com.miui.miwallpaper"
 
+/**
+ * 小米澎湃 AI 引擎（`com.xiaomi.aicr`）—— 光栅壁纸「景深主体」的服务端（2026-11-05 起第五个作用域）。
+ *
+ * 只在 `hook/AicrHook` 里挂 `getPluginBinder`。**新勾选作用域后必须重启它**模块才会注入，
+ * 否则用户会看到"勾了但没生效"。它带一串 `:coreService` / `:cognitionService` 子进程，
+ * 重启方式见 [AppRestarter] 里的特殊分支。
+ */
+const val AicrPackageName = "com.xiaomi.aicr"
+
 /** 一个可重启的目标：界面上的显示名 + 包名。 */
 data class RestartTarget(val label: String, val packageName: String)
 
@@ -38,6 +47,7 @@ val RestartTargets = listOf(
     RestartTarget("系统界面", SystemUiPackageName),
     RestartTarget("系统桌面", MiuiHomePackageName),
     RestartTarget("壁纸", MiuiWallpaperPackageName),
+    RestartTarget("小米澎湃 AI 引擎", AicrPackageName),
 )
 
 /**
@@ -81,6 +91,10 @@ object AppRestarter {
      * 只看"还在不在"必然把成功误判成失败（这正是上一版的问题）；看"原来是哪几个 pid、它们还在不在"才准。
      */
     private fun restartWithRoot(target: String): Result {
+        // AICR 有 `:coreService` / `:cognitionService` / `:actionprovider` 等一串子进程，
+        // `pidof` 按主名只能匹配到一个；而插件服务恰恰跑在 `:coreService` 里 —— 只杀主进程
+        // 等于没重启（2026-11-05 新增作用域时发现）。用 `am force-stop` 全杀。
+        if (target == AicrPackageName) return restartAicr()
         // 连子进程一起处理：aod 有两个进程名 —— 主进程 `com.miui.aod` 和编辑器子进程
         // `com.miui.aod:keyguardeditor`。用户开着锁屏编辑器时往往只有子进程在，
         // 只查主进程名会漏（真机反馈过）。对 SystemUI 来说第二个名字匹配不到，无害。
@@ -109,6 +123,20 @@ object AppRestarter {
             // 脚本没跑到 `state=`，说明 su 这一层就出问题了。
             else -> Result(false, "执行 su 失败（${output.trim().ifBlank { "退出码 ${result.exitCode}" }}）")
         }
+    }
+
+    /**
+     * 重启 AICR（`com.xiaomi.aicr`）—— 它的 `:coreService` 等子进程才是插件宿主。
+     *
+     * 用 `am force-stop`：按包名结束**整个进程组**；`pidof` 按主名只能匹配主进程，
+     * 用通用脚本会留下子进程（等于没重启）。AICR 不是 persistent，杀完不会立刻自启，
+     * 等下一次 bind（用户点「计算景深」）由系统拉起 —— 对"让模块重新注入"是等价的。
+     */
+    private fun restartAicr(): Result {
+        RootShell.run("am force-stop $AicrPackageName")
+        runCatching { Thread.sleep(500) }
+        val left = RootShell.run("pidof $AicrPackageName").output.trim()
+        return if (left.isEmpty()) Result(true) else Result(false, "进程仍在运行")
     }
 
     private fun restartWithoutRoot(context: Context, target: String): Result {

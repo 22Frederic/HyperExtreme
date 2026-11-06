@@ -114,6 +114,18 @@ internal object HookRuntime {
          * （换壁纸会带来大量不确定行为，不关就得逐个擦屁股）。
          */
         val spatialWallpaperFp: String,
+        /**
+         * 「光栅壁纸」是否生效中（2026-11-05，供换壁纸检测的 raster 分支用）。
+         *
+         * 与空间壁纸同构：只看 `raster_active_id` 非空，**没有开关**。
+         */
+        val rasterActive: Boolean,
+        /**
+         * 「光栅壁纸基准」壁纸判据（空 = 尚未记录，检测时惰性补记）。
+         *
+         * 与空间一样**没有配套开关**：检测到换壁纸就无条件关。
+         */
+        val rasterWallpaperFp: String,
     ) {
         /** 该角色在模块里设置了图片 —— 没有开关，设了就是生效。 */
         fun has(role: MaskRole): Boolean = role.id in present
@@ -236,6 +248,8 @@ internal object HookRuntime {
                 parallaxWallpaperFp = data.getString(MaskProvider.KEY_PARALLAX_FP).orEmpty(),
                 spatialActive = data.getBoolean(MaskProvider.KEY_SPATIAL_ACTIVE, false),
                 spatialWallpaperFp = data.getString(MaskProvider.KEY_SPATIAL_FP).orEmpty(),
+                rasterActive = data.getBoolean(MaskProvider.KEY_RASTER_ACTIVE, false),
+                rasterWallpaperFp = data.getString(MaskProvider.KEY_RASTER_FP).orEmpty(),
             )
         }
 
@@ -478,7 +492,8 @@ internal object HookRuntime {
         val replaceWatch = replaceWatchOf(config)
         val parallaxWatch = parallaxWatchOf(config)
         val spatialWatch = spatialWatchOf(config)
-        if (!replaceWatch && !parallaxWatch && !spatialWatch) return
+        val rasterWatch = rasterWatchOf(config)
+        if (!replaceWatch && !parallaxWatch && !spatialWatch && !rasterWatch) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastVersionAt < VERSION_CHECK_INTERVAL_MS) return
         lastVersionAt = now
@@ -488,6 +503,7 @@ internal object HookRuntime {
         if (replaceWatch) checkReplaceBranch(context, config, version)
         if (parallaxWatch) checkParallaxBranch(context, config, version)
         if (spatialWatch) checkSpatialBranch(context, config, version)
+        if (rasterWatch) checkRasterBranch(context, config, version)
     }
 
     /**
@@ -502,13 +518,15 @@ internal object HookRuntime {
         val replaceWatch = replaceWatchOf(config)
         val parallaxWatch = parallaxWatchOf(config)
         val spatialWatch = spatialWatchOf(config)
-        if (!replaceWatch && !parallaxWatch && !spatialWatch) return
+        val rasterWatch = rasterWatchOf(config)
+        if (!replaceWatch && !parallaxWatch && !spatialWatch && !rasterWatch) return
 
         val version = runCatching { WallpaperVersion.computeFrom(context, templateInfo) }.getOrNull() ?: return
         if (!version.usable) return
         if (replaceWatch) checkReplaceBranch(context, config, version)
         if (parallaxWatch) checkParallaxBranch(context, config, version)
         if (spatialWatch) checkSpatialBranch(context, config, version)
+        if (rasterWatch) checkRasterBranch(context, config, version)
     }
 
     /** 替换链的守护条件：保护期内 + 基准指纹可用（空 / weak 都不自动解除）。 */
@@ -531,6 +549,14 @@ internal object HookRuntime {
      * 另外，空间壁纸**没有开关** —— 用户定的是"检测到换壁纸就无条件关"。
      */
     private fun spatialWatchOf(config: HookConfig): Boolean = config.spatialActive
+
+    /**
+     * 光栅壁纸的守护条件：**只看是否生效中**（2026-11-05，与空间完全同构）。
+     *
+     * 同样不能在这里要求基准非空 —— 惰性补记在 [checkRasterBranch] 里，
+     * 放这里会让"老版本升上来"的用户永久不检测。
+     */
+    private fun rasterWatchOf(config: HookConfig): Boolean = config.rasterActive
 
     /** 替换链：判据变化 → 解除保护；判据升级（换尺子）→ 只更新指纹。 */
     private fun checkReplaceBranch(context: Context, config: HookConfig, version: WallpaperVersion.Version) {
@@ -644,6 +670,44 @@ internal object HookRuntime {
     }
 
     /**
+     * **光栅壁纸：壁纸判据变化 → 无条件自动关闭**（2026-11-05，与空间同构）。
+     *
+     * 三条保护逐字一致：基准空 / weak ⇒ 惰性补记不动作（升级保护）；
+     * 判据升级（换尺子）⇒ 只更新基准不关闭。
+     */
+    private fun checkRasterBranch(context: Context, config: HookConfig, version: WallpaperVersion.Version) {
+        val base = config.rasterWallpaperFp
+        if (base.isEmpty() || base == MaskPrefs.FINGERPRINT_WEAK) {
+            log("光栅壁纸基准：首次记录（${version.detail}）")
+            updateRasterFingerprint(context, version)
+            return
+        }
+        if (version.value == base) return
+        if (WallpaperVersion.kindOf(version.value) != WallpaperVersion.kindOf(base)) {
+            log("光栅壁纸基准：判据升级（${version.detail}），只更新基准不关闭")
+            updateRasterFingerprint(context, version)
+            return
+        }
+        log("光栅壁纸：壁纸已变化（${version.detail}），自动关闭")
+        rasterAutoOffFromWallpaper(context, version.detail)
+    }
+
+    /** 更新「光栅壁纸基准」指纹（惰性补记 / 判据升级时用；不碰开关与指令号）。 */
+    private fun updateRasterFingerprint(context: Context, version: WallpaperVersion.Version) {
+        runCatching {
+            val extras = Bundle().apply {
+                putString(MaskProvider.KEY_RASTER_FP, version.value)
+            }
+            context.contentResolver.call(
+                MaskProvider.configUri(),
+                MaskProvider.METHOD_RASTER_FP,
+                null,
+                extras,
+            )
+        }.onFailure { error -> log("更新光栅壁纸基准失败：$error") }
+    }
+
+    /**
      * 「换壁纸 → 关闭空间壁纸」的收尾。
      *
      * 全部动作在 **provider 进程**里完成（改 prefs → 推系统属性 → toast → 延迟重启壁纸进程），
@@ -662,6 +726,27 @@ internal object HookRuntime {
             lastVersionAt = 0L
             lastReportAt = SystemClock.elapsedRealtime()
         }.onFailure { error -> log("自动关闭空间壁纸失败：$error") }
+    }
+
+    /**
+     * 「换壁纸 → 关闭光栅壁纸」的收尾。
+     *
+     * 全部动作在 **provider 进程**里完成（改 prefs → 推系统属性 → toast），
+     * 与 App 手动「取消应用」共用 `RasterControl.disable` —— 本进程只负责发起 + 失效 config 缓存。
+     */
+    private fun rasterAutoOffFromWallpaper(context: Context, detail: String) {
+        runCatching {
+            context.contentResolver.call(
+                MaskProvider.configUri(),
+                MaskProvider.METHOD_RASTER_AUTO_OFF,
+                detail,
+                null,
+            )
+            configAt = 0L
+            configValue = null
+            lastVersionAt = 0L
+            lastReportAt = SystemClock.elapsedRealtime()
+        }.onFailure { error -> log("自动关闭光栅壁纸失败：$error") }
     }
 
     /**

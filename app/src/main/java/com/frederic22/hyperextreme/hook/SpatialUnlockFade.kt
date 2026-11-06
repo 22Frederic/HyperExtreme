@@ -169,6 +169,8 @@ internal object SpatialUnlockFade {
             m.isAccessible = true
             module.hook(m).intercept(object : XposedInterface.Hooker {
                 override fun intercept(chain: XposedInterface.Chain): Any? {
+                    // 光栅壁纸也吃这个时机（没在跑就是空操作，内部自判 runningKey）。
+                    RasterRenderer.fadeOutOnUnlock()
                     if (enabled()) {
                         logOnce("fade-exit", "解锁退场动画开始 → 启动解锁淡出")
                         SpatialRenderer.fadeOutOnUnlock()
@@ -221,7 +223,12 @@ internal object SpatialUnlockFade {
                     val was = runCatching { showingField.getBoolean(self) }.getOrNull()
                     val result = chain.proceed()
                     val showing = chain.getArgs().filterIsInstance<Boolean>().firstOrNull()
-                    if (was == null || showing == null || !enabled()) return result
+                    if (was == null || showing == null) return result
+                    // 光栅壁纸同样按"锁屏显示状态的真跳变"淡出 / 复位（与空间壁纸互不影响）。
+                    if (showing != was) {
+                        if (showing) RasterRenderer.resetAlpha() else RasterRenderer.fadeOutOnUnlock()
+                    }
+                    if (!enabled()) return result
                     when {
                         showing && !was -> {
                             setFlag(com.frederic22.hyperextreme.data.SpatialFlag.PROP_KEYGUARD, "1")
@@ -264,6 +271,9 @@ internal object SpatialUnlockFade {
             module.hook(m).intercept(object : XposedInterface.Hooker {
                 override fun intercept(chain: XposedInterface.Chain): Any? {
                     // 亮屏传 true、灭屏传 false —— 只在 true 时复位
+                    if (chain.getArgs().filterIsInstance<Boolean>().firstOrNull() == true) {
+                        RasterRenderer.resetAlpha()
+                    }
                     if (chain.getArgs().filterIsInstance<Boolean>().firstOrNull() == true && enabled()) {
                         logOnce("reset-on", "亮屏 → alpha 复位 1")
                         SpatialRenderer.resetAlpha()

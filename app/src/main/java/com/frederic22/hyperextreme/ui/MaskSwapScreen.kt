@@ -61,8 +61,8 @@ import top.yukonga.miuix.kmp.blur.BlurDefaults
 import top.yukonga.miuix.kmp.blur.LayerBackdrop
 import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
 import top.yukonga.miuix.kmp.blur.layerBackdrop
-import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import top.yukonga.miuix.kmp.blur.textureBlur
+import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -139,7 +139,7 @@ private const val BottomFadeAlpha = 0.85f
  * 二级页是**盖住底栏**的全屏页（用户指定），所以它们不占 [Tab] 的位置。
  * 见 [FunctionHome] / [MaskReplaceDetail] / [SystemUiDetail] / [DesktopDetail]。
  */
-internal enum class DetailPage { MaskReplace, ParallaxBg, SpatialWallpaper, SystemUi, Desktop }
+internal enum class DetailPage { MaskReplace, ParallaxBg, SpatialWallpaper, RasterWallpaper, SystemUi, Desktop }
 
 // 二级页（[DetailPage]）的转场**不归本文件管**：它现在是独立 Activity（[MaskDetailActivity]），
 // 转场由**系统的 Activity 动画**负责 —— 为什么必须如此、以及为什么不在这里复刻，见那个类的注释。
@@ -300,7 +300,8 @@ private fun MaskSwapShell(
             !state.activated -> "请检查LSPosed"
             else -> "请检查Root"
         // 2026-10-31：末尾这句里给档位名加引号 + 补「（免Root）」，与页面下拉里的文案逐字一致。
-        }) + "，如果需要在无Root下使用空间壁纸，请点击忽略，并在空间壁纸的挂载模式中选择" +
+        // 2026-11-05：两处「空间壁纸」补上「与光栅壁纸」—— 光栅壁纸同样有免 Root 的服务模式。
+        }) + "，如果需要在无Root下使用空间壁纸与光栅壁纸，请点击忽略，并在空间壁纸与光栅壁纸的挂载模式中选择" +
             "“系统壁纸服务（免Root）”。",
         show = activationAlert,
         onDismissRequest = { activationAlert = false },
@@ -868,6 +869,7 @@ internal fun BigStatusCard(
                     Column {
                         Text(text = statusText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(1.dp))
+                        // `versionName` 是 "0.5 Beta2"（不带 v），界面统一拼一个 "v" 显示。
                         Text(text = "v$version", fontSize = 15.sp)
                     }
                 }
@@ -945,15 +947,31 @@ internal fun deviceName(context: Context): String = runCatching {
  *
  * 2026-09-29 由 `private` 改为 `internal`：二级页（[MaskDetailActivity]）与共用的
  * [RestartDialog] 都在别的文件里用它。
+ *
+ * 2026-11-03 加 [danger]：**警示主题色**（`colorScheme.error` 底 + `onError` 字），
+ * 给「删除此搭配？」这类不可恢复的确认用；默认 false，原有调用一个字都不用改。
  */
 @Composable
-internal fun RowScope.TextButtonLike(text: String, primary: Boolean = false, onClick: () -> Unit) {
+internal fun RowScope.TextButtonLike(
+    text: String,
+    primary: Boolean = false,
+    danger: Boolean = false,
+    onClick: () -> Unit,
+) {
     // 两个弹窗的四个按钮都从这里出，振动统一加在这一层。
     val haptic = rememberClickHaptic()
     TextButton(
         text = text,
         onClick = { haptic(); onClick() },
         modifier = Modifier.weight(1f),
-        colors = if (primary) ButtonDefaults.textButtonColorsPrimary() else ButtonDefaults.textButtonColors(),
+        colors = when {
+            danger -> ButtonDefaults.textButtonColorsPrimary(
+                color = MiuixTheme.colorScheme.error,
+                // ⚠️ 第二个参数叫 `textColor`，不是 `contentColor`（《07》里那条坑，MaskTabs L155 也有注记）。
+                textColor = MiuixTheme.colorScheme.onError,
+            )
+            primary -> ButtonDefaults.textButtonColorsPrimary()
+            else -> ButtonDefaults.textButtonColors()
+        },
     )
 }

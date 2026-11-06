@@ -1,13 +1,11 @@
 package com.frederic22.hyperextreme.ui
 
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.graphics.RectF
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,14 +14,12 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -35,12 +31,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.luminance
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
@@ -48,10 +39,13 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.frederic22.hyperextreme.data.MaskPrefs
+import com.frederic22.hyperextreme.hook.SpatialGlCore
 import com.frederic22.hyperextreme.data.SpatialControl
 import com.frederic22.hyperextreme.data.RunLog
+import com.frederic22.hyperextreme.spatial.SpatialCrop
 import com.frederic22.hyperextreme.spatial.SpatialDepth
 import com.frederic22.hyperextreme.spatial.SpatialLayers
+import com.frederic22.hyperextreme.wallpaper.DynamicWallpaperPermission
 import com.frederic22.hyperextreme.wallpaper.SpatialServiceMode
 import com.frederic22.hyperextreme.wallpaper.SpatialServiceTarget
 import kotlinx.coroutines.Dispatchers
@@ -71,6 +65,14 @@ import top.yukonga.miuix.kmp.icon.extended.ChevronForward
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.window.WindowDialog
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Dp
+import top.yukonga.miuix.kmp.basic.Button
 
 /**
  * 二级页「空间壁纸」（2026-10-22 建立）。
@@ -94,35 +96,33 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var picked by remember { mutableStateOf<Uri?>(null) }
-    var preview by remember { mutableStateOf<Bitmap?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
     // 深度推理进行中：按钮禁用，防连点重复跑（一次 7~10s，重复跑会同时占两份内存）。
     var busy by remember { mutableStateOf(false) }
-    // 「这张图有没有缓存」只是读几个文件，几百毫秒内就回来。**绝不能翻 busy** ——
-    // busy 会同时把「更换图片 / 生成深度缓存」打灰，视觉上就是闪一下（2026-10-29 用户反馈）。
-    // 这里单独用一个只做防重入的标志，不参与任何 enabled 判断。
-    var checking by remember { mutableStateOf(false) }
-    // 功能冲突弹窗（视差壁纸正在生效时点「立即替换」）
+    // 功能冲突弹窗（2026-11-04 起三侧统一：视差 / 光栅任一在跑都不许应用）
     var showConflict by remember { mutableStateOf(false) }
+    var conflictOther by remember { mutableStateOf<RunningWallpaper?>(null) }
 
     // 「缓存推理分辨率」：推理短边档位（768 / 896 / 1024），存在 MaskPrefs 里跨页面保留。
     val prefs = remember { MaskPrefs(ctx) }
 
-    /**
-     * 当前**候选图**（用户选中的那张）的缓存键；null = 没选中。
-     *
-     * 与 [lastKey]（已生成）分开：选完图立刻就有值，并已在缓存目录里复制了 `source` 原图。
-     * 页面重建后靠它 + `source` 把预览框恢复出来 —— 不会再出现「预览显示着、实际没选中」。
-     */
-    var sourceKey by remember {
-        mutableStateOf(
-            prefs.spatialSourceKey.takeIf {
-                it.length == 16 &&
-                    SpatialDepth.sourceFile(File(SpatialDepth.cacheRoot(ctx), it)).isFile
-            },
-        )
-    }
+    // ───────────── 候选卡片流（2026-11-04，取代原来的"1:1 预览 + 选择/更换/清空"）─────────────
+    //
+    // 一个候选 = `files/spatial/<key>/` 一个目录（见 `SpatialDepth.listCandidates`）。
+    // 卡片流 item 0 固定是「新建」，其余按 [candidates] 铺开，与光栅壁纸页**同一套**。
+    var candidates by remember { mutableStateOf<List<SpatialDepth.SpatialCandidate>>(emptyList()) }
+    // 首轮扫描完成前不画卡片流（先占位，避免"从空到有"跳一下）。
+    var loaded by remember { mutableStateOf(false) }
+    var reload by remember { mutableIntStateOf(0) }
+    // 居中的页号（0 = 新建卡）；由卡片流吸附到位后回报。
+    var focused by remember { mutableIntStateOf(0) }
+    // 删除编排：与光栅页同一套（确认弹窗 → 卡片缩小淡出 → 播完真删 → 补位）。
+    var pendingDelete by remember { mutableStateOf<SpatialDepth.SpatialCandidate?>(null) }
+    var deletingId by remember { mutableStateOf<String?>(null) }
+    var shiftDir by remember { mutableFloatStateOf(0f) }
+    var shiftFromPage by remember { mutableIntStateOf(-1) }
+    var shiftToken by remember { mutableIntStateOf(0) }
+
     var shortSide by remember { mutableStateOf(prefs.spatialShortSide) }
     // 「空间壁纸生效范围」：0 锁屏（默认）/ 1 桌面 / 2 全局。**不影响层图生成**，只决定渲染器挂哪条 leash。
     var scopeChoice by remember { mutableStateOf(prefs.spatialScope) }
@@ -134,18 +134,13 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     var confirmKey by remember { mutableStateOf<String?>(null) }
     var confirmUntil by remember { mutableStateOf(0L) }
 
-    // 当前图片的缓存键（生成成功时写入）与**正在生效**的键（决定按钮显示「立即替换 / 关闭替换」）。
-    // 进页面时若已经生效，直接用 prefs 里的键初始化，这样一进来就能一键关闭。
-    // `spatialLastKey` 是落盘的「上次生成成功的键」—— 页面重建后 `picked` 会丢，
-    // 但层图还在磁盘上，靠它才能继续替换（不落盘的话「立即替换」永远判成没生成过）。
-    var lastKey by remember {
-        mutableStateOf(
-            prefs.spatialLastKey.takeIf {
-                it.length == 16 && SpatialLayers.hasLayers(File(SpatialDepth.cacheRoot(ctx), it))
-            },
-        )
-    }
+    // **正在生效**的键（LSPosed 链）。服务模式的"在渲染哪张"在 target 文件里，单独记。
     var activeKey by remember { mutableStateOf(prefs.spatialKey) }
+    var serviceTargetKey by remember { mutableStateOf(SpatialServiceTarget.readKey(ctx).orEmpty()) }
+
+    /** 当前**居中选中**的候选；null = 新建卡居中（没有选中任何图）。 */
+    val selected = candidates.getOrNull(focused - 1)
+
 
     // ───────────── 挂载模式（2026-10-30，v1.5.82）─────────────
     //
@@ -168,7 +163,19 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
      * ⇒ 候选框能被清空 / 换成别的图，与屏幕上看到的完全对不上。现在两种模式的
      * 「生效中锁住候选框」语义一致（用户要求"与 LSPosed 模式逻辑相同"）。
      */
-    val locked = activeKey.isNotEmpty() || serviceRunning
+    /**
+     * **正在渲染的那一张**的 key（2026-11-04 卡片式改造后统一）——
+     * LSPosed 链看 `activeKey`；服务链看 target 文件（`SpatialServiceMode` 只写文件、
+     * 不动 `spatialActive`，所以不能拿 `activeKey` 当判据）。
+     * 空串 = 没有在渲染。
+     */
+    val inUseKey = if (mountMode == MaskPrefs.SPATIAL_MOUNT_SERVICE) {
+        if (serviceRunning) serviceTargetKey else ""
+    } else {
+        activeKey
+    }
+
+    val locked = inUseKey.isNotEmpty() || serviceRunning
 
     /**
      * 当前模式是否**正在运行** —— 为 true 时「挂载模式」下拉锁死。
@@ -189,6 +196,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
             if (event == Lifecycle.Event.ON_RESUME) {
                 // 用户可能在系统壁纸页里换了图/换了范围，回来必须重新对一次
                 serviceRunning = SpatialServiceMode.isRunning(ctx)
+                serviceTargetKey = SpatialServiceTarget.readKey(ctx).orEmpty()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -206,31 +214,36 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         }
     }
 
-    // 页面重建后把预览从磁盘读回来：`picked` / `preview` 都是 remember，一退页面就没了。
-    // 现在读的是**原图副本** `source`（不再是 preview.webp），所以预览框里看到的就是用户选的那张图。
+    // 候选加载（2026-11-04）：扫 `files/spatial/*/` + 按 `spatialCandidateOrder` 排序。
     //
-    // 2026-10-31：改用 `serviceRunning` 做 key，并补一条**服务模式的候选键兜底** ——
-    // 服务链不写 `spatialActive` / `spatialKey`，页面里的 `activeKey` 恒为空；
-    // 一旦 `spatialSourceKey` 丢过（旧版生效中还能点「清空选择」），重进页面/从系统壁纸页
-    // 返回时就不知道在渲染哪张图，预览框会空着。这里按「系统壁纸服务当前目标」补齐候选键，
-    // 与 LSPosed 模式从 prefs 恢复预览完全等价。
-    LaunchedEffect(serviceRunning) {
-        if (preview != null) return@LaunchedEffect
-        if (sourceKey == null && serviceRunning) {
-            val target = SpatialServiceTarget.readKey(ctx)
-            val dir = target?.let { File(SpatialDepth.cacheRoot(ctx), it) }
-            if (target != null && dir != null && SpatialDepth.sourceFile(dir).isFile) {
-                sourceKey = target
-                prefs.setSpatialSourceKey(target)
-                if (lastKey == null && SpatialLayers.hasLayers(dir)) {
-                    lastKey = target
-                    prefs.setSpatialLastKey(target)
-                }
+    // **正在渲染的那张永远排第一**（用户 2026-11-04：应用的下一次都排到第一）——
+    // 与光栅页「正在应用的那组紧挨新建卡」同一条规则。
+    LaunchedEffect(reload) {
+        val list = withContext(Dispatchers.IO) {
+            val order = prefs.spatialCandidateOrder
+            val scanned = SpatialDepth.listCandidates(ctx, order)
+            val inUse = if (mountMode == MaskPrefs.SPATIAL_MOUNT_SERVICE) {
+                SpatialServiceTarget.readKey(ctx).orEmpty()
+            } else {
+                prefs.spatialKey
+            }
+            if (inUse.isNotEmpty()) {
+                val hit = scanned.firstOrNull { it.key == inUse }
+                if (hit != null) listOf(hit) + scanned.filterNot { it.key == inUse } else scanned
+            } else {
+                scanned
             }
         }
-        val f = sourceKey?.let { SpatialDepth.sourceFile(File(SpatialDepth.cacheRoot(ctx), it)) }
-        if (f != null && f.isFile) {
-            preview = withContext(Dispatchers.IO) { SpatialDepth.decodePreview(f) }
+        // 重扫后**尽量停在原来那张**（按 key 找），找不到才夹到合法范围。
+        val keepKey = candidates.getOrNull(focused - 1)?.key
+        candidates = list
+        if (!loaded) {
+            // 「有就第一张，没有就新建」（用户 2026-11-04）。
+            focused = if (list.isEmpty()) 0 else 1
+            loaded = true
+        } else {
+            val idx = if (keepKey == null) -1 else list.indexOfFirst { it.key == keepKey }
+            focused = if (idx >= 0) idx + 1 else focused.coerceIn(0, list.size)
         }
     }
 
@@ -243,14 +256,42 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     fun enableSpatial(key: String) {
         prefs.setSpatialActive(key)
         activeKey = key
+        // 应用即置顶，但**只写顺序、不动当前列表**（2026-11-05 用户明确）：
+        // 点应用的这一刻卡片留在原位，退出页面重进时才刷新到第一个；
+        // 关闭应用也不清顺序 ⇒ 重进仍在第一个（与光栅同一口径）。
+        prefs.setSpatialCandidateOrder(
+            listOf(key) + prefs.spatialCandidateOrder.filterNot { it == key },
+        )
         // **SystemUI 侧读的是系统属性**（见 SpatialFlag：那里 prefs 通道不可用）。
         // scope 必须一起推 —— 生效中改过范围的话，到这里才真正生效（用户 2026-10-29 定）。
-        com.frederic22.hyperextreme.data.SpatialFlag.push(
-            true,
-            key,
-            prefs.spatialScope,
-            prefs.spatialLockDepth,
-        )
+        //
+        // ⚠️ 「同一张图改过显示区域」（2026-11-05）：crop 是**启动时读一次**的，
+        // 而 SystemUI 轮询的判据是 `key` 变没变 —— key 没变连 `start()` 都不会调。
+        // 这种情况必须走 `pushRestart`（关 → 等一个轮询周期 → 开），代价是闪一下。
+        val cropStamp = SpatialCrop.fileOf(ctx, key).lastModified()
+        // 「显示区域」必须**走属性**（渲染器在 SystemUI 进程，读不到模块的 crop.json）。
+        val cropProp = SpatialCrop.encodeProp(SpatialCrop.read(ctx, key))
+        val cropChanged = prefs.spatialAppliedCropKey == key &&
+            prefs.spatialAppliedCropStamp != 0L &&
+            prefs.spatialAppliedCropStamp != cropStamp
+        if (cropChanged) {
+            com.frederic22.hyperextreme.data.SpatialFlag.pushRestart(
+                true,
+                key,
+                prefs.spatialScope,
+                prefs.spatialLockDepth,
+                cropProp,
+            )
+        } else {
+            com.frederic22.hyperextreme.data.SpatialFlag.push(
+                true,
+                key,
+                prefs.spatialScope,
+                prefs.spatialLockDepth,
+                cropProp,
+            )
+        }
+        prefs.setSpatialAppliedCrop(key, cropStamp)
         android.util.Log.i(
             "HyperExtreme",
             "SPATIAL_UI enable key=$key active=${prefs.spatialActive} scope=${prefs.spatialScope}",
@@ -278,24 +319,33 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         busy = true
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
-                // ③ 深度池用完立刻还：深度图尺寸 = 层图尺寸，两份工作集（20n + 56n）
-                // 同时常驻要 168MB，分层再要一块就撞 256MB 堆上限（2026-10-31）。
-                runCatching {
-                    try {
-                        SpatialDepth.generate(ctx, uri, shortSide, force)
-                    } finally {
-                        SpatialDepth.dropPool()
-                    }
-                }.map { depth ->
-                    // ⑦ OOM 自愈：换图时最缺的是「先回收再分配」，而 ART 只在分配失败时 GC。
-                    // 实测（run_log）：同一张图第一次 OutOfMemoryError、紧接着重试就能过。
-                    depth to runCatching { SpatialLayers.generate(ctx, depth.dir, uri, force) }
-                        .recoverCatching { e ->
-                            if (e !is OutOfMemoryError) throw e
-                            SpatialLayers.dropPool()
-                            System.gc()
-                            SpatialLayers.generate(ctx, depth.dir, uri, force)
+                try {
+                    // ③ 深度池用完立刻还：深度图尺寸 = 层图尺寸，两份工作集（20n + 56n）
+                    // 同时常驻要 168MB，分层再要一块就撞堆上限（2026-10-31）。
+                    runCatching {
+                        try {
+                            SpatialDepth.generate(ctx, uri, shortSide, force)
+                        } finally {
+                            SpatialDepth.dropPool()
                         }
+                    }.map { depth ->
+                        // ⑦ OOM 自愈：换图时最缺的是「先回收再分配」，而 ART 只在分配失败时 GC。
+                        // 实测（run_log）：同一张图第一次 OutOfMemoryError、紧接着重试就能过。
+                        depth to runCatching { SpatialLayers.generate(ctx, depth.dir, uri, force) }
+                            .recoverCatching { e ->
+                                if (e !is OutOfMemoryError) throw e
+                                SpatialLayers.dropPool()
+                                System.gc()
+                                SpatialLayers.generate(ctx, depth.dir, uri, force)
+                            }
+                    }
+                } finally {
+                    // ⑧ 分层池用完立刻还（2026-11-03，配合 Manifest 的 largeHeap）。
+                    // 池是 56n（1022×2268 ⇒ 130MB），生成完还常驻的话，主进程退到后台就成了
+                    // lmkd 的首选目标 —— 大堆本来就让它在同 adj 档位里更靠前。
+                    // 代价：下一次生成要多花几百毫秒重建池（分配 9 个数组 + 清零）。
+                    // 放在 finally 里 ⇒ 分层失败/抛异常也会还。
+                    SpatialLayers.dropPool()
                 }
             }
             busy = false
@@ -303,8 +353,8 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                 onSuccess = { pair ->
                     val depth = pair.first
                     val layerRes = pair.second
-                    lastKey = depth.dir.name
-                    prefs.setSpatialLastKey(depth.dir.name)
+                    // 生成完重扫候选（这张卡的封面 / layers 可能刚落地）。
+                    reload++
                     val dSec = "%.1f".format(depth.costMs / 1000f)
                     val layer = layerRes.getOrNull()
                     val totalMs = depth.costMs + (layer?.costMs ?: 0L)
@@ -347,49 +397,85 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         }
     }
 
-    // **必须 remember**：`Color.luminance()` 有浮点运算，且主题对象每帧读一次没意义。
-    val scheme = MiuixTheme.colorScheme
-    val previewSurface = remember(scheme.surface) {
-        if (scheme.surface.luminance() < 0.5f) Color(0xFF1A1A1A) else scheme.surfaceContainerHigh
-    }
-
-    // **必须 remember(preview)**：`asImageBitmap()` 每次调用都会新建 `ImageBitmap` 包装，
-    // Compose 认为是新对象 ⇒ **每帧重新上传整张纹理**（原图 3000×4000 ≈ 48MB）⇒ 动画卡死。
-    // 换成 remember 后只在图片真正变化时重建一次。
-    val previewImage = remember(preview) { preview?.asImageBitmap() }
+    // 新建卡：**单选图 → 直接生成一张新卡**（2026-11-04 用户定，取代原来的三控件）。
+    // 选完只写 `source` 原图副本，深度交给用户自己点「生成深度缓存」——
+    // 与以前一致（一次推理 7~10s，不能因为点一下新建就烧掉）。
+    // 「调整显示区域」独立页（2026-11-04）：回来重扫一次候选（crop.json 变了）。
+    val cropLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { reload++ }
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
-        if (uri != null) {
-            picked = uri
-            scope.launch {
-                // 一、算 key + 把**原图原始字节**拷进缓存目录（不重编码）。
-                //     拷完就算「选中」了 —— 即使还没生成深度，重进页面也能恢复预览。
-                val k = withContext(Dispatchers.IO) {
-                    runCatching {
-                        val key = SpatialDepth.cacheKey(ctx, uri)
-                        SpatialDepth.ensureSource(ctx, uri, File(SpatialDepth.cacheRoot(ctx), key))
-                        key
-                    }.getOrNull()
-                }
-                if (k != null) {
-                    sourceKey = k
-                    prefs.setSpatialSourceKey(k)
-                }
-                // 二、预览：优先解 `source`（就是原图），复制失败才退回直接解 uri。
-                preview = withContext(Dispatchers.IO) {
-                    k?.let {
-                        SpatialDepth.decodePreview(SpatialDepth.sourceFile(File(SpatialDepth.cacheRoot(ctx), it)))
-                    } ?: SpatialDepth.decodePreview(ctx, uri)
-                }
-                // 三、这张图之前生成过（深度 + 层图都在）⇒ 「立即替换」可以直接用。
-                if (k != null && SpatialLayers.hasLayers(File(SpatialDepth.cacheRoot(ctx), k))) {
-                    lastKey = k
-                    prefs.setSpatialLastKey(k)
-                } else {
-                    lastKey = null
-                }
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            // 算 key + 把**原图原始字节**拷进缓存目录（不重编码、不缩放）。
+            val k = withContext(Dispatchers.IO) {
+                runCatching {
+                    val key = SpatialDepth.cacheKey(ctx, uri)
+                    SpatialDepth.ensureSource(ctx, uri, File(SpatialDepth.cacheRoot(ctx), key))
+                    key
+                }.getOrNull()
+            }
+            if (k == null) {
+                Toast.makeText(ctx, "导入失败：读不出这张图片", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            // 新卡排最前：写进 order 的第一位，重扫后自然落到「新建卡」右边。
+            prefs.setSpatialCandidateOrder(
+                listOf(k) + prefs.spatialCandidateOrder.filterNot { it == k },
+            )
+            reload++
+        }
+    }
+
+    // ── 卡片尺寸（与光栅壁纸页**同一个口径**）──
+    val screen = rememberScreenSizePx()
+    val density = LocalDensity.current
+    val cardWidthDp: Dp = with(density) { (screen.width * CARD_WIDTH_RATIO).toDp() }
+    // 主按钮宽 = 卡宽 5/6（光栅那一套的定值）；两个按钮并排 + 12dp 间距。
+    val buttonWidth: Dp = cardWidthDp * 5f / 6f
+    val pagerPadding = pagerVPadding(cardWidthDp)
+    val carouselHeight: Dp = with(density) {
+        (screen.width * CARD_WIDTH_RATIO * screen.height / screen.width).toDp()
+    } + pagerPadding * 2
+
+    /**
+     * 确认删除一张候选（2026-11-04）：只打标记，卡片自己 200ms 缩小淡出；
+     * 播完由卡片流回调 [commitDelete] —— 与光栅页同一套编排。
+     */
+    fun deleteCandidate(c: SpatialDepth.SpatialCandidate) {
+        pendingDelete = null
+        if (deletingId != null) return
+        deletingId = c.key
+    }
+
+    /**
+     * 淡出播完：**直接从内存列表移除**（不重新读盘），并在同一帧把补位方向交给卡片流。
+     * 磁盘上的 `<key>/` 目录（原图 + 深度 + 层图）一起删掉 —— 这是**不可恢复**的，
+     * 所以上游有二次确认弹窗。
+     */
+    fun commitDelete() {
+        val key = deletingId ?: return
+        val idx = candidates.indexOfFirst { it.key == key }
+        if (idx < 0) {
+            deletingId = null
+            return
+        }
+        val page = idx + 1          // item 索引（item 0 = 新建卡）
+        val lastPage = candidates.size
+        shiftDir = if (page < lastPage) 1f else -1f
+        shiftFromPage = page
+        shiftToken++
+        val rest = candidates.filterNot { it.key == key }
+        candidates = rest
+        focused = focused.coerceIn(0, rest.size)
+        deletingId = null
+        prefs.setSpatialCandidateOrder(rest.map { it.key })
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                File(SpatialDepth.cacheRoot(ctx), key).deleteRecursively()
             }
         }
     }
@@ -405,252 +491,279 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
             .verticalScroll(rememberPageScroll())
             .padding(top = LocalTopBarHeight.current, bottom = 32.dp),
     ) {
-        // 一、图片卡（无标题）：预览框 + 同一行的两个按钮。
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(top = 12.dp),
-            insideMargin = PaddingValues(0.dp),
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(1f / 1f)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(previewSurface),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    val img = previewImage
-                    if (img != null) {
-                        Image(
-                            bitmap = img,
-                            contentDescription = "图片",
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Fit,
-                        )
-                    } else {
-                        Text(
-                            text = "还未选择图片",
-                            style = MiuixTheme.textStyles.body2,
-                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                            textAlign = TextAlign.Center,
-                        )
-                    }
-                }
-                Spacer(Modifier.height(12.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    TextButton(
-                        text = if (preview != null) "更换图片" else "选择图片",
-                        onClick = {
-                            haptic()
-                            picker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-                            )
-                        },
-                        modifier = Modifier.weight(1f),
-                        enabled = !locked && !busy,
-                        colors = ButtonDefaults.textButtonColorsPrimary(),
-                    )
-                    TextButton(
-                        text = "清空选择",
-                        onClick = {
-                            haptic()
-                            // **只清「选中」**（用户 2026-10-29 定）：预览与候选键一起清，
-                            // 但磁盘上的原图/层图、以及 `lastKey` 都不动 —— 已经生成好的
-                            // 仍然可以「立即替换」，只是候选框空着。
-                            picked = null
-                            preview = null
-                            sourceKey = null
-                            prefs.setSpatialSourceKey(null)
-                        },
-                        modifier = Modifier.weight(1f),
-                        enabled = !locked && !busy,
-                    )
-                }
-            }
+        // 一、卡片流（2026-11-04 取代原来的「1:1 预览 + 选择/更换/清空」三控件）：
+        //    与光栅壁纸页**同一套**（`CoverCarousel`），item 0 = 新建卡。
+        //    点新建卡只做一件事：选一张图 → 直接生成一张新卡。
+        Spacer(Modifier.height(BLOCK_GAP))
+        // 把 crop 换算成卡片的**归一化源矩形**（null = 整幅，不裁）。
+        //
+        // 卡片要反映「显示区域」：crop 的 uv 窗口 = 中心 ± (visibleHalf / zoom)，
+        // 而 `visibleHalf` 来自 `Geometry`（只吃比例，所以拿 aspect 造一对假尺寸即可）。
+        // 球面映射会让裁出的像素矩形比屏幕比例宽约 2.7%，卡片由 `ContentScale.Crop`
+        // 自然吸收，肉眼看不出来 —— 不需要在卡片上跑 AGSL。
+        fun srcOf(c: SpatialDepth.SpatialCandidate): RectF? {
+            val cr = c.crop
+            if (cr.cx == 0.5f && cr.cy == 0.5f && cr.zoom == 1f) return null
+            val lw = 1000
+            val lh = (1000f / c.aspect.coerceAtLeast(0.01f)).toInt().coerceAtLeast(1)
+            val g = SpatialGlCore.geometry(screen.width, screen.height, lw, lh)
+            val halfW = g.visibleHalfX / cr.zoom
+            val halfH = g.visibleHalfY / cr.zoom
+            return RectF(cr.cx - halfW, cr.cy - halfH, cr.cx + halfW, cr.cy + halfH)
         }
+        if (loaded) {
+            CoverCarousel(
+                items = candidates.map { CoverItem(it.key, it.cover, srcOf(it)) },
+                initialPage = if (candidates.isEmpty()) 0 else 1,
+                activeId = inUseKey,
+                deletingId = deletingId,
+                shiftDir = shiftDir,
+                shiftFromPage = shiftFromPage,
+                shiftToken = shiftToken,
+                screen = screen,
+                onFocus = { focused = it },
+                onNew = {
+                    haptic()
+                    picker.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                    )
+                },
+                // 点图卡 = 将来「调整显示区域」的入口（UI 还没定）。**正在应用的那张不能编辑**：
+                // 改显示区域会直接影响正在渲染的那一份（用户 2026-11-04）。
+                onClick = { item ->
+                    when {
+                        item.id == inUseKey ->
+                            Toast.makeText(ctx, "正在应用的图片无法编辑", Toast.LENGTH_SHORT).show()
+                        else -> {
+                            haptic()
+                            cropLauncher.launch(SpatialCropActivity.intent(ctx, item.id))
+                        }
+                    }
+                },
+                onDelete = { item ->
+                    val c = candidates.firstOrNull { it.key == item.id }
+                    when {
+                        c == null -> Unit
+                        // 删除钮本来就不会出现在正在应用的那张上，这条只是兜底。
+                        c.key == inUseKey ->
+                            Toast.makeText(ctx, "请先取消应用", Toast.LENGTH_SHORT).show()
+                        else -> {
+                            haptic()
+                            pendingDelete = c
+                        }
+                    }
+                },
+                onDeleteSettled = { commitDelete() },
+                // 推理期间**收起所有删除钮**（用户 2026-11-04）：一次 7~10s，
+                // 中途把正在算的那张删掉，结果就没处可写了。
+                allowDelete = !busy,
+            )
+        } else {
+            Spacer(Modifier.height(carouselHeight))
+        }
+        // 按钮上方的可见间距 = padding + 下面这条 Spacer，两者之和正好是 BLOCK_GAP。
+        Spacer(Modifier.height(BLOCK_GAP - pagerPadding))
 
-        // 二、动作卡：「生成深度缓存」+「立即替换」（主题色）。
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(top = 12.dp),
-            insideMargin = PaddingValues(0.dp),
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                TextButton(
-                    text = if (busy) "处理中…" else "生成深度缓存",
+        // 二、两个按钮并排（2026-11-04 用户定）：
+        //    宽 = 卡宽 5/6（与光栅主按钮**同一个值**）、间距 12dp、整行居中。
+        Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                // 「生成深度缓存」：**常规色底 + 提示色字**（次要动作，与光栅「取消应用」同一档）。
+                Button(
                     onClick = {
                         haptic()
-                        // 有 picked 用 picked；没有就用缓存目录里的原图（页面重建后的常态）
-                        val uri = picked ?: sourceKey
-                            ?.let { SpatialDepth.sourceFile(File(SpatialDepth.cacheRoot(ctx), it)) }
-                            ?.takeIf { it.isFile }
-                            ?.let { Uri.fromFile(it) }
+                        val c = selected
                         when {
-                            uri == null -> Toast.makeText(ctx, "请先选择图片", Toast.LENGTH_SHORT).show()
-                            busy || checking -> Unit
+                            c == null -> Unit
+                            // 旧版缓存只有深度、没有原图副本 ⇒ 重算深度拿不到 uri。
+                            !c.hasSource -> Toast.makeText(
+                                ctx,
+                                "此图片为旧版缓存，请删除后重新导入",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            // 命中缓存：10s 内再点一次才覆盖重算（2026-10-22 用户要求）。
+                            c.hasLayers && !(
+                                confirmKey == c.key &&
+                                    SystemClock.elapsedRealtime() <= confirmUntil
+                                ) -> {
+                                confirmKey = c.key
+                                confirmUntil = SystemClock.elapsedRealtime() + CACHE_CONFIRM_WINDOW_MS
+                                Toast.makeText(
+                                    ctx,
+                                    "该图片已有缓存，如需重新生成并替换请在10s内再次点击",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
                             else -> {
-                                // **命中有缓存时不直接重算**（2026-10-22 用户要求）：
-                                // 先提示「10s 内再点一次」，窗口内再点才覆盖重算。
-                                // ⚠️ 这里只翻 `checking`（防重入），**不翻 `busy`** ——
-                                // busy 会连带把两个按钮打灰，用户看到的就是「闪一下」。
-                                scope.launch {
-                                    checking = true
-                                    val key = withContext(Dispatchers.IO) {
-                                        runCatching { SpatialDepth.hasCache(ctx, uri) }.getOrNull()
-                                    }
-                                    checking = false
-                                    val now = SystemClock.elapsedRealtime()
-                                    // 层图缺失/格式过期（`hasLayers` 会检查版本号）时**直接补算层图**，
-                                    // 不走「10 秒内再点一次」那套 —— 那种情况用户根本没得选，
-                                    // 深度命中缓存、只重跑分层（1~2 秒）。
-                                    val layersReady = key != null && SpatialLayers.hasLayers(
-                                        File(SpatialDepth.cacheRoot(ctx), key),
-                                    )
-                                    if (key != null && layersReady &&
-                                        !(confirmKey == key && now <= confirmUntil)
-                                    ) {
-                                        confirmKey = key
-                                        confirmUntil = now + CACHE_CONFIRM_WINDOW_MS
-                                        Toast.makeText(
-                                            ctx,
-                                            "该图片已有缓存，如需重新生成并替换请在10s内再次点击",
-                                            Toast.LENGTH_LONG,
-                                        ).show()
-                                    } else {
-                                        val force = key != null && layersReady
-                                        confirmKey = null
-                                        runGenerate(uri, force)
-                                    }
-                                }
+                                confirmKey = null
+                                val uri = Uri.fromFile(
+                                    SpatialDepth.sourceFile(File(SpatialDepth.cacheRoot(ctx), c.key)),
+                                )
+                                runGenerate(uri, c.hasLayers)
                             }
                         }
                     },
-                    modifier = Modifier.fillMaxWidth(),
-                    // 2026-10-31：生效中（两条链任一在跑）连「生成深度缓存」也一起变灰 ——
-                    // 与「更换图片 / 清空选择」同一把 `locked`。生效中重算缓存没有意义，
-                    // 且会把正在渲染的那份层图覆盖掉。
-                    enabled = !busy && !locked,
-                    colors = ButtonDefaults.textButtonColorsPrimary(),
-                )
-                Spacer(Modifier.height(12.dp))
-                TextButton(
-                    text = when {
-                        // 系统壁纸服务模式：两个文案都由「当前系统壁纸是不是我们」决定
-                        mountMode == MaskPrefs.SPATIAL_MOUNT_SERVICE ->
-                            if (serviceRunning) "恢复到系统默认壁纸" else "跳转到服务页设置"
-                        lastKey != null && activeKey == lastKey -> "关闭替换"
-                        else -> "立即替换"
+                    modifier = Modifier.width(buttonWidth),
+                    // 没选中 / 正在推理 / 生效中（会覆盖正在渲染的层图）⇒ 不可点。
+                    // **判据与可点性保持原样**，这次只改配色。
+                    enabled = selected != null && !busy && !locked,
+                    // 与光栅浮页的「计算选中景深」**完全同一个形态**（用户 2026-11-04）：
+                    // 只给常态的「正常底 + 主体字」，**禁用时的字色完全交给 miuix 默认**。
+                    // 于是「新建页（没选中）」与「生成中（busy）」这两种不可点状态会自动置灰，
+                    // 不需要自己判断是哪种禁用 —— 也不该自己传 disabledContentColor。
+                    colors = ButtonDefaults.buttonColors(
+                        color = MiuixTheme.colorScheme.surfaceContainerHigh,
+                        contentColor = MiuixTheme.colorScheme.primary,
+                    ),
+                ) {
+                    Text(
+                        text = if (busy) "处理中…" else "生成深度缓存",
+                        style = MiuixTheme.textStyles.button,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+
+                // 主按钮四态（2026-11-04，逻辑照光栅页）：
+                //   新建卡「新图片」/ 服务模式「恢复默认」·「跳转系统页」/ 当前图「取消应用」/ 其余「应用」。
+                val serviceMode = mountMode == MaskPrefs.SPATIAL_MOUNT_SERVICE
+                val isActive = selected != null && selected.key == inUseKey
+                // 「取消 / 恢复」这类次要动作的配色判据：服务模式看"服务真在跑"，
+                // 不能只看指针 —— 用户可能从系统壁纸页把壁纸换回去了。
+                val secondary = if (serviceMode) serviceRunning else isActive
+                val label = when {
+                    selected == null -> "新图片"
+                    serviceMode -> if (serviceRunning) "恢复默认" else "跳转系统页"
+                    isActive -> "取消应用"
+                    else -> "应用"
+                }
+                // 提示色 ⇄ 常态：颜色叠化过去，不是硬切（与光栅页一致）。
+                val bg by animateColorAsState(
+                    targetValue = if (secondary) {
+                        MiuixTheme.colorScheme.surfaceContainerHigh
+                    } else {
+                        MiuixTheme.colorScheme.primary
                     },
-                    onClick = replace@{
+                    animationSpec = tween(BUTTON_FADE_MS),
+                )
+                val fg by animateColorAsState(
+                    targetValue = if (secondary) {
+                        MiuixTheme.colorScheme.primary
+                    } else {
+                        MiuixTheme.colorScheme.onPrimary
+                    },
+                    animationSpec = tween(BUTTON_FADE_MS),
+                )
+                Button(
+                    onClick = {
+                        // 振动统一提到最前（2026-11-04 修：原来只有「新图片」分支有 haptic，
+                        // 应用 / 取消应用 / 服务模式那几条点了都没震动）。
                         haptic()
-                        // ── 系统壁纸服务模式：**只走系统路径**（2026-10-30）──
-                        // 开启 = 写目标 + 拉起系统壁纸页（用户在页面里选生效范围）；
-                        // 关闭 = WallpaperManager.clear(both) → 回系统默认壁纸。
-                        if (mountMode == MaskPrefs.SPATIAL_MOUNT_SERVICE) {
-                            if (serviceRunning) {
-                                // `WallpaperManager.clear()` 是同步 binder，HyperOS 上要几百 ms，
-                                // 放主线程就是「点一下卡一下」（用户 2026-10-31 反馈）。
-                                // 丢到 IO 线程，完成后再回主线程更新状态 / toast。
+                        val c = selected
+                        when {
+                            c == null -> {
+                                picker.launch(
+                                    PickVisualMediaRequest(
+                                        ActivityResultContracts.PickVisualMedia.ImageOnly,
+                                    ),
+                                )
+                            }
+                            // ── 系统壁纸服务模式：只走系统路径 ──
+                            serviceMode -> if (serviceRunning) {
+                                // `WallpaperManager.clear()` 是同步 binder，丢 IO 线程。
                                 scope.launch {
                                     withContext(Dispatchers.IO) { SpatialServiceMode.disable(ctx) }
                                     serviceRunning = SpatialServiceMode.isRunning(ctx)
-                                    Toast.makeText(ctx, "已恢复到系统默认壁纸", Toast.LENGTH_LONG).show()
+                                    serviceTargetKey = ""
+                                    activeKey = ""
+                                    reload++
+                                    Toast.makeText(
+                                        ctx, "已恢复到系统默认壁纸", Toast.LENGTH_LONG,
+                                    ).show()
                                 }
                             } else {
-                                val k = lastKey
-                                val ok = k != null && SpatialLayers.hasLayers(
-                                    File(SpatialDepth.cacheRoot(ctx), k),
+                                // 功能冲突（三侧统一）：跳系统页会把系统壁纸换掉 ⇒ 先关对方。
+                                val other = WallpaperConflict.running(
+                                    ctx, state, WallpaperChain.SPATIAL,
                                 )
-                                if (ok) {
-                                    SpatialServiceMode.enable(ctx, k!!)
-                                    Toast.makeText(
-                                        ctx,
-                                        "请在系统服务页设置生效范围",
-                                        Toast.LENGTH_LONG,
-                                    ).show()
-                                } else {
-                                    Toast.makeText(ctx, "请先生成深度缓存", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                            return@replace
-                        }
-                        // ── 激活保险（2026-10-31 用户要求）──
-                        // LSPosed 模式靠模块激活（属性通道 + hook 落盘）才能生效，未激活时点
-                        // 「立即替换」只会静默失败 ⇒ 先拦一句。判据用 `fullyActivated`
-                        // （与功能页 `requireActivated()` 同一把闸门）。
-                        // ⚠️ **关闭方向不拦**：否则掉激活后用户连关都关不掉。
-                        // 位置在服务模式 return 之后 ⇒ 服务模式（免 Root）完全不受影响。
-                        val closing = lastKey != null && activeKey == lastKey
-                        if (!closing && !state.fullyActivated) {
-                            Toast.makeText(
-                                ctx,
-                                "以LSPosed模式运行时需要激活模块，请先激活",
-                                Toast.LENGTH_LONG,
-                            ).show()
-                            return@replace
-                        }
-                        // **纯同步**：只用已记下的缓存键 + 一次文件存在性检查。
-                        // 之前这里走 `busy` + IO 协程，busy 一翻，两个按钮的文案/可用态跟着变 → 看着在「闪」。
-                        val known = lastKey
-                        val hasLayers = known != null && SpatialLayers.hasLayers(
-                            File(SpatialDepth.cacheRoot(ctx), known),
-                        )
-                        android.util.Log.i(
-                            "HyperExtreme",
-                            "SPATIAL_UI click lastKey=$known hasLayers=$hasLayers picked=$picked " +
-                                "source=$sourceKey active=$activeKey parallax=${state.parallaxActive}",
-                        )
-                        when {
-                            // 关闭方向：不做互斥检查（关闭永远不会冲突）
-                            hasLayers && activeKey == known -> {
-                                SpatialControl.disable(ctx)
-                                activeKey = ""
-                            }
-                            // 开启方向：**最后**才查互斥。上面「有没有可替换的图」已经过了，
-                            // 这时才轮到「视差正在生效」这个外部条件。
-                            hasLayers && state.parallaxActive -> showConflict = true
-                            hasLayers -> enableSpatial(known!!)
-                            // 键丢了但有图：现算一次（异步，不翻 busy，所以不闪）
-                            picked != null || sourceKey != null -> scope.launch {
-                                val u = picked ?: sourceKey
-                                    ?.let { SpatialDepth.sourceFile(File(SpatialDepth.cacheRoot(ctx), it)) }
-                                    ?.takeIf { it.isFile }
-                                    ?.let { Uri.fromFile(it) } ?: return@launch
-                                val k = withContext(Dispatchers.IO) {
-                                    runCatching { SpatialDepth.cacheKey(ctx, u) }.getOrNull()
-                                }
-                                if (k != null && SpatialLayers.hasLayers(File(SpatialDepth.cacheRoot(ctx), k))) {
-                                    lastKey = k
-                                    prefs.setSpatialLastKey(k)
-                                    if (state.parallaxActive) showConflict = true else enableSpatial(k)
-                                } else {
-                                    Toast.makeText(
+                                when {
+                                    other != null -> {
+                                        conflictOther = other
+                                        showConflict = true
+                                    }
+                                    !DynamicWallpaperPermission.allowed(ctx) -> {
+                                        Toast.makeText(
+                                            ctx,
+                                            "请先给予模块“动态壁纸服务”权限",
+                                            Toast.LENGTH_LONG,
+                                        ).show()
+                                        DynamicWallpaperPermission.openSettings(ctx)
+                                    }
+                                    !c.hasLayers -> Toast.makeText(
                                         ctx, "请先生成深度缓存", Toast.LENGTH_SHORT,
                                     ).show()
+                                    else -> {
+                                        SpatialServiceMode.enable(ctx, c.key)
+                                        serviceTargetKey = c.key
+                                        Toast.makeText(
+                                            ctx, "请在系统服务页设置生效范围", Toast.LENGTH_LONG,
+                                        ).show()
+                                    }
                                 }
                             }
+                            // ── LSPosed：关闭方向不做互斥检查 ──
+                            isActive -> {
+                                SpatialControl.disable(ctx)
+                                activeKey = ""
+                                reload++
+                            }
                             else -> {
-                                android.util.Log.i("HyperExtreme", "SPATIAL_UI click 无图无键，忽略")
-                                Toast.makeText(ctx, "请先选择图片", Toast.LENGTH_SHORT).show()
+                                // 激活保险：未激活时点「应用」只会静默失败。
+                                if (!state.fullyActivated) {
+                                    Toast.makeText(
+                                        ctx,
+                                        "以LSPosed模式运行时需要激活模块，请先激活",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                } else if (!c.hasLayers) {
+                                    Toast.makeText(ctx, "请先生成深度缓存", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    val other = WallpaperConflict.running(
+                                        ctx, state, WallpaperChain.SPATIAL,
+                                    )
+                                    if (other != null) {
+                                        conflictOther = other
+                                        showConflict = true
+                                    } else {
+                                        enableSpatial(c.key)
+                                    }
+                                }
                             }
                         }
                     },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.textButtonColorsPrimary(),
-                )
+                    modifier = Modifier.width(buttonWidth),
+                    colors = ButtonDefaults.buttonColorsPrimary(
+                        color = bg,
+                        disabledColor = bg,
+                        contentColor = fg,
+                        disabledContentColor = fg,
+                    ),
+                ) {
+                    Crossfade(targetState = label, animationSpec = tween(BUTTON_FADE_MS)) { t ->
+                        Text(
+                            text = t,
+                            style = MiuixTheme.textStyles.button,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
             }
         }
 
-        // 三、参数调整（**卡外标题**，与设置页"外观 / 测试"同一类）。
-        SmallTitle("参数调整")
+        // 三、参数调整（2026-11-04 用户要求：**去掉「参数调整」这个小标题**，
+        //    卡片直接接在按钮下面 —— 间距仍按统一的 BLOCK_GAP）。
+        Spacer(Modifier.height(BLOCK_GAP))
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -753,7 +866,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                 summary = null,
                 titleColor = BasicComponentColors(
                     color = MiuixTheme.colorScheme.error,
-                    disabledColor = MiuixTheme.colorScheme.disabledOnSurface,
+                    disabledColor = MiuixTheme.colorScheme.surfaceContainerHigh,
                 ),
                 onClick = {
                     haptic()
@@ -793,13 +906,23 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
             }
             // 删 `files/spatial/` 下所有子目录（逻辑原来在 SpatialDepth 里，这里直接走它）
             val n = SpatialDepth.clearAll(ctx)
-            // 层图/原图都没了 ⇒ 记着的键作废（生效态上面已经关掉了）
-            lastKey = null
-            sourceKey = null
+            // 候选就是这些目录 ⇒ 列表、选中、顺序一起作废（生效态上面已经关掉了）。
+            candidates = emptyList()
+            focused = 0
+            serviceTargetKey = ""
+            prefs.setSpatialCandidateOrder(emptyList())
             prefs.setSpatialSourceKey(null)
             Toast.makeText(ctx, "已清除 $n 项深度缓存", Toast.LENGTH_SHORT).show()
             showClearConfirm = false
         },
+    )
+
+    // 「删除此图片？」确认框（2026-11-04，照搬光栅页「删除此搭配？」的形态）：
+    // 标题 + 正文 + 取消 / 确认（**确认键用警示色**）。确认后才播缩小淡出，播完真删。
+    SpatialDeleteDialog(
+        show = pendingDelete != null,
+        onDismissRequest = { pendingDelete = null },
+        onConfirm = { pendingDelete?.let { deleteCandidate(it) } },
     )
 
     // 「功能提醒」弹窗（切到系统壁纸服务模式时弹一次；勾了「不再弹」就不再出现）。
@@ -819,11 +942,16 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     // 「关闭」只关视差、**不继续**本次替换；要再点一次「立即替换」才生效。
     FeatureConflictDialog(
         show = showConflict,
-        summary = "当前视差壁纸已生效，应用空间壁纸需先关闭",
-        onDismissRequest = { showConflict = false },
-        onConfirmClose = {
+        summary = conflictOther?.let { WallpaperConflict.summary(it, WallpaperChain.SPATIAL) } ?: "",
+        onDismissRequest = {
             showConflict = false
-            state.disableParallax()
+            conflictOther = null
+        },
+        onConfirmClose = {
+            val other = conflictOther
+            showConflict = false
+            conflictOther = null
+            if (other != null) scope.launch { WallpaperConflict.disable(ctx, state, other) }
         },
     )
 }
@@ -847,6 +975,52 @@ private val MOUNT_MODE_LABELS = listOf("LSPosed", "系统壁纸服务（免Root�
 /** 取值 → 文案；越界时回退到默认档（锁屏），绝不抛。 */
 private fun scopeLabel(v: Int): String =
     SPATIAL_SCOPE_LABELS.getOrElse(v) { SPATIAL_SCOPE_LABELS[0] }
+
+/**
+ * 「删除此图片？」确认框（2026-11-04，照搬光栅页「删除此搭配？」）。
+ *
+ * 结构照 [ClearCacheDialog]：`WindowDialog` + `SpaceBetween` + 两个 `TextButtonLike`，
+ * **确认键用 miuix 警示主题色**（`colorScheme.error` 底 + `onError` 字）。
+ */
+@Composable
+private fun SpatialDeleteDialog(
+    show: Boolean,
+    onDismissRequest: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    WindowDialog(
+        title = "删除此图片？",
+        summary = "图片与深度缓存将被删除",
+        show = show,
+        onDismissRequest = onDismissRequest,
+    ) {
+        val dismissState = LocalDismissState.current
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Spacer(Modifier.height(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                TextButtonLike(
+                    text = "取消",
+                    onClick = {
+                        onDismissRequest()
+                        dismissState?.invoke()
+                    },
+                )
+                Spacer(Modifier.width(20.dp))
+                TextButtonLike(
+                    text = "确认",
+                    danger = true,
+                    onClick = {
+                        onConfirm()
+                        dismissState?.invoke()
+                    },
+                )
+            }
+        }
+    }
+}
 
 /**
  * 「清除所有深度缓存」的二次确认弹窗。
@@ -889,7 +1063,9 @@ private fun ClearCacheDialog(
                 Spacer(Modifier.width(20.dp))
                 TextButtonLike(
                     text = "清除",
-                    primary = true,
+                    // 警示色（用户 2026-11-04）：清缓存是不可恢复的破坏性操作，
+                    // 与「删除此搭配」同一档配色（`colorScheme.error` 底 + `onError` 字）。
+                    danger = true,
                     onClick = {
                         onConfirm()
                         dismissState?.invoke()

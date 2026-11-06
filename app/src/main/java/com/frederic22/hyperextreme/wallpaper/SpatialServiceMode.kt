@@ -34,11 +34,23 @@ object SpatialServiceMode {
      * **桌面和锁屏任一命中就算"运行中"**：用户在系统页可以选"仅桌面 / 仅锁屏 / 同时"，
      * 选"仅锁屏"时 `FLAG_SYSTEM` 还指着原来的壁纸，只查那一路会漏判 ⇒ UI 会以为没生效、
      * 又去点一次。带 `which` 的重载是 API 34，33 上退回无参（等价 FLAG_SYSTEM）。
+     *
+     * ⚠️ **判据必须比到 component 类名，不能只比包名**（2026-11-04）：现在有两个
+     * `WallpaperService`（[SpatialWallpaperService] 与 [RasterWallpaperService]），
+     * 包名相同 ⇒ 只比包名会让两套功能互相误判「我的服务正在跑」。
+     *
+     * @param service 要检查的服务类，默认空间壁纸那条
      */
-    fun isRunning(ctx: Context): Boolean = runCatching {
+    fun isRunning(
+        ctx: Context,
+        service: Class<out WallpaperService> = SpatialWallpaperService::class.java,
+    ): Boolean = runCatching {
         val wm = WallpaperManager.getInstance(ctx)
-        fun ours(info: android.app.WallpaperInfo?): Boolean =
-            info?.component?.packageName == ctx.packageName
+        val pkg = ctx.packageName
+        fun ours(info: android.app.WallpaperInfo?): Boolean {
+            val c = info?.component ?: return false
+            return c.packageName == pkg && c.className == service.name
+        }
         if (Build.VERSION.SDK_INT >= 34) {
             ours(wm.getWallpaperInfo(WallpaperManager.FLAG_SYSTEM)) ||
                 ours(wm.getWallpaperInfo(WallpaperManager.FLAG_LOCK))
@@ -81,7 +93,10 @@ object SpatialServiceMode {
      * （那个 API 要 signature 权限，第三方拿不到）⇒ 它只能靠系统页设置。
      * 差别只在 AppOps：WE 的 `MIUIOP(10045)` 是**显式 allow**，我们靠**系统默认 allow**。
      */
-    fun openPicker(ctx: Context) {
+    fun openPicker(
+        ctx: Context,
+        service: Class<out WallpaperService> = SpatialWallpaperService::class.java,
+    ) {
         val app = ctx.applicationContext ?: ctx
         // 一、A：WE 那条路（component + LiveWallpaperChange）—— 唯一第三方可直达的
         val a = runCatching {
@@ -93,7 +108,7 @@ object SpatialServiceMode {
                     )
                     .putExtra(
                         WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,
-                        ComponentName(app, SpatialWallpaperService::class.java),
+                        ComponentName(app, service),
                     )
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
@@ -110,8 +125,11 @@ object SpatialServiceMode {
                 val ri = pm.queryIntentServices(
                     Intent(WallpaperService.SERVICE_INTERFACE),
                     PackageManager.GET_META_DATA,
-                ).firstOrNull { it.serviceInfo.packageName == app.packageName }
-                    ?: error("查不到自己的壁纸 service")
+                ).firstOrNull {
+                    // ⚠️ 必须连类名一起比：本包有两个 WallpaperService，只比包名会拿到另一个。
+                    it.serviceInfo.packageName == app.packageName &&
+                        it.serviceInfo.name == service.name
+                } ?: error("查不到自己的壁纸 service（${service.name}）")
                 ctx.startActivity(
                     Intent()
                         .setClassName(
@@ -148,9 +166,23 @@ object SpatialServiceMode {
      * 壁纸进程是独立进程，读不到 UI 侧的内存状态，只能靠 [SpatialServiceTarget] 这个文件。
      * **先写文件再跳转** —— 用户从系统页返回时壁纸进程可能已经开始渲染了。
      */
-    fun enable(ctx: Context, key: String) {
-        SpatialServiceTarget.write(ctx, key)
-        openPicker(ctx)
+    /**
+     * 准备并跳转：先把「要渲染哪张图」落盘，再拉起系统页。
+     *
+     * 壁纸进程是独立进程，读不到 UI 侧的内存状态，只能靠 target 文件。
+     * **先写文件再跳转** —— 用户从系统页返回时壁纸进程可能已经开始渲染了。
+     *
+     * @param service 目标壁纸服务（空间 / 光栅）
+     * @param writeTarget 目标文件的写入方式（两套壁纸**各一份**，互不覆盖）
+     */
+    fun enable(
+        ctx: Context,
+        key: String,
+        service: Class<out WallpaperService> = SpatialWallpaperService::class.java,
+        writeTarget: (Context, String) -> Unit = { c, k -> SpatialServiceTarget.write(c, k) },
+    ) {
+        writeTarget(ctx, key)
+        openPicker(ctx, service)
     }
 
     /**
@@ -158,12 +190,17 @@ object SpatialServiceMode {
      *
      * ⚠️ 必须清 **both**：只清 `FLAG_SYSTEM` 的话，之前设成 both 的壁纸会"退化成只剩锁屏"，
      * 我们的 service 还赖在锁屏上（官方文档原话："it will become lock screen only"）。
+     *
+     * @param clearTarget 目标文件的清理方式（与 [enable] 的写入方成对）
      */
-    fun disable(ctx: Context) {
+    fun disable(
+        ctx: Context,
+        clearTarget: (Context) -> Unit = { SpatialServiceTarget.clear(it) },
+    ) {
         runCatching {
             WallpaperManager.getInstance(ctx)
                 .clear(WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK)
         }.onFailure { Log.w(TAG, "clear 壁纸失败：${it.javaClass.simpleName}: ${it.message}") }
-        SpatialServiceTarget.clear(ctx)
+        clearTarget(ctx)
     }
 }

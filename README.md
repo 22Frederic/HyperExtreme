@@ -7,15 +7,16 @@
 <p align="center">Extreme for HyperOS</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Platform-Android-blue?style=flat-square&logo=android" alt="platform">
-  <img src="https://img.shields.io/badge/minSdk-33-red?style=flat-square" alt="minSdk">
-  <img src="https://img.shields.io/badge/targetSdk-37-green?style=flat-square" alt="targetSdk">
-  <img src="https://img.shields.io/badge/License-AGPL--3.0-yellow?style=flat-square" alt="license">
+  <img src="https://img.shields.io/github/v/release/22Frederic/HyperExtreme?style=flat" alt="release">
+  <img src="https://img.shields.io/badge/Platform-Android-blue?style=flat&logo=android" alt="platform">
+  <img src="https://img.shields.io/badge/minSdk-33-red?style=flat" alt="minSdk">
+  <img src="https://img.shields.io/badge/targetSdk-37-green?style=flat" alt="targetSdk">
+  <img src="https://img.shields.io/badge/License-AGPL--3.0-yellow?style=flat" alt="license">
 </p>
 
 ## 兼容性
 
-对于空间壁纸：LSPosed模式只在澎湃OS4上测试，也只会对澎湃OS4适配；系统壁纸服务（免Root）模式理论支持到安卓13，但对安卓17之外的安卓版本未测试。
+对于空间壁纸与光栅壁纸：LSPosed模式只在澎湃OS4上测试，也只会对澎湃OS4适配；系统壁纸服务（免Root）模式理论支持到安卓13，但对安卓17之外的安卓版本未测试。
 
 对于其他功能：都需要Root与LSPosed，只会对澎湃OS4适配。
 

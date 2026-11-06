@@ -111,11 +111,17 @@ internal object SpatialGlCore {
         uniform float uDepthCh;     // 0 = 背景场(.r)，1 = 主体场(.a)
         uniform float uDkTh;        // 选择性融合的深度差阈值（|Δk|）
         uniform float uDim;         // AOD 压暗系数（1 = 原亮度，0 = 全黑）
+        // 显示区域（2026-11-04）：uv' = uv * uUvScale + uUvOffset
+        // scale = 1/zoom，offset = c − 0.5/zoom（见 `SpatialCrop`）。
+        // ⚠️ 深度场与颜色**必须用同一套变换**，否则位移场和图像错位、主体会飘。
+        uniform vec2 uUvScale;
+        uniform vec2 uUvOffset;
         void main() {
             vec2 q0 = vec2(atan(vNdc.x * uK.x) / uSpan.x, atan(vNdc.y * uK.y) / uSpan.y);
             // ⚠️ y 必须反转：GL 的 v=0 在纹理底部，而屏幕 NDC 的 y=+1 在顶部
             //（2026-10-23 实测：直接 0.5+q*0.5 会导致整幅壁纸上下颠倒）。
             vec2 uv0 = vec2(q0.x * 0.5 + 0.5, 0.5 - q0.y * 0.5);
+            uv0 = uv0 * uUvScale + uUvOffset;
 
             // **逐像素位移**：位移不按「层」给定值，而是按每个像素自己的 k 算
             //（每层一个常数 ⇒ 深度只在层边界跳变 ⇒ 转动时层间割裂）。
@@ -136,6 +142,7 @@ internal object SpatialGlCore {
 
             vec2 q = q0 - uShift * k;
             vec2 uv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+            uv = uv * uUvScale + uUvOffset;
             if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
                 gl_FragColor = vec4(0.0);
                 return;
@@ -153,7 +160,37 @@ internal object SpatialGlCore {
     // ─────────────────────────── 几何 ───────────────────────────
 
     /** 屏幕 → 球面的 uniform 值。字段名与 GLSL 里的 `uK` / `uSpan` 一一对应。 */
-    class Geometry(val kx: Float, val ky: Float, val spanX: Float, val spanY: Float)
+    class Geometry(val kx: Float, val ky: Float, val spanX: Float, val spanY: Float) {
+
+        /**
+         * **屏幕当前看得见的 uv 半宽 / 半高**（zoom = 1 时；实际占用还要再除以 zoom）。
+         *
+         * 由 shader 那段反推：`q0 = atan(ndc·uK) / uSpan`，`uv = q0·0.5 + 0.5`
+         * ⇒ `ñdc = ±1` 时 `q0 = ±atan(uK)/uSpan` ⇒ uv 半宽 = `atan(kx)/spanX · 0.5`。
+         *
+         * 用途：「显示区域」的平移边界（2026-11-04）。中心必须落在
+         * `[half, 1−half]` 内才不会采到图外，`half` 就是它 —— 而不是 `0.5/zoom`
+         * （那个在 zoom = 1 时等于 0.5，等于把平移自由度全锁死）。
+         */
+        val visibleHalfX: Float get() = kotlin.math.atan(kx) / spanX * 0.5f
+
+        val visibleHalfY: Float get() = kotlin.math.atan(ky) / spanY * 0.5f
+
+        /**
+         * **每边要留给姿态位移的 uv 余量**（zoom = 1 时）。
+         *
+         * shader 里 `q = q0 − uShift·k`，`uShift = PAN_RAD / span` ⇒ uv 空间位移
+         * = `0.5 · (PAN_RAD / span) · k`，再除以 zoom 才是最终占用的余量。
+         *
+         * `k` 的物理上限是 `K_MIN + (1−K_MIN)·WARP_GAIN = 0.6175`（见 [SPHERE_SAFE] 注释），
+         * 不是 1 —— 用它算才能和 [SPHERE_SAFE] 的 0.0652 对上（1.45 倍余量）。
+         */
+        val shiftMarginX: Float get() = 0.5f * (PAN_RAD / spanX) * K_MAX
+        val shiftMarginY: Float get() = 0.5f * (PAN_RAD / spanY) * K_MAX
+    }
+
+    /** `k` 场的物理上限（`K_MIN + (1−K_MIN)·WARP_GAIN`）；位移余量按它算。 */
+    const val K_MAX = 0.6175f
 
     /**
      * 球面参数：屏幕垂直半角 = [SPHERE_HALF_V_RAD]，图像水平半角 = 垂直半角 × 图像宽高比。

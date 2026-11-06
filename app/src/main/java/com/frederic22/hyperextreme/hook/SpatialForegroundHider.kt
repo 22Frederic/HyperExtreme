@@ -77,9 +77,20 @@ internal object SpatialForegroundHider {
         val active = HookRuntime.systemProperty(SpatialFlag.PROP_ACTIVE).trim() == "1"
         val scope = HookRuntime.systemProperty(SpatialFlag.PROP_SCOPE).trim().toIntOrNull()
             ?: MaskPrefs.SPATIAL_SCOPE_LOCK
-        val v = active && scope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
+        val spatialOn = active && scope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
+        // **光栅壁纸同样需要撤这一层**（2026-11-04）：它也挂在壁纸 leash 上、全屏不透明，
+        // 系统那层 `keyguard_foreground_layer`（主体抠像 + 景深色带）会压在我们的图上面，
+        // 看起来就是"旧壁纸的人浮在新壁纸上面"。它没有景深主体，所以走下面的"旧链"整层压掉。
+        val rasterActive = HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.RasterFlag.PROP_ACTIVE,
+        ).trim() == "1"
+        val rasterScope = HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.RasterFlag.PROP_SCOPE,
+        ).trim().toIntOrNull() ?: MaskPrefs.SPATIAL_SCOPE_LOCK
+        val rasterOn = rasterActive && rasterScope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
+        val v = spatialOn || rasterOn
         if (v != cacheValue) {
-            log("开关 -> $v（active=$active scope=$scope）")
+            log("开关 -> $v（空间=$spatialOn[$active/$scope] 光栅=$rasterOn[$rasterActive/$rasterScope]）")
         }
         cacheAt = now
         cacheValue = v
@@ -145,18 +156,29 @@ internal object SpatialForegroundHider {
         val layer = field.get(self) as? android.view.ViewGroup ?: return
         if (layer.visibility != View.VISIBLE) return
 
-        if (SpatialOverlay.active()) {
+        if (SpatialOverlay.active() || RasterOverlay.active()) {
             // 新链：我们的主体顶替系统主体 ⇒ 把系统那个 ImageView **从父容器摘掉**（问题 2：
             // 设 INVISIBLE 会被系统的 folme onBegin 每帧翻回来），整层留着（它管着我们的
             // View 的显隐、模糊、解锁退场）。
-            SpatialOverlay.detachSystemSubject(layer)
-            SpatialOverlay.ensure(layer)
+            //
+            // ⚠️ 两套壁纸**互斥**：`keyguard_foreground_layer` 只有一个，谁在跑谁占，
+            //    另一条链必须当场收口 —— 否则两个主体会叠在同一层上（2026-11-04）。
+            if (SpatialOverlay.active()) {
+                SpatialOverlay.detachSystemSubject(layer)
+                SpatialOverlay.ensure(layer)
+                RasterOverlay.onDisabled()
+            } else {
+                RasterOverlay.detachSystemSubject(layer)
+                RasterOverlay.ensure(layer)
+                SpatialOverlay.onDisabled()
+            }
             logOnceDepth()
             return
         }
 
         // 旧链：整层压掉
         SpatialOverlay.onDisabled()
+        RasterOverlay.onDisabled()
         val view = layer as View
         if (Looper.myLooper() == Looper.getMainLooper()) {
             view.visibility = View.INVISIBLE
@@ -192,7 +214,10 @@ internal object SpatialForegroundHider {
             val mgr = f.get(self) ?: return@runCatching null
             mgr.javaClass.getMethod("fullAodEnable").invoke(mgr) as? Boolean
         }.getOrNull() ?: return
-        SpatialOverlay.setLeashScale(if (full) 1.05f else 1f)
+        val scale = if (full) 1.05f else 1f
+        // 两套壁纸（空间 / 光栅）共用同一层，缩放口径也必须一致 —— 谁在跑谁吃这个值。
+        SpatialOverlay.setLeashScale(scale)
+        RasterOverlay.setLeashScale(scale)
     }
 
     private fun logOnceDepth() {

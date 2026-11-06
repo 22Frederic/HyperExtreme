@@ -63,3 +63,11 @@
 -keepclasseswithmembernames class com.frederic22.hyperextreme.spatial.** {
     native <methods>;
 }
+
+# ── 光栅壁纸的 AICR 客户端（2026-11-03）────────────────────────────────────────
+#
+# Root 兜底路径是 `su -c "CLASSPATH=<base.apk> app_process ... RootSegmentMain"` ——
+# 入口类是按**全限定类名字符串**找的，R8 改一次名这条路就静默失效（现象只是"降级也失败"）。
+# AicrVision 一并 keep：它被 RootSegmentMain 的静态入口间接引用，R8 有可能把它内联掉。
+-keep class com.frederic22.hyperextreme.aicr.RootSegmentMain { *; }
+-keep class com.frederic22.hyperextreme.aicr.AicrVision { *; }

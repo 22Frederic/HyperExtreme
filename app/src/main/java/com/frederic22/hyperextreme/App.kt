@@ -6,6 +6,7 @@ import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.data.MaskStore
 import com.frederic22.hyperextreme.data.ParallaxCoverFlag
 import com.frederic22.hyperextreme.data.ParallaxFeed
+import com.frederic22.hyperextreme.data.RasterFlag
 import com.frederic22.hyperextreme.data.SpatialFlag
 import com.frederic22.hyperextreme.spatial.SpatialDepth
 import com.frederic22.hyperextreme.wallpaper.SpatialServiceMode
@@ -64,11 +65,33 @@ class App : Application() {
             ParallaxCoverFlag.push(prefs.parallaxCoverDesktop && prefs.parallaxBgActive)
             // 「空间壁纸」开关的系统属性同步（同上：debug.* 属性不持久化，重启后靠这里补回）。
             // SystemUI 侧读 prefs 不可靠（陈旧快照 + openRemoteFile 读不到），只认这两个属性。
+            // 「显示区域」也要一起补推：渲染器在 SystemUI 进程读不到模块的 crop.json，
+            // 只认这条属性；`debug.*` 不持久化，重启后不补就是默认（= 不裁剪）。
+            val spatialKey = prefs.spatialKey.takeIf { it.isNotEmpty() }
             SpatialFlag.push(
                 prefs.spatialActive,
-                prefs.spatialKey.takeIf { it.isNotEmpty() },
+                spatialKey,
                 prefs.spatialScope,
                 prefs.spatialLockDepth,
+                spatialKey?.let {
+                    com.frederic22.hyperextreme.spatial.SpatialCrop.encodeProp(
+                        com.frederic22.hyperextreme.spatial.SpatialCrop.read(this, it),
+                    )
+                }.orEmpty(),
+            )
+            // 「光栅壁纸」同理：属性不持久化，重启后靠这里补回。
+            //
+            // ⚠️ **服务模式必须推 false**（2026-11-04）：那条链由系统壁纸页驱动，
+            // 属性一亮 hook 链也会去挂 leash ⇒ 同一张图被画两遍（错位 + 掉帧）。
+            // `rasterActiveId` 在服务模式下只是 UI 指针，不能当作"要渲染"的判据。
+            val rasterLsposed = prefs.rasterMountMode == MaskPrefs.RASTER_MOUNT_LSPOSED
+            RasterFlag.push(
+                rasterLsposed && prefs.rasterActiveId.isNotEmpty(),
+                prefs.rasterActiveId.takeIf { it.isNotEmpty() },
+                prefs.rasterScope,
+                prefs.rasterLockDepth,
+                prefs.rasterMaxAngle,
+                prefs.rasterSettle,
             )
             // 开关开着但图可能失效（重装/换图）——启动时再推一次给 miwallpaper。
             if (prefs.parallaxCoverDesktop) {
@@ -80,31 +103,15 @@ class App : Application() {
             // 未开启时按普通候选语义随启动清空（用户定的"回到软件重启候选清空"）。
             val parallaxCleared = !prefs.parallaxBgActive && MaskStore.parallaxExists(this) &&
                 run { MaskStore.clearParallax(this); true }
-            // 「空间壁纸」的候选：同样「关闭状态下一进进程就清空」（2026-10-29 用户要求，同视差）。
-            //
-            // 清三样：`source` 原图副本、`spatialSourceKey`（候选键）、`spatialLastKey`（已生成键）。
-            // 为什么要连 lastKey 一起清：空间壁纸的「立即替换」只依赖 layers/，不依赖 source，
-            // 单清候选会出现「预览空着、却能立即替换」的新不一致。
-            // 深度 / 层图**不删** —— 下次重新选同一张图会直接命中缓存。
-            //
-            // 2026-10-31：判据从 `spatialActive` 换成 [spatialRunning] —— **系统壁纸服务
-            // 正在运行时也算生效**。服务链不写 `spatialActive`（恒 false），原来服务模式
-            // 一重开 app 就把候选清掉 ⇒ 预览框空着、跟屏幕上正在渲染的图对不上。
-            val spatialCleared = !spatialRunning(prefs) && prefs.spatialSourceKey.isNotEmpty() && run {
-                runCatching {
-                    File(SpatialDepth.cacheRoot(this), prefs.spatialSourceKey)
-                        .resolve(SpatialDepth.SOURCE_NAME)
-                        .delete()
-                }
-                prefs.setSpatialSourceKey(null)
-                prefs.setSpatialLastKey(null)
-                true
-            }
-            if (cleared.isNotEmpty() || parallaxCleared || spatialCleared) {
+            // ⚠️ 「空间壁纸的候选随启动清空」**已于 2026-11-04 移除**：
+            // 二级页改成卡片式候选后，每张卡就是 `files/spatial/<key>/` 一个持久目录，
+            // 不再是「一次性的选中状态」。旧逻辑在未生效时会删掉 `spatialSourceKey` 指向的
+            // `source` 原图副本 —— 那会把一张正常候选变成"没有原图、不能重算"的残卡。
+            // `spatialSourceKey` / `spatialLastKey` 两个键一并退役（字段保留，不再读写）。
+            if (cleared.isNotEmpty() || parallaxCleared) {
                 val detail = buildList {
                     if (cleared.isNotEmpty()) add(cleared.joinToString("、") { it.title })
                     if (parallaxCleared) add("背景")
-                    if (spatialCleared) add("空间壁纸")
                 }.joinToString("、")
                 prefs.setDiagNote("启动清理：已清空残留候选（$detail）")
             }

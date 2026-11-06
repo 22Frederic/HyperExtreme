@@ -587,11 +587,14 @@ internal object ParallaxBg {
                 // 模糊探针（probe=3 记参数 / probe=4 把 100×ratio 设到壁纸 leash 上）
                 runCatching {
                     val controller = chain.getThisObject()
-                    SpatialRenderer.onKeyguardBlurArgs(
-                        chain.getArgs(),
-                        depthEffectOf(controller),
-                        foregroundLayerOf(controller),
-                    )
+                    val args = chain.getArgs()
+                    val depth = depthEffectOf(controller)
+                    val fg = foregroundLayerOf(controller)
+                    SpatialRenderer.onKeyguardBlurArgs(args, depth, fg)
+                    // **光栅壁纸同一个处境**（2026-11-04）：也挂在壁纸 leash 上、也是兄弟层，
+                    // 景深关时系统同样不会糊它。转发到 RasterRenderer，内部自己判在不在跑、
+                    // 景深开关、是否解锁退场；复用同一份反射缓存与日志。
+                    RasterRenderer.onKeyguardBlurArgs(args, depth, fg)
                 }.onFailure { HookRuntime.log("SPATIAL 探针：doBlurAndDim 处理异常：$it") }
                 return result
             }
@@ -800,6 +803,19 @@ internal object ParallaxBg {
 
     @Volatile
     private var subjectRef: WeakReference<View>? = null
+
+    /**
+     * **视差是否真的动过系统主体**（translation / scale）—— 2026-11-05 真机 bug 的修复位。
+     *
+     * [applyParallax] 往 `deducted_image_view` 写位移/缩放时置 true；
+     * [resetSubjectShift] **只在它为 true 时才写回** 0 / 1。
+     *
+     * 以前的写法是无条件复位，于是"视差根本没开"时也会把系统主体的 `scaleX/Y` 拉回 1.0；
+     * 而系统在「AOD 与锁屏样式相同」时会把主体缩到 `f - 0.05`（全屏 AOD = 0.95）
+     * ⇒ 被我们覆盖成 1.0，锁屏主体与背景稳态错位 5%（用户 2026-11-05 实测）。
+     */
+    @Volatile
+    private var subjectShiftApplied = false
 
     @Volatile
     private var backdropRef: WeakReference<BackdropView>? = null
@@ -2080,6 +2096,9 @@ internal object ParallaxBg {
             // 与背景倍数可不同——副本补偿按各自矩阵算，比例差也逐位对齐。
             if (subject.scaleX != params.subjectScale) subject.scaleX = params.subjectScale
             if (subject.scaleY != params.subjectScale) subject.scaleY = params.subjectScale
+            // 记下"我们动过它"——[resetSubjectShift] 只在这之后才允许写回，否则会覆盖
+            // 系统自己在 AOD 下设置的 0.95 缩放（2026-11-05）。
+            subjectShiftApplied = true
         }
         // 桌面主体层（v1.3.29）：锁屏那层主体是系统自己的景深 View，桌面没有；
         // 这里用 TYPE_WALLPAPER 窗口补一层，参数与锁屏完全同一套（sx/sy 不取反）。
@@ -3157,6 +3176,12 @@ internal object ParallaxBg {
     }
 
     private fun resetSubjectShift(context: Context) {
+        // **只在视差真的动过主体时才复位**（2026-11-05 修复）。
+        // 以前无条件把 scaleX/Y 写回 1.0 —— 视差没开也一样写，于是系统在
+        // 「AOD 与锁屏样式相同」下给主体设的 0.95（`f - 0.05`）被我们覆盖成 1.0，
+        // 锁屏主体与背景稳态错位 5%（真机：关掉 SystemUI 作用域就正常）。
+        if (!subjectShiftApplied) return
+        subjectShiftApplied = false
         subjectView(context)?.let { subject ->
             if (subject.translationX != 0f || subject.translationY != 0f ||
                 subject.scaleX != 1f || subject.scaleY != 1f

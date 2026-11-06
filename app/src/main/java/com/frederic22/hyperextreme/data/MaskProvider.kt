@@ -51,6 +51,44 @@ class MaskProvider : ContentProvider() {
             if (!file.isFile) throw FileNotFoundException("层图不存在: $uri")
             return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
         }
+        // 「光栅壁纸」的图与 meta（2026-11-04）：`content://…/raster/<组id>/meta`、
+        // `content://…/raster/<组id>/<序号>`、`content://…/raster/<组id>/subject/<序号>`。
+        // 渲染器在 SystemUI 进程里读不到模块私有目录，只能走 provider 流式拿（与空间壁纸同一套路）。
+        // ⚠️ provider 是导出的，路径必须严格白名单（组 id 是纯数字时间戳、序号是 0~9 的小整数），
+        //    否则能被拼成 `../../shared_prefs/…` 读走别的文件。
+        if (uri.pathSegments.firstOrNull() == RASTER_SEGMENT) {
+            val id = uri.pathSegments.getOrNull(1).orEmpty()
+            val what = uri.pathSegments.getOrNull(2).orEmpty()
+            if (!id.matches(RASTER_ID_RE)) throw FileNotFoundException("非法的光栅壁纸路径: $uri")
+            val dir = java.io.File(java.io.File(appContext.filesDir, "raster"), id)
+            if (what == "meta") {
+                val f = java.io.File(dir, "meta.json")
+                if (!f.isFile) throw FileNotFoundException("meta 不存在: $uri")
+                return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+            }
+            // `subject/<序号>` = 该图的**主体抠像**（`<图名>.subject.png`）。
+            // 光栅景深层（RasterOverlay）读它；没算过主体的图直接 404，上层按"透明"处理
+            //（用户 2026-11-04：没算景深的图主体透明 = 等于没开）。
+            val isSubject = what == "subject"
+            val indexStr = if (isSubject) uri.pathSegments.getOrNull(3).orEmpty() else what
+            if (!indexStr.matches(RASTER_INDEX_RE)) throw FileNotFoundException("非法的光栅序号: $uri")
+            val names = runCatching {
+                val text = java.io.File(dir, "meta.json").readText()
+                val arr = org.json.JSONObject(text).optJSONArray("items")
+                    ?: throw FileNotFoundException("meta 里没有 items: $uri")
+                (0 until arr.length()).map { arr.getString(it) }
+            }.getOrElse { throw FileNotFoundException("meta 读不出来: $uri") }
+            val name = names.getOrNull(indexStr.toInt()) ?: throw FileNotFoundException("序号越界: $uri")
+            // 文件名校验：只允许 `RasterStore` 生成的那种名字，防止 meta 被改写后读走别的文件。
+            if (!name.matches(RASTER_FILE_RE)) throw FileNotFoundException("非法的图片名: $uri")
+            val f = if (isSubject) {
+                java.io.File(dir, "$name.subject.png")
+            } else {
+                java.io.File(dir, name)
+            }
+            if (!f.isFile) throw FileNotFoundException("文件不存在: $uri")
+            return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+        }
         // 「视差壁纸效果」的背景图 —— SystemUI 侧（hook/ParallaxBg）显示时从这儿读流。
         if (uri.pathSegments.lastOrNull() == PARALLAX_SEGMENT) {
             val bg = MaskStore.parallaxFile(appContext)
@@ -129,6 +167,10 @@ class MaskProvider : ContentProvider() {
                 //（`HookRuntime` 的 spatial 分支）。**没有开关**：检测到变化就无条件关。
                 putBoolean(KEY_SPATIAL_ACTIVE, prefs.spatialActive)
                 putString(KEY_SPATIAL_FP, prefs.spatialWallpaperFp)
+                // 「光栅壁纸」的开启状态与**壁纸基准**（2026-11-05）—— 消费方同样是 aod 侧的
+                // 换壁纸检测（`HookRuntime` 的 raster 分支）。同样**没有开关**。
+                putBoolean(KEY_RASTER_ACTIVE, prefs.rasterActiveId.isNotEmpty())
+                putString(KEY_RASTER_FP, prefs.rasterWallpaperFp)
                 // 「视差效果覆盖桌面」（2026-10-21）—— 消费方：miwallpaper / SystemUI 的解锁动画抑制。
                 putBoolean(KEY_PARALLAX_COVER_DESKTOP, prefs.parallaxCoverDesktop)
                 // 「强制锁屏元素深浅模式」—— 主开关 + 6 个元素的档位（消费方：SystemUI 侧的深浅注入）。
@@ -313,6 +355,27 @@ class MaskProvider : ContentProvider() {
                 Bundle.EMPTY
             }
 
+            // **换壁纸 → 无条件关闭光栅壁纸**（2026-11-05，与空间同语义）。
+            //
+            // 收尾与手动「取消应用」共用同一套（`RasterControl.disable`）：
+            // 清 active/key + 清基准 → 推系统属性（SystemUI 轮询到 active=0 自己拆层）。
+            // 服务模式不额外 `WallpaperManager.clear()` —— 系统已经把壁纸换掉了。
+            METHOD_RASTER_AUTO_OFF -> {
+                RasterControl.disable(appContext, "检测到壁纸变化，光栅壁纸已自动关闭")
+                val at = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+                prefs.setDiagNote(
+                    "光栅壁纸自动关闭：$at → 检测到换壁纸${if (arg.isNullOrBlank()) "" else "（$arg）"}",
+                )
+                Bundle.EMPTY
+            }
+
+            // 只更新「光栅壁纸基准」（hook 侧惰性补记 / 判据升级用）。不碰开关与指令号。
+            METHOD_RASTER_FP -> {
+                val value = extras?.getString(KEY_RASTER_FP).orEmpty()
+                if (value.isNotEmpty()) prefs.setRasterWallpaperFp(value)
+                Bundle.EMPTY
+            }
+
             // 「壁纸改变后自动关闭替换」：hook 侧检测到换壁纸后来这儿收尾 ——
             // 双重检查（开关还开着、视差还在生效）后置状态 + 清基准 + 生成指令号；
             // **广播由 hook 侧拿到 token 后自行发出**（写状态在前、发广播在后，与 App 的
@@ -416,6 +479,12 @@ class MaskProvider : ContentProvider() {
         /** **换壁纸 → 无条件关闭空间壁纸**（2026-10-29）。arg = 判据详情，仅用于 diagNote。 */
         const val METHOD_SPATIAL_AUTO_OFF = "spatial_auto_off"
 
+        /** 只更新「光栅壁纸基准」（2026-11-05；惰性补记 / 判据升级用）。 */
+        const val METHOD_RASTER_FP = "raster_fp"
+
+        /** **换壁纸 → 无条件关闭光栅壁纸**（2026-11-05）。arg = 判据详情，仅用于 diagNote。 */
+        const val METHOD_RASTER_AUTO_OFF = "raster_auto_off"
+
         /** [METHOD_PARALLAX_AUTO_OFF] 回执 bundle 里的指令号键（与广播 extra 同名，hook 拿到后发广播用）。 */
         const val KEY_PARALLAX_TOKEN = "token"
 
@@ -465,6 +534,10 @@ class MaskProvider : ContentProvider() {
         const val KEY_SPATIAL_ACTIVE = "spatial_active"
         const val KEY_SPATIAL_FP = "spatial_wallpaper_fp"
 
+        /** 「光栅壁纸」的开启状态与壁纸基准（消费方：aod 侧的换壁纸检测；2026-11-05）。 */
+        const val KEY_RASTER_ACTIVE = "raster_active"
+        const val KEY_RASTER_FP = "raster_wallpaper_fp"
+
         /** 「视差效果覆盖桌面」（2026-10-21 加，默认关）。 */
         const val KEY_PARALLAX_COVER_DESKTOP = "parallax_cover_desktop"
 
@@ -486,6 +559,22 @@ class MaskProvider : ContentProvider() {
 
         /** 空间壁纸层图：`content://<authority>/spatial/<16位哈希>/layerN.webp`。 */
         const val SPATIAL_SEGMENT = "spatial"
+
+        /** 「光栅壁纸」：`raster/<组id>/meta`、`raster/<组id>/<序号>`、`raster/<组id>/subject/<序号>`。 */
+        const val RASTER_SEGMENT = "raster"
+        private val RASTER_ID_RE = Regex("^[0-9]{6,20}$")
+        private val RASTER_INDEX_RE = Regex("^[0-9]$")
+
+        /**
+         * 图片文件名白名单。
+         *
+         * 指纹有两种长度（2026-11-04）：
+         * * **16 hex** = 新格式，SHA-256 前 8 字节（当前写入口径）；
+         * * **32 hex** = 旧格式，双路 dHash。只为了**老组还能显示**，判重已不认它
+         *   （`RasterStore.hashOf` 只认 16），用户清掉旧缓存后就没了。
+         */
+        private val RASTER_FILE_RE =
+            Regex("^img_[0-9]+_([0-9a-f]{16}|[0-9a-f]{32})\\.[a-z0-9]{2,5}$")
         private val SPATIAL_KEY_RE = Regex("^[0-9a-f]{16}$")
         private val SPATIAL_LAYER_RE = Regex("^(layer[0-9]\\.png|depth\\.png|meta\\.json)$")
 
