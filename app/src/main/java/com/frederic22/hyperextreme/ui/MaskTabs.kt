@@ -3,28 +3,27 @@ package com.frederic22.hyperextreme.ui
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Build
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
+import android.os.SystemClock
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -32,6 +31,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -49,23 +51,32 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.frederic22.hyperextreme.R
 import com.frederic22.hyperextreme.data.AodPackageName
 import com.frederic22.hyperextreme.data.MaskRole
 import com.frederic22.hyperextreme.data.MaskPrefs
-import com.frederic22.hyperextreme.data.SpatialControl
+import com.frederic22.hyperextreme.data.MaskProvider
 import com.frederic22.hyperextreme.data.MiuiHomePackageName
 import com.frederic22.hyperextreme.data.MiuiWallpaperPackageName
+import com.frederic22.hyperextreme.data.RasterStore
 import com.frederic22.hyperextreme.data.SystemUiPackageName
 import com.frederic22.hyperextreme.hook.HookRuntime
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
@@ -86,9 +97,9 @@ import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ChevronForward
 import top.yukonga.miuix.kmp.overlay.OverlayListPopup
+import top.yukonga.miuix.kmp.squircle.squircleClip
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import com.frederic22.hyperextreme.ui.nav.NavBgState
-import com.frederic22.hyperextreme.ui.nav.reportSliderRect
+import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -99,15 +110,36 @@ import kotlin.math.roundToInt
  *
  * 2026-10-29：状态卡（[BigStatusCard]）从关于页**搬回主页最上面**（用户指定）——
  * 「模块有没有激活」是打开 App 第一眼要确认的事，放在关于页要多点一次才看得到。
- * 顺序固定为：状态卡 → 「未检测到Root」卡（条件显示）→ 设备信息卡。
+ *
+ * 2026-11-08：顺序改为 **状态卡 → 「未检测到Root」卡（条件）→ 「当前运行」卡（条件）→ 设备信息卡**。
+ * Root 卡从「标题 + 一个大按钮」改成选项行（`BasicComponent`：标题 / summary / 右侧箭头，
+ * 整行点击刷新）；新增「当前运行」卡，点它直接进对应二级页。
  *
  * 同一天删掉了底部的「去选图替换」按钮：二级页入口在「功能」页签里已经有了，这里是重复路径。
  */
 @Composable
-internal fun HomeTab(state: MaskUiState) {
+internal fun HomeTab(state: MaskUiState, onOpen: (DetailPage) -> Unit) {
     val context = state.context
     val activated = state.activated
     val haptic = rememberClickHaptic()
+
+    // 「当前运行」判据与冲突弹窗共用 [WallpaperConflict]（2026-11-08）——
+    // 服务模式要查 `WallpaperManager`，所以在**进前台**时算一次，别塞进重组。
+    var running by remember { mutableStateOf(WallpaperConflict.current(context, state)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                running = WallpaperConflict.current(context, state)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    // 视差是 State：在本页关掉它时不会走 ON_RESUME，单独跟一下。
+    LaunchedEffect(state.parallaxActive) {
+        running = WallpaperConflict.current(context, state)
+    }
 
     TabColumn {
         // 模块激活状态：**永远是第一张**（即使下面的 Root 卡也在）。
@@ -124,6 +156,9 @@ internal fun HomeTab(state: MaskUiState) {
         // 配色 2026-09-29 改成**橙**（原来是 `errorContainer / onErrorContainer` 那套红）：
         // 与状态卡的"无 Root"档**同一组色值**（`StatusCardAmber*`，见 MaskSwapScreen），
         // 两张卡放一起时是同一种"缺东西但还能修"的语气，而不是"致命错误"。
+        //
+        // 2026-11-08：卡内排版改成**选项行**（用户要求）—— 标题 / summary 的字号与颜色
+        // 走 `BasicComponent` 那套规范，右侧加箭头，原来的「刷新 Root」按钮删掉、整行点击。
         if (activated && state.rootAvailable == false) {
             // 卡面是固定色值、不跟动态取色，所以深浅色得自己判（和关于页状态卡一个套路）。
             val dark = MiuixTheme.colorScheme.surface.luminance() < 0.5f
@@ -139,31 +174,18 @@ internal fun HomeTab(state: MaskUiState) {
                     color = if (dark) StatusCardAmberDark else StatusCardAmberLight,
                 ),
             ) {
-                Column(modifier = Modifier.padding(20.dp)) {
-                    Text(
-                        text = "未检测到Root",
-                        // 字号字重与关于页「模块未激活」那行**逐字一致**（22.sp / SemiBold），
-                        // 不用 `textStyles.title1` —— 那个在两处会算出不同的大小。
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    TextButton(
-                        text = "刷新 Root",
-                        onClick = { haptic(); state.refreshRoot() },
-                        modifier = Modifier.fillMaxWidth(),
-                        // 底色 = 状态卡那个图标的深橙；文字**恒定白色**（2026-10-29 用户指定，
-                        // 原来是"浅色黑、深色白"—— 橙底上黑字显得脏）。
-                        // ⚠️ 参数名是 `textColor` **不是** `contentColor`
-                        //（`TextButtonColors` 四个字段是 color / disabledColor / textColor / disabledTextColor；
-                        //  写成 contentColor 编译直接报错，javap + Kotlin 元数据核过）。
-                        colors = ButtonDefaults.textButtonColors(
-                            color = StatusCardAmberGlyph,
-                            textColor = Color.White,
-                        ),
-                    )
-                }
+                BasicComponent(
+                    title = "未检测到Root",
+                    summary = "点此以刷新",
+                    endActions = { LinkArrow() },
+                    onClick = { haptic(); state.refreshRoot() },
+                )
             }
+        }
+
+        // 「当前运行」卡（2026-11-08）：四链互斥，正常最多一条；没有就整卡不出现。
+        running?.let { current ->
+            RunningWallpaperCard(current = current, onOpen = onOpen)
         }
 
         // 设备信息卡。
@@ -243,6 +265,14 @@ internal fun FunctionHome(onOpen: (DetailPage) -> Unit) {
             title = "光栅壁纸",
             onClick = { onOpen(DetailPage.RasterWallpaper) },
         )
+        // 「Alive壁纸」（2026-11-07）：照片透镜「启航」—— AOD 里是自转的小球，
+        // 锁屏 / 桌面铺满原图，三态之间连续转场。与光栅同列（同样是壁纸层的事），
+        // 但只有 LSPosed 一种挂载方式（AOD 动画必须挂在 SystemUI 的 leash 上）。
+        AppEntryCard(
+            packageName = MiuiWallpaperPackageName,
+            title = "Alive壁纸",
+            onClick = { onOpen(DetailPage.AliveWallpaper) },
+        )
         AppEntryCard(
             packageName = SystemUiPackageName,
             title = "系统界面",
@@ -317,6 +347,84 @@ private fun AppEntryCard(packageName: String, title: String, onClick: () -> Unit
     }
 }
 
+/**
+ * 主页的「当前运行」卡（2026-11-08）。
+ *
+ * 只显示**真的在跑**的那一条（判据来自 [WallpaperConflict.current]，与冲突弹窗同一份）；
+ * 没有运行时调用方根本不会组合它。
+ *
+ * 排版照功能页的 [AppEntryCard]：系统图标 44dp / 圆角 10dp → 标题 `headline1` →
+ * summary `body2`（`onSurfaceVariantSummary`）→ 右侧 16dp 箭头，整行可点。
+ *
+ * **summary 只在双模式的链上出现**：视差 / Alive 只有 LSPosed 一条，写了反而像
+ * 在暗示可以换挂载方式。服务模式的措辞是「系统壁纸服务」，不带「（免Root）」。
+ */
+@Composable
+private fun RunningWallpaperCard(current: RunningWallpaper, onOpen: (DetailPage) -> Unit) {
+    val haptic = rememberClickHaptic()
+    // 图标用功能页那张卡同一个系统图标：视差挂 aod，其余三条挂壁纸服务。
+    val pkg = when (current.chain) {
+        WallpaperChain.PARALLAX -> AodPackageName
+        else -> MiuiWallpaperPackageName
+    }
+    val icon = rememberAppIcon(pkg)
+    val page = when (current.chain) {
+        WallpaperChain.PARALLAX -> DetailPage.ParallaxBg
+        WallpaperChain.SPATIAL -> DetailPage.SpatialWallpaper
+        WallpaperChain.RASTER -> DetailPage.RasterWallpaper
+        WallpaperChain.ALIVE -> DetailPage.AliveWallpaper
+    }
+    val summary = when (current.chain) {
+        WallpaperChain.SPATIAL, WallpaperChain.RASTER ->
+            "挂载模式（${if (current.mode == WallpaperMode.SERVICE) "系统壁纸服务" else "LSPosed"}）"
+        else -> null
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .padding(top = 12.dp),
+        insideMargin = PaddingValues(0.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { haptic(); onOpen(page) }
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (icon != null) {
+                Image(
+                    bitmap = icon,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(10.dp)),
+                )
+                Spacer(Modifier.width(14.dp))
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(text = "当前应用（${current.label}）", style = MiuixTheme.textStyles.headline1)
+                if (summary != null) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = summary,
+                        style = MiuixTheme.textStyles.body2,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Image(
+                imageVector = MiuixIcons.ChevronForward,
+                contentDescription = null,
+                colorFilter = ColorFilter.tint(MiuixTheme.colorScheme.onSurfaceVariantActions),
+                modifier = Modifier.size(16.dp),
+            )
+        }
+    }
+}
+
 /** 取系统里那个应用的真实图标；拿不到就返回 null（卡片只显示文字）。 */
 @Composable
 private fun rememberAppIcon(packageName: String): ImageBitmap? {
@@ -354,90 +462,177 @@ private const val FallbackIconSize = 144
 // ------------------------------------------------------------------ 功能（二级：锁屏遮罩替换）
 
 /**
- * 二级页「锁屏遮罩替换」的全部内容 —— 就是**原来的整个功能页**，2026-09-29 由一级降为二级。
+ * 二级页「锁屏遮罩替换」的全部内容（2026-11-07 两轮改版后的最终形态）。
  *
- * 2026-09-29 又追加了设置页搬来的「替换行为」（只含「替换前备份原文件」）—— 标题沿用设置页那两个字的原文。
+ * ## 布局
+ *
+ * 两张**并排**的竖版卡，视觉与一级页卡片流一致（squircle 圆角 = 卡宽 × [CARD_RADIUS_RATIO]、
+ * 1dp 纯黑 10% 描边、图铺满裁切）：卡宽 = 屏宽 × [LOCK_CARD_WIDTH_RATIO]（0.39）、
+ * 间距 [LOCK_CARD_GAP]（16dp）。**标题在卡片下方**（2026-11-09 从卡上移到卡下），标题与卡之间 12dp、
+ * 字号与颜色同选项 `summary`（`body2` + `onSurfaceVariantSummary`）。
+ *
+ * | 位置 | 卡片 | 交互 |
+ * | --- | --- | --- |
+ * | 左 | 「当前壁纸」—— hook 从 AOD 进程推回来的锁屏壁纸缩略图 | 只读 |
+ * | 右 | 「主体或遮罩」—— 候选图；没有图时是加号卡 | 点卡选图；右上角删除钮清空 |
+ *
+ * 卡下**单个**「立即替换」按钮（主题色；宽 = 卡片流的 0.45 × 5/6 = 0.375 屏宽，与光栅页逐像素同宽；
+ * 整行居中）。原「清空选择」已删 —— 清空改由右卡右上角的删除钮负责（有图才出现，带 0.15s
+ * 缩放 + 淡入淡出）。左卡换图时走 0.15s 交叉过渡。
+ *
+ * ⚠️ **删除钮不参与排版**：它挂在尺寸写死的卡片 Box 里、用 `offset` 探出卡角，
+ * `offset` 只改绘制位置、不改测量尺寸 ⇒ 两张卡 + 间距算居中时**天然不含**那半颗钮，
+ * 左右两卡不会因为多了一个钮而整体偏左（用户 2026-11-07 明确要求）。
+ *
+ * ## 与旧版的区别
+ *
+ * 旧版是「主体」「遮罩」两张卡**各自**选图、卡内各带「选择图片 / 清空选择」两个按钮，两者互斥。
+ * 现在**只有一个槽**：选一张图，由 [RasterStore.probeKind] 自动判定它是主体还是遮罩
+ * （判据与光栅的组合编辑完全同一套），判定不出来就提示、不导入。
  *
  * **刻意不用 [TabColumn]**：那里带着 120dp 的底栏留白，而二级页是**盖住底栏**的全屏页，
  * 留那么多空白没有意义。
  */
 @Composable
-internal fun MaskReplaceDetail(state: MaskUiState, onPick: (MaskRole) -> Unit) {
+internal fun MaskReplaceDetail(state: MaskUiState, onPick: () -> Unit) {
     val haptic = rememberClickHaptic()
+    val ctx = LocalContext.current
+    val screen = rememberScreenSizePx()
+    val density = LocalDensity.current
+    val cardW: Dp = with(density) { (screen.width * LOCK_CARD_WIDTH_RATIO).toDp() }
+    // 卡高 = 卡宽 × 屏高 / 屏宽（与卡片流同一个比例：卡片是"屏幕的一块"）。
+    val cardH: Dp = cardW * screen.height / screen.width
+    val radius: Dp = cardW * CARD_RADIUS_RATIO
+    val surface = rememberCardSurface()
+    // 按钮宽度按**卡片流的卡宽**（[CARD_WIDTH_RATIO] = 0.45）算 5/6 —— 与本页两张 0.39 的卡无关：
+    // 用户 2026-11-07 要求"跟光栅页一样宽"，光栅页就是 0.45 × 5/6 = 0.375 屏宽。
+    val buttonW: Dp = with(density) { (screen.width * CARD_WIDTH_RATIO * 5f / 6f).toDp() }
+    val thumbCache = remember(ctx) { File(ctx.cacheDir, MaskProvider.LOCK_THUMB_NAME) }
+
+    // 只有一个槽：主体或遮罩，谁在就显示谁。
+    val role = MaskRole.selectable.firstOrNull { state.sizes[it] != null }
+    val bitmap = role?.let { state.previews[it] }
+    val thumb = rememberLockThumb()
+    val busy = state.busy
+
+    // 缩略图刷新（2026-11-07 第二轮，用户报「换了锁屏壁纸，左卡不刷新」）：
+    // 旧逻辑只在**缓存文件不存在**时才请一次 ⇒ 缓存一落盘，之后换多少次壁纸都看旧的。
+    // 现在两个时机都请：① 进页面；② 回到前台（用户常见路径 = 去系统设置换壁纸再切回来）。
+    // 两次都过 [LOCK_THUMB_REFRESH_MIN_MS] 节流 —— 这条请求要么唤醒宿主进程、要么在宿主里
+    // 重新解码 + JPEG 编码，进出页面会连触两三次，没必要。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) requestLockThumb(state, thumbCache.isFile)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(Unit) { requestLockThumb(state, thumbCache.isFile) }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberPageScroll())
             .padding(top = LocalTopBarHeight.current, bottom = 32.dp),
     ) {
-        // 这一页所有按钮都先过 [MaskUiState.requireActivated]：状态不是「模块已激活」时
-        // 只提示"模块未激活，请先激活"、什么都不做。闸门放在**外层**，原来的 root 实测
-        // （onPick 里的 ensureRoot）保持不动 —— 那道是兜底，防"记录说有 root、其实已经被撤销"。
-        // 「主体」和「遮罩」并排，二者互斥：选了其中一个，另一个就得先清空再选。
-        Row(
+        // 一、两张并排卡。所有按钮都先过 [MaskUiState.requireActivated]。
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(top = 12.dp)
-                // 两张卡的内容高度可能差一行，用 IntrinsicSize.Min 让它们永远等高对齐。
-                .height(IntrinsicSize.Min),
+                .padding(top = 24.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            RoleCard(
-                role = MaskRole.SUBJECT,
-                bitmap = state.previews[MaskRole.SUBJECT],
-                injected = MaskRole.SUBJECT in state.injectedRoles,
-                otherSelected = state.sizes[MaskRole.SUBJECT_MASK] != null,
-                otherTitle = MaskRole.SUBJECT_MASK.title,
-                // 替换进行中一律禁掉，见 [RoleCard] 的 `enabled`。
-                enabled = !state.busy,
-                onPick = { if (state.requireActivated()) onPick(MaskRole.SUBJECT) },
-                onClear = { if (state.requireActivated()) state.clearRole(MaskRole.SUBJECT) },
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-            )
-            Spacer(Modifier.width(12.dp))
-            RoleCard(
-                role = MaskRole.SUBJECT_MASK,
-                bitmap = state.previews[MaskRole.SUBJECT_MASK],
-                injected = MaskRole.SUBJECT_MASK in state.injectedRoles,
-                otherSelected = state.sizes[MaskRole.SUBJECT] != null,
-                otherTitle = MaskRole.SUBJECT.title,
-                enabled = !state.busy,
-                onPick = { if (state.requireActivated()) onPick(MaskRole.SUBJECT_MASK) },
-                onClear = { if (state.requireActivated()) state.clearRole(MaskRole.SUBJECT_MASK) },
-                modifier = Modifier.weight(1f).fillMaxHeight(),
-            )
-        }
-
-        // 替换动作放在最下面：立即替换。
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(top = 12.dp),
-            insideMargin = PaddingValues(0.dp),
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                TextButton(
-                    text = if (state.busy) "处理中…" else "立即替换",
-                    // 走 requestReplace 而不是 rootReplace：没确认过「屏幕灭亮提醒」时先弹提示，
-                    // 确认过（或已点过「确定」）才真的替换。
-                    onClick = { haptic(); if (state.requireActivated() && !state.busy) state.requestReplace() },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.textButtonColorsPrimary(),
-                )
-                // 「清除替换记录」按钮去掉了：保护收尾（替换完成时由 App 直接结束）provider 那边
-                // 就会自动把候选和注入快照清掉，不需要用户再点一次。
-                // 「还原」按钮 2026-10-15 随备份/还原整组逻辑删除（用户要求"删干净"）。
+            Row(horizontalArrangement = Arrangement.spacedBy(LOCK_CARD_GAP)) {
+                // 左：当前壁纸（只读，没有删除钮）。
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(
+                        modifier = Modifier
+                            .size(cardW, cardH)
+                            .squircleClip(radius)
+                            .background(surface)
+                            .squircleStroke({ CARD_STROKE_WIDTH }, { CARD_STROKE }, radius),
+                    ) {
+                        // 换壁纸时**交叉过渡** 0.15s（用户 2026-11-07）：旧图保持不动、新图淡入盖上去。
+                        // ⚠️ 这里用裸 `Image` 而不是 [CardImage]：后者自带一次 0.15s 渐显，
+                        //    套在 Crossfade 里会变成"先淡出到白底再淡入"，看着像闪一下。
+                        Crossfade(
+                            targetState = thumb,
+                            animationSpec = tween(durationMillis = LOCK_THUMB_CROSSFADE_MS),
+                            modifier = Modifier.fillMaxSize(),
+                        ) { frame ->
+                            if (frame != null) {
+                                Image(
+                                    bitmap = frame.asImageBitmap(),
+                                    contentDescription = null,
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop,
+                                )
+                            }
+                        }
+                    }
+                    LockCardTitle(text = "当前壁纸", width = cardW)
+                }
+                // 右：主体或遮罩。空态是加号卡（点它选图），有图时整张卡也是选图入口，
+                // 右上角挂删除钮 —— 视觉与交互全在 [PickCard] 里（与视差页共用同一份）。
+                // ⚠️ 判据用 `role`（= 有没有候选）而不是 `bitmap`：预览是异步解码的，
+                // 用 bitmap 判会在进来的头一两帧闪成加号卡，看着像"没选过图"。
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    PickCard(
+                        cardW = cardW,
+                        cardH = cardH,
+                        radius = radius,
+                        surface = surface,
+                        hasImage = role != null,
+                        bitmap = bitmap,
+                        enabled = !busy,
+                        onPick = {
+                            if (state.requireActivated()) {
+                                haptic()
+                                onPick()
+                            }
+                        },
+                        onClear = {
+                            // 处理中照样显示钮（与卡片流一致），只是点了不响应。
+                            if (!busy && state.requireActivated()) {
+                                haptic()
+                                state.clearRoles()
+                            }
+                        },
+                    )
+                    LockCardTitle(text = "主体或遮罩", width = cardW)
+                }
             }
         }
 
-        // 「替换行为」这一节 2026-09-29 从设置页整张卡片搬过来（用户指定，**标题不变**）。
+        // 二、单个「立即替换」（用户 2026-11-07 第二轮：砍掉「清空选择」、只留这一个并居中）。
+        // 宽度沿用卡宽 5/6（与空间页同一个比例），整行居中。
+        Spacer(Modifier.height(24.dp))
+        Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            // 提示色主按钮。走 requestReplace（没选图时的兜底提示也在里面）。
+            // `buttonColors()` 默认是**次级灰**；这个按钮是唯一的主动作，用户 2026-11-07 要求用主题色。
+            Button(
+                onClick = {
+                    haptic()
+                    if (state.requireActivated() && !busy) state.requestReplace()
+                },
+                modifier = Modifier.width(buttonW),
+                enabled = role != null && !busy,
+                colors = ButtonDefaults.buttonColorsPrimary(),
+            ) {
+                Text(
+                    text = if (busy) "处理中…" else "立即替换",
+                    style = MiuixTheme.textStyles.button,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+
+        // 三、「替换行为」。2026-09-29 从设置页整张卡片搬过来（用户指定，标题不变）；
+        // 2026-11-07 按用户要求**删掉了 SmallTitle**，间距改由上面的 Spacer 给。
         // 同卡片里另一个开关（详细过程写入LSPosed日志）并进了设置页的「测试」，不在这边。
-        // 位置放在最下面（动作卡之后）：页面主体仍是"选图 → 替换"，不让选项把主体顶下去。
-        //
-        // 间距：**照设置页的规矩** —— `SmallTitle` 后面紧跟的 `Card` 只留 `padding(horizontal = 12.dp)`，
-        // **不要再加 `top`**。`SmallTitle` 自己带下方留白，加 top 就成了双份（用户反馈"间距大了点"）。
-        SmallTitle(text = "替换行为")
+        Spacer(Modifier.height(24.dp))
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -466,20 +661,111 @@ internal fun MaskReplaceDetail(state: MaskUiState, onPick: (MaskRole) -> Unit) {
     }
 }
 
+/** 锁屏遮罩页两张卡的卡宽 ÷ 屏宽（2026-11-07 第二轮用户拍板 0.39）。 */
+private const val LOCK_CARD_WIDTH_RATIO = 0.39f
+
+/** 两张卡的间距（2026-11-07 第二轮用户拍板 16dp）。 */
+private val LOCK_CARD_GAP = 16.dp
+
+/** 上一次请 hook 重推缩略图的时刻（节流，见 [requestLockThumb]）。 */
+private var LockThumbRequestAt = 0L
+
+/** 两次「请 hook 重推缩略图」之间的最小间隔（毫秒）。 */
+private const val LOCK_THUMB_REFRESH_MIN_MS = 2_000L
+
+/** 「当前壁纸」换图时的交叉过渡时长（用户 2026-11-07 定 0.15s）。 */
+private const val LOCK_THUMB_CROSSFADE_MS = 150
+
+/**
+ * 请 hook 重推一次「当前壁纸」缩略图（[MaskReplaceDetail] 进页面 / 回前台各调一次）。
+ *
+ * [cacheExists] = 本地已经有缩略图 ⇒ 允许 hook 按「同一张壁纸不重推」去重（省一次解码 +
+ * 一次 720 短边的 JPEG 编码，也让卡片不会因为重推而重新渐显闪一下）；缓存不在时必须
+ * 让 hook 无条件推，否则它会以为"早就推过了"而一直不给图。
+ */
+private fun requestLockThumb(state: MaskUiState, cacheExists: Boolean) {
+    val now = SystemClock.elapsedRealtime()
+    if (now - LockThumbRequestAt < LOCK_THUMB_REFRESH_MIN_MS) return
+    LockThumbRequestAt = now
+    state.refreshLockThumb(force = !cacheExists)
+}
+
+/**
+ * 卡片**下方**的标题（2026-11-09 用户要求从卡上移到卡下；间距仍是 12dp，
+ * 字号 / 颜色改成与选项 `summary` 一致 = `body2` + `onSurfaceVariantSummary`）。
+ */
+@Composable
+private fun LockCardTitle(text: String, width: Dp) {
+    Text(
+        text = text,
+        style = MiuixTheme.textStyles.body2,
+        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+        textAlign = TextAlign.Center,
+        modifier = Modifier
+            .width(width)
+            .padding(top = 12.dp),
+    )
+}
+
+/**
+ * 「当前壁纸」卡的图：hook 从 AOD 进程推回来的锁屏壁纸缩略图。
+ *
+ * 推送是**异步**的（还要先唤醒 AOD 进程），所以这里按文件 mtime 轮询（400ms）——
+ * 比在 provider 里跨进程回调界面简单得多，开销也只有一次 `lastModified()`。
+ *
+ * ⚠️ **换图时不能把 value 清空**：旧实现用 `produceState(initialValue = null, stamp)`，
+ * 新 stamp 一到 value 先变 null、再等解码完成 ⇒ 卡片会白闪一下（每次重推都闪）。
+ * 这里改成"先留着上一张、解码成功才替换"，解码失败也保留旧图。
+ */
+@Composable
+private fun rememberLockThumb(): Bitmap? {
+    val ctx = LocalContext.current
+    val file = remember(ctx) { File(ctx.cacheDir, MaskProvider.LOCK_THUMB_NAME) }
+    var stamp by remember { mutableStateOf(0L) }
+    LaunchedEffect(file) {
+        while (true) {
+            val m = file.lastModified()
+            if (m != stamp) stamp = m
+            delay(400L)
+        }
+    }
+    val bitmap = remember { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(stamp) {
+        if (stamp <= 0L) return@LaunchedEffect
+        val decoded = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(file.absolutePath) }
+        if (decoded != null) bitmap.value = decoded
+    }
+    return bitmap.value
+}
+
 // ------------------------------------------------------------------ 功能（二级：视差壁纸效果）
 
 /**
- * 二级页「视差壁纸效果」的全部内容（2026-10-12）—— 照「锁屏遮罩替换」的模板，
- * 但**只有一列**（「背景」卡）+ 底部**单个**动作按钮。
+ * 二级页「视差壁纸效果」的全部内容（2026-11-07 第三次改版：单卡版）。
  *
- * ## 状态机（用户 2026-10-12 定）
+ * ## 布局
  *
- * | 状态 | 按钮 | 选图操作（选择/更换、清空选择） | 预览框 |
+ * **一张卡居中**（不做卡片流）：复用锁屏遮罩页右卡那张「单槽选图卡」—— 空态是加号卡、
+ * 有图时铺满 + 右上角删除钮（[PickCard]，两页同一份实现）。卡宽 = 屏宽 ×
+ * [CARD_WIDTH_RATIO]（0.45），卡高按屏幕比例（卡片是"屏幕的一块"），
+ * **没有标题、没有 summary**（2026-11-07 用户要求）。
+ *
+ * 卡下是**单个**按钮（「立即替换」⇄「关闭替换」，主题色；宽 = 卡宽 5/6 = 0.375 屏宽，
+ * 与锁屏遮罩页逐像素同宽）。再下面是「参数调整」卡 —— 2026-11-07 起**卡外标题也删了**，
+ * 靠上一档 Spacer 给间距。
+ *
+ * ⚠️ **删除钮不参与居中**：它由 [PickCard] 用 `offset` 探出卡角，只改绘制位置、不改测量
+ * 尺寸 ⇒ 卡片按 0.45 屏宽居中，不会因为多了半颗钮而偏左（用户 2026-11-07 明确要求）。
+ *
+ * ## 状态机（用户 2026-10-12 定，未变）
+ *
+ * | 状态 | 按钮 | 选图 / 清空 | 卡片 |
  * | --- | --- | --- | --- |
  * | 未替换 | 「立即替换」 | ✅ 可动 | 显示候选（如有） |
  * | 已替换（开启中） | 「关闭替换」 | ❌ 禁用 | 显示已生效背景，**跨重启持久** |
  *
- * * 点「选择图片」时先过**景深检查**（没开 → toast「请先在系统锁屏编辑开启景深效果」并中止）；
+ * * 点卡选图时先过**景深检查**（没开 → toast「请先在系统锁屏编辑开启景深效果」并中止，
+ *   判定在 `MaskDetailActivity` 的 picker 里）；
  * * 「关闭替换」后图退回普通候选，随「启动清空残留候选」在下次打开 App 时清空（见 `App.onCreate`）；
  *   「壁纸改变后自动关闭替换」（默认开）开着时，视差生效中检测到换壁纸也走同一条关闭路径；
  * * 全程不写系统文件、不需要 root、无「替换行为」小节（备份 / 灭亮屏 / 遮挡限制都属主体链）。
@@ -488,8 +774,20 @@ internal fun MaskReplaceDetail(state: MaskUiState, onPick: (MaskRole) -> Unit) {
 internal fun ParallaxBgDetail(state: MaskUiState, onPick: () -> Unit) {
     val haptic = rememberClickHaptic()
     val ctx = LocalContext.current
-    val prefs = remember { MaskPrefs(ctx) }
     val scope = rememberCoroutineScope()
+    val screen = rememberScreenSizePx()
+    val density = LocalDensity.current
+    // 卡宽 = 卡片流的卡宽（0.45 屏宽，用户 2026-11-07 拍板）；卡高 / 圆角沿用同一套比例。
+    val cardW: Dp = with(density) { (screen.width * CARD_WIDTH_RATIO).toDp() }
+    val cardH: Dp = cardW * screen.height / screen.width
+    val radius: Dp = cardW * CARD_RADIUS_RATIO
+    val surface = rememberCardSurface()
+    // 按钮宽度与锁屏遮罩页同一个算式（卡片流卡宽 × 5/6 = 0.375 屏宽）。
+    val buttonW: Dp = cardW * 5f / 6f
+    val busy = state.busy
+    // 生效中不许动选图 / 清空（用户 2026-10-12 定：只有非替换状态下才能动选图）。
+    val editable = !busy && !state.parallaxActive
+
     // 功能冲突弹窗（2026-11-04 起三侧统一：空间 / 光栅任一在跑都不许应用）
     var showConflict by remember { mutableStateOf(false) }
     var conflictOther by remember { mutableStateOf<RunningWallpaper?>(null) }
@@ -499,61 +797,86 @@ internal fun ParallaxBgDetail(state: MaskUiState, onPick: () -> Unit) {
             .verticalScroll(rememberPageScroll())
             .padding(top = LocalTopBarHeight.current, bottom = 32.dp),
     ) {
-        // 一列「背景」卡 —— 与主体 / 遮罩卡同款（标题 + summary + 预览框 + 两个按钮）。
-        // 「开启替换」期间选图操作禁用（用户指定：只有非替换状态下才能动上面的选图）。
-        ParallaxBgCard(
-            bitmap = state.parallaxPreview,
-            enabled = !state.busy && !state.parallaxActive,
-            onPick = { if (state.requireActivated()) onPick() },
-            onClear = { if (state.requireActivated()) state.clearParallaxBg() },
+        // 一、单卡居中。空态点加号选图；有图时整张卡也是选图入口，右上角删除钮清空。
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(top = 12.dp),
-        )
-
-        // 动作卡：**单个按钮**（用户指定）——「立即替换」⇄「关闭替换」，不是两个按钮。
-        // 位置 = 背景卡与「参数调整」卡的中间（2026-10-13 用户指定）。
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp)
-                .padding(top = 12.dp),
-            insideMargin = PaddingValues(0.dp),
+                .padding(top = 24.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                TextButton(
-                    text = if (state.parallaxActive) "关闭替换" else "立即替换",
-                    onClick = {
+            PickCard(
+                cardW = cardW,
+                cardH = cardH,
+                radius = radius,
+                surface = surface,
+                // 判据用"文件在不在"而不是 bitmap：预览异步解码，用它会先闪一下加号卡。
+                hasImage = state.parallaxHasBg,
+                bitmap = state.parallaxPreview,
+                enabled = editable,
+                onPick = {
+                    if (state.requireActivated()) {
                         haptic()
-                        if (state.requireActivated() && !state.busy) {
-                            when {
-                                state.parallaxActive -> state.disableParallax()
-                                // **最后**才查互斥：激活 / busy 这些「本来就能不能开」的条件
-                                // 已经过了（它们不满足时自己会弹 toast），这时才轮到外部状态。
-                                else -> {
-                                    // 统一检测（空间 / 光栅，含两种挂载模式）；
-                                    // 「正在运行的名字要对」—— 文案由实际命中的那条拼。
-                                    val other = WallpaperConflict.running(ctx, state, WallpaperChain.PARALLAX)
-                                    if (other != null) {
-                                        conflictOther = other
-                                        showConflict = true
-                                    } else {
-                                        state.enableParallax()
-                                    }
+                        onPick()
+                    }
+                },
+                onClear = {
+                    if (!busy && state.requireActivated()) {
+                        haptic()
+                        // 生效中内部会 toast「请先关闭替换」并中止（界面上的钮也已挡，这是兜底）。
+                        state.clearParallaxBg()
+                    }
+                },
+            )
+        }
+
+        // 二、**单个**按钮（用户指定）——「立即替换」⇄「关闭替换」，不是两个按钮。
+        // 主题色 + 卡宽 5/6 的尺寸，与锁屏遮罩页的「立即替换」完全一致（用户 2026-11-07）。
+        Spacer(Modifier.height(24.dp))
+        Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            Button(
+                onClick = {
+                    haptic()
+                    if (state.requireActivated() && !state.busy) {
+                        when {
+                            state.parallaxActive -> state.disableParallax()
+                            // **最后**才查互斥：激活 / busy 这些「本来就能不能开」的条件
+                            // 已经过了（它们不满足时自己会弹 toast），这时才轮到外部状态。
+                            else -> {
+                                // 统一检测（空间 / 光栅，含两种挂载模式）；
+                                // 「正在运行的名字要对」—— 文案由实际命中的那条拼。
+                                val other = WallpaperConflict.running(ctx, state, WallpaperChain.PARALLAX)
+                                if (other != null) {
+                                    conflictOther = other
+                                    showConflict = true
+                                } else {
+                                    state.enableParallax()
                                 }
                             }
                         }
+                    }
+                },
+                modifier = Modifier.width(buttonW),
+                // 没选图时禁用（与遮罩页同一口径）；「关闭替换」永远可点。
+                enabled = (state.parallaxActive || state.parallaxHasBg) && !busy,
+                colors = ButtonDefaults.buttonColorsPrimary(),
+            ) {
+                Text(
+                    text = when {
+                        busy -> "处理中…"
+                        state.parallaxActive -> "关闭替换"
+                        else -> "立即替换"
                     },
+                    style = MiuixTheme.textStyles.button,
+                    textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.textButtonColorsPrimary(),
                 )
             }
         }
 
-        // 「参数调整」（2026-10-13 加）：**卡外标题**（SmallTitle，同设置页"外观 / 测试"那类）
-        // + 卡内 1 开关 + 4 滑块 —— 调完直接锁屏查看（SystemUI 侧 ~4s 内取用，
+        // 三、「参数调整」（2026-10-13 加；2026-11-07 起卡外标题删掉，间距改由上面的 Spacer 给）
+        // —— 卡内 2 开关 + 6 滑块，调完直接锁屏查看（SystemUI 侧 ~4s 内取用，
         // 无需重启、无需重开替换）。
+        Spacer(Modifier.height(24.dp))
         ParallaxParamsCard(
             state = state,
             modifier = Modifier.fillMaxWidth(),
@@ -578,94 +901,18 @@ internal fun ParallaxBgDetail(state: MaskUiState, onPick: () -> Unit) {
     )
 }
 
-/** 「视差壁纸效果」的背景卡 —— 照 `RoleCard` 的样式（标题 / summary / 1:1 预览框 / 两个按钮）。 */
-@Composable
-private fun ParallaxBgCard(
-    bitmap: Bitmap?,
-    /** 选图操作是否可用：替换进行中与「开启中」都禁用。 */
-    enabled: Boolean,
-    onPick: () -> Unit,
-    onClear: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val haptic = rememberClickHaptic()
-    // 预览框底色与 RoleCard 完全同一套判断（注释见那里）：必须和卡片拉得开。
-    val previewSurface = if (MiuixTheme.colorScheme.surface.luminance() < 0.5f) {
-        Color(0xFF1A1A1A)
-    } else {
-        MiuixTheme.colorScheme.surfaceContainerHigh
-    }
-    Card(modifier = modifier, insideMargin = PaddingValues(0.dp)) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Text(text = "背景", style = MiuixTheme.textStyles.body1)
-            Text(
-                text = "不含主体的背景图片",
-                style = MiuixTheme.textStyles.body2,
-                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                modifier = Modifier.padding(top = 2.dp),
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 12.dp)
-                    // 1:1 预览框（2026-10-14 用户要求；原 9:16）——只改视差页，遮罩页 RoleCard 保持 9:16。
-                    .aspectRatio(1f / 1f)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(previewSurface),
-                contentAlignment = Alignment.Center,
-            ) {
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap.asImageBitmap(),
-                        contentDescription = "背景",
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit,
-                    )
-                } else {
-                    Text(
-                        text = "还未选择图片",
-                        style = MiuixTheme.textStyles.body2,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        textAlign = TextAlign.Center,
-                    )
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            // 「选择/更换图片」与「清空选择」放**同一行**（2026-10-22 用户要求）。
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(12.dp),
-            ) {
-                TextButton(
-                    text = if (bitmap != null) "更换图片" else "选择图片",
-                    onClick = { haptic(); onPick() },
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.textButtonColorsPrimary(),
-                    enabled = enabled,
-                )
-                TextButton(
-                    text = "清空选择",
-                    onClick = { haptic(); onClear() },
-                    modifier = Modifier.weight(1f),
-                    enabled = enabled,
-                )
-            }
-        }
-    }
-}
-
 /**
- * 「参数调整」—— **卡外标题**（`SmallTitle`）+ 一张控件卡（2 开关 + 6 滑块；首行
- * 「壁纸改变后自动关闭替换」为 2026-10-15 用户指定新增，其余为 2026-10-13 起陆续加入）。
+ * 「参数调整」—— 一张控件卡（2 开关 + 6 滑块；首行「壁纸改变后自动关闭替换」为
+ * 2026-10-15 用户指定新增，其余为 2026-10-13 起陆续加入）。
  *
- * * 标题用"卡片外的那种"（与设置页"外观 / 测试"同一类 —— 用户 2026-10-13 指定，
- *   初版是卡内自排标题，已改）；卡片位置在动作卡（「立即替换 / 关闭替换」）之后；
+ * * **2026-11-07 起没有卡外标题**（用户要求删掉 `SmallTitle("参数调整")`）——
+ *   卡片直接跟在「立即替换」按钮下面，间距由调用方的 Spacer 给；
  * * 开关「使主体与背景移动方向相同」（v22.5 语义翻转，用户 2026-10-14）：默认关 = **反方向移动**
  *   （背景取反）；开关打开 = 主体与背景同方向。方向语义 = **只翻背景**（主体保持现状）。
  * * 倍率滑块 1~1.25（步长 0.05）；幅度滑块范围**随倍率动态**：上限 =（半屏宽 ×（倍率−1）− 5px，
  *   见 [MaskPrefs.parallaxAmpUpperBound]）、下限 = 上限 ×（主体 50% / 背景 35%）；
  *   倍率 = 1.0 时上限 0 → 滑块锁 0 + 禁用态；
- * * 拖动中 `persist = false` 只更新内存（`commit()` 每帧写盘会卡拖动 —— NavBg 滑块的同一教训），
+ * * 拖动中 `persist = false` 只更新内存（`commit()` 每帧写盘会卡拖动 —— 滑块类设置的同一教训），
  *   抬手（`onValueChangeFinished`）一次性落盘；
  * * SystemUI 侧 3~4 秒内取用（config TTL 3s + 传感器帧轮询），**无需重启、无需重开替换**，
  *   替换关着时也允许调整（下次开启带着生效）。
@@ -674,107 +921,100 @@ private fun ParallaxBgCard(
 private fun ParallaxParamsCard(state: MaskUiState, modifier: Modifier = Modifier) {
     val subjectRange = state.parallaxSubjectAmpRange()
     val bgRange = state.parallaxBgAmpRange()
-    Column(modifier = modifier) {
-        // 卡外标题（用户指定；间距由 SmallTitle 自带 —— 与设置页同一用法，不加额外 padding）。
-        SmallTitle(text = "参数调整")
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp),
-            insideMargin = PaddingValues(0.dp),
-        ) {
-            Column {
-                // 「壁纸改变后自动关闭替换」（2026-10-15 加，**默认开**）：视差生效中检测到换壁纸
-                // → 自动关闭视差替换（无 summary —— 用户指定）。
-                SwitchRow(
-                    title = "壁纸改变后自动关闭替换",
-                    checked = state.parallaxAutoOff,
-                    onCheckedChange = { state.applyParallaxAutoOff(it) },
-                )
-                // 「视差效果覆盖桌面」（2026-10-21 加，**默认关**，无 summary —— 用户指定）。
-                // 当前只做「解锁动画抑制」；视差层真正覆盖桌面的逻辑后续再接。
-                SwitchRow(
-                    title = "视差效果覆盖桌面",
-                    checked = state.parallaxCoverDesktop,
-                    onCheckedChange = { state.applyParallaxCoverDesktop(it) },
-                )
-                SwitchRow(
-                    title = "使主体与背景移动方向相同",
-                    summary = "默认为反方向移动",
-                    checked = state.parallaxReverse,
-                    onCheckedChange = { state.applyParallaxReverse(it) },
-                )
-                ParallaxSliderRow(
-                    title = "主体放大倍率",
-                    text = formatScale(state.parallaxSubjectScale),
-                    value = state.parallaxSubjectScale,
-                    range = MaskPrefs.PARALLAX_SCALE_MIN..MaskPrefs.PARALLAX_SCALE_MAX,
-                    steps = 4,
-                    onValueChange = { state.applyParallaxSubjectScale(it, persist = false) },
-                    onFinished = { state.persistParallaxParams() },
-                )
-                ParallaxSliderRow(
-                    title = "背景放大倍率",
-                    text = formatScale(state.parallaxBgScale),
-                    value = state.parallaxBgScale,
-                    range = MaskPrefs.PARALLAX_SCALE_MIN..MaskPrefs.PARALLAX_SCALE_MAX,
-                    steps = 4,
-                    onValueChange = { state.applyParallaxBgScale(it, persist = false) },
-                    onFinished = { state.persistParallaxParams() },
-                )
-                ParallaxSliderRow(
-                    title = "主体移动最大幅度",
-                    text = "${state.parallaxSubjectAmp.roundToInt()} px",
-                    value = state.parallaxSubjectAmp,
-                    range = subjectRange,
-                    steps = sliderSteps(subjectRange),
-                    enabled = subjectRange.endInclusive > 0f,
-                    onValueChange = { state.applyParallaxSubjectAmp(it, persist = false) },
-                    onFinished = { state.persistParallaxParams() },
-                )
-                ParallaxSliderRow(
-                    title = "背景移动最大幅度",
-                    text = "${state.parallaxBgAmp.roundToInt()} px",
-                    value = state.parallaxBgAmp,
-                    range = bgRange,
-                    steps = sliderSteps(bgRange),
-                    enabled = bgRange.endInclusive > 0f,
-                    onValueChange = { state.applyParallaxBgAmp(it, persist = false) },
-                    onFinished = { state.persistParallaxParams() },
-                )
-                // 「最大幅度角度」（2026-10-13 用户加）：转动的满量程角 —— 绕长边转多少度达到满幅；
-                // 量程 15°~45°、步进 1°、默认 25°（用户定；v22.6 上限 30°→45°）。
-                // 位置在"背景幅度"与"归位等待"中间（用户指定）。
-                ParallaxSliderRow(
-                    title = "最大幅度角度",
-                    text = "${state.parallaxGyroDeg.roundToInt()}°",
-                    value = state.parallaxGyroDeg,
-                    range = MaskPrefs.PARALLAX_GYRO_DEG_MIN..MaskPrefs.PARALLAX_GYRO_DEG_MAX,
-                    steps = sliderSteps(
-                        MaskPrefs.PARALLAX_GYRO_DEG_MIN..MaskPrefs.PARALLAX_GYRO_DEG_MAX,
-                    ),
-                    onValueChange = { state.applyParallaxGyroDeg(it, persist = false) },
-                    onFinished = { state.persistParallaxParams() },
-                )
-                // 「恢复原位等待时长」（2026-10-13 用户加）：静止判定窗口 —— 停下来后**等多久**
-                // 开始归位动画；量程 0.2s~1s、步进 0.1s。排在「背景移动最大幅度」下方（用户指定）。
-                ParallaxSliderRow(
-                    title = "恢复原位等待时长",
-                    text = formatSeconds(state.parallaxHomeWait),
-                    value = state.parallaxHomeWait,
-                    range = MaskPrefs.PARALLAX_HOME_WAIT_MIN..MaskPrefs.PARALLAX_HOME_WAIT_MAX,
-                    steps = 7,
-                    onValueChange = { state.applyParallaxHomeWait(it, persist = false) },
-                    onFinished = { state.persistParallaxParams() },
-                )
-            }
+    Card(
+        modifier = modifier.padding(horizontal = 12.dp),
+        insideMargin = PaddingValues(0.dp),
+    ) {
+        Column {
+            // 「壁纸改变后自动关闭替换」（2026-10-15 加，**默认开**）：视差生效中检测到换壁纸
+            // → 自动关闭视差替换（无 summary —— 用户指定）。
+            SwitchRow(
+                title = "壁纸改变后自动关闭替换",
+                checked = state.parallaxAutoOff,
+                onCheckedChange = { state.applyParallaxAutoOff(it) },
+            )
+            // 「视差效果覆盖桌面」（2026-10-21 加，**默认关**，无 summary —— 用户指定）。
+            // 当前只做「解锁动画抑制」；视差层真正覆盖桌面的逻辑后续再接。
+            SwitchRow(
+                title = "视差效果覆盖桌面",
+                checked = state.parallaxCoverDesktop,
+                onCheckedChange = { state.applyParallaxCoverDesktop(it) },
+            )
+            SwitchRow(
+                title = "使主体与背景移动方向相同",
+                summary = "默认为反方向移动",
+                checked = state.parallaxReverse,
+                onCheckedChange = { state.applyParallaxReverse(it) },
+            )
+            ParallaxSliderRow(
+                title = "主体放大倍率",
+                text = formatScale(state.parallaxSubjectScale),
+                value = state.parallaxSubjectScale,
+                range = MaskPrefs.PARALLAX_SCALE_MIN..MaskPrefs.PARALLAX_SCALE_MAX,
+                steps = 4,
+                onValueChange = { state.applyParallaxSubjectScale(it, persist = false) },
+                onFinished = { state.persistParallaxParams() },
+            )
+            ParallaxSliderRow(
+                title = "背景放大倍率",
+                text = formatScale(state.parallaxBgScale),
+                value = state.parallaxBgScale,
+                range = MaskPrefs.PARALLAX_SCALE_MIN..MaskPrefs.PARALLAX_SCALE_MAX,
+                steps = 4,
+                onValueChange = { state.applyParallaxBgScale(it, persist = false) },
+                onFinished = { state.persistParallaxParams() },
+            )
+            ParallaxSliderRow(
+                title = "主体移动最大幅度",
+                text = "${state.parallaxSubjectAmp.roundToInt()} px",
+                value = state.parallaxSubjectAmp,
+                range = subjectRange,
+                steps = sliderSteps(subjectRange),
+                enabled = subjectRange.endInclusive > 0f,
+                onValueChange = { state.applyParallaxSubjectAmp(it, persist = false) },
+                onFinished = { state.persistParallaxParams() },
+            )
+            ParallaxSliderRow(
+                title = "背景移动最大幅度",
+                text = "${state.parallaxBgAmp.roundToInt()} px",
+                value = state.parallaxBgAmp,
+                range = bgRange,
+                steps = sliderSteps(bgRange),
+                enabled = bgRange.endInclusive > 0f,
+                onValueChange = { state.applyParallaxBgAmp(it, persist = false) },
+                onFinished = { state.persistParallaxParams() },
+            )
+            // 「最大幅度角度」（2026-10-13 用户加）：转动的满量程角 —— 绕长边转多少度达到满幅；
+            // 量程 15°~45°、步进 1°、默认 25°（用户定；v22.6 上限 30°→45°）。
+            // 位置在"背景幅度"与"归位等待"中间（用户指定）。
+            ParallaxSliderRow(
+                title = "最大幅度角度",
+                text = "${state.parallaxGyroDeg.roundToInt()}°",
+                value = state.parallaxGyroDeg,
+                range = MaskPrefs.PARALLAX_GYRO_DEG_MIN..MaskPrefs.PARALLAX_GYRO_DEG_MAX,
+                steps = sliderSteps(
+                    MaskPrefs.PARALLAX_GYRO_DEG_MIN..MaskPrefs.PARALLAX_GYRO_DEG_MAX,
+                ),
+                onValueChange = { state.applyParallaxGyroDeg(it, persist = false) },
+                onFinished = { state.persistParallaxParams() },
+            )
+            // 「恢复原位等待时长」（2026-10-13 用户加）：静止判定窗口 —— 停下来后**等多久**
+            // 开始归位动画；量程 0.2s~1s、步进 0.1s。排在「背景移动最大幅度」下方（用户指定）。
+            ParallaxSliderRow(
+                title = "恢复原位等待时长",
+                text = formatSeconds(state.parallaxHomeWait),
+                value = state.parallaxHomeWait,
+                range = MaskPrefs.PARALLAX_HOME_WAIT_MIN..MaskPrefs.PARALLAX_HOME_WAIT_MAX,
+                steps = 7,
+                onValueChange = { state.applyParallaxHomeWait(it, persist = false) },
+                onFinished = { state.persistParallaxParams() },
+            )
         }
     }
 }
 
 /**
- * 「参数调整」卡里的一行滑块 —— 标题行右侧实时数值 + 全宽 Slider（照设置页 NavBgOptions 的
- * 模糊半径滑块同款排布 / 字体）。
+ * 「参数调整」卡里的一行滑块 —— 标题行右侧实时数值 + 全宽 Slider。
  */
 @Composable
 internal fun ParallaxSliderRow(
@@ -827,175 +1067,13 @@ private fun formatScale(value: Float): String = String.format(Locale.US, "%.2f",
 /** 秒显示（"0.5 s"；归位等待时长用）。 */
 private fun formatSeconds(value: Float): String = String.format(Locale.US, "%.1f s", value)
 
-@Composable
-private fun RoleCard(
-    role: MaskRole,
-    bitmap: Bitmap?,
-    injected: Boolean,
-    /** 另一边（主体 / 遮罩）已经选过了 —— 两者互斥。 */
-    otherSelected: Boolean,
-    otherTitle: String,
-    /**
-     * 两个按钮是否可用。
-     *
-     * 替换进行中（`MaskUiState.busy` → 「立即替换」显示"处理中…"）时传 `false`：
-     * 「选择图片 / 更换图片」与「清空选择」都进入 miuix 的**禁用态**（官方 disabled 配色 = 变灰，
-     * 且点击无效）。目的是让用户在整个「替换 + 保护」周期里**选不了新图** ——
-     * 保护期内新选的候选本来就不该生效，索性在这个窗口内直接不给入口。
-     */
-    enabled: Boolean,
-    onPick: () -> Unit,
-    onClear: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    // 「选择图片 / 更换图片」和「清空选择」两个按钮：主体卡、遮罩卡共用这一处。
-    val haptic = rememberClickHaptic()
-    // 预览框的底色必须和卡片**拉得开**。miuix 的色表里：
-    // - 浅色：卡片 `surfaceContainer` = 白、`surfaceContainerHigh` = #E8E8E8 → 用它，看得见 ✓
-    // - 深色：卡片 `surfaceContainer` 和 `surfaceContainerHigh` **都是 #242424** → 用它就和卡片糊成一片，
-    //   所以深色固定用一个比卡片更深的灰 **#1A1A1A**（比纯黑的 `surface` 柔和，用户定的值）。
-    // 深浅判断用 `surface` 的亮度、而不是 `isSystemInDarkTheme()`：本应用支持强制深浅色，
-    // 必须跟**应用主题**走（深色 surface = #000000 → 0.0；浅色 = #F7F7F7 → 0.93，不会判错）。
-    val previewSurface = if (MiuixTheme.colorScheme.surface.luminance() < 0.5f) {
-        Color(0xFF1A1A1A)
-    } else {
-        MiuixTheme.colorScheme.surfaceContainerHigh
-    }
-    Card(modifier = modifier, insideMargin = PaddingValues(0.dp)) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Text(text = role.title, style = MiuixTheme.textStyles.body1)
-            Text(
-                text = role.summary,
-                // 和设置页开关下面那行说明同一号（body2 = 14sp），不要再往下缩一档。
-                style = MiuixTheme.textStyles.body2,
-                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                modifier = Modifier.padding(top = 2.dp),
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 12.dp)
-                    // 9:16 竖版比例（手机照片的样子），比固定高度好看。
-                    .aspectRatio(9f / 16f)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(previewSurface),
-                contentAlignment = Alignment.Center,
-            ) {
-                when {
-                    bitmap != null -> Image(
-                        bitmap = bitmap.asImageBitmap(),
-                        contentDescription = role.title,
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit,
-                    )
-
-                    otherSelected -> Text(
-                        text = "已选择$otherTitle",
-                        style = MiuixTheme.textStyles.body2,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        textAlign = TextAlign.Center,
-                    )
-
-                    injected -> Text(
-                        text = "已写入系统",
-                        style = MiuixTheme.textStyles.body2,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        textAlign = TextAlign.Center,
-                    )
-
-                    else -> Text(
-                        text = "还未选择图片",
-                        style = MiuixTheme.textStyles.body2,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        textAlign = TextAlign.Center,
-                    )
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            TextButton(
-                text = if (bitmap != null) "更换图片" else "选择图片",
-                onClick = { haptic(); onPick() },
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.textButtonColorsPrimary(),
-                enabled = enabled,
-            )
-            Spacer(Modifier.height(12.dp))
-            TextButton(
-                text = "清空选择",
-                onClick = { haptic(); onClear() },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = enabled,
-            )
-        }
-    }
-}
-
 // ------------------------------------------------------------------ 设置
-
-/**
- * 「使用自定义背景」打开后出现的两行：**选择图片** + **模糊半径调整**（2026-10-06）。
- *
- * 位置由调用处决定 —— 夹在「使用自定义背景」与「显示自检与最近操作」**之间**、同一张卡片内
- * （用户指定），所以这里**不再自己开 Card**。
- *
- * 模糊那一行**不能**把滑块塞进 `BasicComponent` 的 `endActions`（那儿只够放一个短文本），
- * 所以拆成「标题行（右侧实时数值）+ 下面整宽滑块」两段，行距由 `BasicComponent` 自带的
- * 16dp 上下 padding 提供（和卡片里其它行一致，官方排版就是这样）。
- */
-@Composable
-private fun NavBgOptions(navBg: NavBgState) {
-    val picker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia(),
-    ) { uri -> uri?.let { navBg.onPicked(it) } }
-
-    LinkRow(
-        title = "选择图片",
-        summary = navBg.fileName.ifEmpty { "未选择图片" },
-        onClick = {
-            picker.launch(
-                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-            )
-        },
-    )
-    // 标题行：右侧是**实时**数值（拖动时逐帧跳，纯粹是个 Text、不花算力）。
-    BasicComponent(
-        title = "模糊半径调整",
-        endActions = {
-            Text(
-                text = "${navBg.radiusPx.roundToInt()} px",
-                modifier = Modifier
-                    .padding(end = 8.dp)
-                    .align(Alignment.CenterVertically),
-                fontSize = MiuixTheme.textStyles.body2.fontSize,
-                color = MiuixTheme.colorScheme.onSurfaceVariantActions,
-                textAlign = TextAlign.End,
-            )
-        },
-    )
-    // 滑块单独一段：0~50px、步长 1px（`steps = 49` ⇒ 共 51 档）。
-    // 量化是为了少算几次 —— 每次数值变化都要解码 + 模糊 + GPU 读回 + 编码落盘，
-    // 外面还包了 0.5s 防抖（见 `NavBg.kt`），所以拖动过程中只更新数值、松手后算一次。
-    //
-    // ⚠️ **它自带的 `draggable` 实际上抢不到事件**（pager 的 PagerSwipeNode 在 Main 阶段
-    // 比子节点先拿到水平手势），真正接管拖动的是挂在 pager 祖先上的 `SliderTouchGesture`
-    // —— 这里的 `onValueChange` 只是兜底，正常不会触发。
-    Slider(
-        value = navBg.radiusPx,
-        onValueChange = { navBg.setRadius(it) },
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 16.dp, end = 16.dp, bottom = 16.dp)
-            .reportSliderRect(navBg),
-        valueRange = 0f..MaskPrefs.NAV_BG_RADIUS_MAX.toFloat(),
-        steps = MaskPrefs.NAV_BG_RADIUS_MAX - 1,
-    )
-}
 
 @Composable
 internal fun SettingsTab(
     state: MaskUiState,
-    navBg: NavBgState,
     onThemeModeChange: (ThemeMode) -> Unit,
+    onMonetChange: (Boolean) -> Unit,
 ) {
     // 这里只给按钮用：开关的振动由 SwitchRow 自己处理（点整行 → ContextClick；点开关 → miuix 内置的 Toggle）。
     val haptic = rememberClickHaptic()
@@ -1022,15 +1100,26 @@ internal fun SettingsTab(
             insideMargin = PaddingValues(0.dp),
         ) {
             DropdownRow(
-                title = "主题",
-                summary = "调整应用的主题模式",
+                title = "主题模式",
                 options = ThemeMode.entries.map { it.label },
                 selectedIndex = ThemeMode.entries.indexOf(state.themeMode),
                 onSelect = { index -> onThemeModeChange(ThemeMode.entries[index]) },
             )
+            // 「启用Monet颜色」（2026-11-07）：miuix 支持读系统动态色（`platformDynamicColors`），
+            // 打开后整套配色跟随壁纸取色。默认关 —— 等价于原来那套固定配色，老用户升级后零变化。
+            SwitchRow(
+                title = "启用Monet颜色",
+                checked = state.monetColor,
+                onCheckedChange = {
+                    state.applyMonetColor(it)
+                    onMonetChange(it)
+                },
+            )
         }
 
-        // 测试：下面那两块是排查用的，默认关着；打开才显示（见 MaskUiState.showDiagnostics）。
+        // 测试：这张卡片现在只剩「详细过程写入LSPosed日志」一个开关 ——
+        // 「使用自定义背景」「显示自检与最近操作」2026-11-07 按用户要求整链删除
+        //（排查改看 LSPosed 日志与 `run_log.txt`，用户发 log 即可，界面上不再留入口）。
         SmallTitle(text = "测试")
         Card(
             modifier = Modifier
@@ -1038,50 +1127,16 @@ internal fun SettingsTab(
                 .padding(horizontal = 12.dp),
             insideMargin = PaddingValues(0.dp),
         ) {
-            // 「详细过程写入LSPosed日志」2026-09-29 从「替换行为」挪进来，排在自检开关**上面**（用户指定）。
+            // 「详细过程写入LSPosed日志」2026-09-29 从「替换行为」挪进来。
             SwitchRow(
                 title = "详细过程写入LSPosed日志",
                 summary = "便于排查问题",
                 checked = state.verbose,
                 onCheckedChange = { state.applyVerbose(it) },
             )
-            // 「使用自定义背景」（2026-10-06，**测试功能**）：整页背景换成自选图，专门用来观察
-            // 底栏玻璃在真实图案下的表现（纯色底看不出降采样降级那些问题）。默认关；
-            // 关掉时半径归零、缓存目录删干净。排在两个既有开关**中间**是用户指定的位置，
-            // 打开后出现的两个选项也**插在这中间**（同卡片内，不是另开一张卡）。
-            SwitchRow(
-                title = "使用自定义背景",
-                summary = "仅供测试使用，非正式选项",
-                checked = navBg.enabled,
-                onCheckedChange = { navBg.applyEnabled(it) },
-            )
-            if (navBg.enabled) {
-                NavBgOptions(navBg)
-            }
-            SwitchRow(
-                title = "显示自检与最近操作",
-                summary = "定位问题时开启",
-                checked = state.showDiagnostics,
-                onCheckedChange = { state.applyShowDiagnostics(it) },
-            )
-        }
-
-        if (state.showDiagnostics) {
-            DiagnosticsSection(state)
         }
     }
 }
-
-/**
- * 设置页的「自检」+「最近操作」两块（都是排查用的）。
- *
- * 「上次执行结果」卡片已于 2026-10-04 按用户要求删除：执行结果改为持续写入
- * `/data/user/0/com.frederic22.hyperextreme/run_log.txt`（见 `data/RunLog.kt`）。
- *
- * 抽成单独一个 composable 是因为它们只在「测试 → 显示自检与最近操作」打开时才渲染（默认关）——
- * 把条件写在 [SettingsTab] 里会是嵌一大段缩进的 `if`，抽出来更清楚。
- * 这里面的内容原本就写在设置页里，逻辑一字未改。
- */
 // ------------------------------------------------------------------ 系统界面（二级）
 
 /**
@@ -1203,91 +1258,6 @@ internal fun DesktopDetail(state: MaskUiState) {
             )
         }
     }
-}
-
-@Composable
-private fun DiagnosticsSection(state: MaskUiState) {
-    val haptic = rememberClickHaptic()
-
-    SmallTitle(text = "自检")
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp),
-        insideMargin = PaddingValues(0.dp),
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = "检查模块内部功能是否正常。",
-                style = MiuixTheme.textStyles.footnote1,
-                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-            )
-            Spacer(Modifier.height(12.dp))
-            Button(
-                onClick = { haptic(); state.runSelfTest() },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    text = if (state.busy) "运行中…" else "运行自检",
-                    style = MiuixTheme.textStyles.button,
-                )
-            }
-            state.selfTestLines.forEach { line ->
-                Text(
-                    text = "· $line",
-                    style = MiuixTheme.textStyles.footnote2,
-                    color = MiuixTheme.colorScheme.onSurfaceContainerVariant,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
-            }
-        }
-    }
-
-    // 最近一次注入 / 保护状态变化（hook 或 root 写回来的记录）—— 保护有没有真的结束就看这里。
-    // （主页那张"替换状态"卡片删掉之后，这条记录一度没有任何地方显示。）
-    // 下面再加一行"诊断"：ScreenDisarm 收到亮屏广播、壁纸尺寸探测的结果都写在这里，
-    // 这两条链路原来都把失败静默吞掉了，真机上没法判断卡在哪一步。
-    val hookDetail = state.hookStatus.detail
-    val diagNote = MaskPrefs(state.context).diagNote
-    if (!hookDetail.isNullOrBlank() || diagNote.isNotBlank()) {
-        SmallTitle(text = "最近操作")
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp),
-            insideMargin = PaddingValues(0.dp),
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                if (!hookDetail.isNullOrBlank()) {
-                    Text(
-                        text = hookDetail,
-                        style = MiuixTheme.textStyles.body2,
-                        color = MiuixTheme.colorScheme.onSurfaceContainerVariant,
-                    )
-                    Text(
-                        text = listOf(state.hookStatus.process.orEmpty(), formatTime(state.hookStatus.at))
-                            .filter { it.isNotBlank() }
-                            .joinToString(" · "),
-                        style = MiuixTheme.textStyles.footnote2,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                }
-                if (diagNote.isNotBlank()) {
-                    Text(
-                        text = diagNote,
-                        style = MiuixTheme.textStyles.footnote2,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                }
-            }
-        }
-    }
-
-    // 「上次执行结果」卡片已按用户要求删除（2026-10-04）——
-    // 执行结果现在持续写入 `/data/user/0/com.frederic22.hyperextreme/run_log.txt`
-    // （带时间戳、最多 500 行，见 data/RunLog.kt），不再占设置页。
 }
 
 // ------------------------------------------------------------------ 关于

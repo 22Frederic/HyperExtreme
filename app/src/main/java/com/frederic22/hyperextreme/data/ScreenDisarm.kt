@@ -7,9 +7,6 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -60,16 +57,7 @@ object ScreenDisarm {
         val target = object : BroadcastReceiver() {
             override fun onReceive(receiverContext: Context?, intent: Intent?) {
                 if (intent?.action != Intent.ACTION_SCREEN_ON) return
-                // 诊断：真机上必须能看出"广播到底有没有到" —— 否则分不清是接收器没注册，
-                // 还是判据没过。写进 prefs，界面在设置页显示它。
                 val armed = runCatching { shouldRelease() }.getOrDefault(false)
-                runCatching {
-                    val at = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                    MaskPrefs(app).setDiagNote(
-                        "亮屏检测：$at → " +
-                            if (armed) "判据通过，即将结束保护" else "判据未通过（保护已结束）",
-                    )
-                }
                 if (!armed) return
                 main.postDelayed({ release(app, shouldRelease) }, DelayMs)
             }
@@ -102,7 +90,6 @@ object ScreenDisarm {
                 MaskProvider.RELEASE_BY_SCREEN_ON,
                 null,
             )
-            MaskPrefs(app).setDiagNote("已按「灭亮屏」结束保护")
         }
     }
 }

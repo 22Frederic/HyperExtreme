@@ -28,6 +28,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -124,6 +125,12 @@ private const val SETTLE_OMEGA = 20f
 /** 收尾补正（把落点精确贴到中线）的时长：不做瞬移，否则端点回来那一下很突兀。 */
 private const val SETTLE_FIX_MS = 180
 
+/**
+ * 「清除全部」时，已经**完全出屏**的新建卡要"传送"到的位置：屏幕左边缘外多少 dp
+ * （2026-11-07 用户拍板 2dp）。
+ */
+private val CLEAR_ENTER_INSET = 2.dp
+
 // ------------------------------------------------------------------ 卡片流
 
 /**
@@ -160,6 +167,21 @@ internal fun CoverCarousel(
      * 推理要 7~10s，中途删掉正在处理的那张会让结果无处可写。
      */
     allowDelete: Boolean = true,
+    /**
+     * 「清除全部」请求号（2026-11-07）：页面点「清除所有深度缓存 / 清除所有搭配」时 +1。
+     *
+     * 卡片流接手三件事 —— ①所有**非新建**卡播 200ms 缩小淡出（复用删除动画）；
+     * ②播完回调 [onClearSettled]，页面在那一帧一次性清空数据；
+     * ③新建卡按起点补位到中间（起点规则见 [clearStartPagesOf]）。
+     */
+    clearToken: Int = 0,
+    /**
+     * 「清除全部」的缩小淡出播完、**数据还没清空**时回调。
+     *
+     * ⚠️ 实现里必须在**这一帧同步**把列表清空（不能先做 IO 再清）：补位进度就是按
+     * 「`items` 变空的那一帧」创建的，晚一帧就会看到新建卡先瞬移到中间再滑回来。
+     */
+    onClearSettled: () -> Unit = {},
 ) {
     val density = LocalDensity.current
     val haptic = rememberClickHaptic()
@@ -209,6 +231,15 @@ internal fun CoverCarousel(
         onDeleteSettled()
     }
 
+    // ── 清除全部（2026-11-07）──
+    // `clearing`   ：所有非新建卡正在播缩小淡出（顺带禁止拖动 / 点击 / 出删除钮）。
+    // `clearArmed` ：已确认清空，等「数据真正变空」的那一帧开播补位。
+    // `clearStartPages`：新建卡要走的距离（页，正数 = 它在中间左侧多少页）——点下清除时算一次。
+    var clearing by remember { mutableStateOf(false) }
+    var clearArmed by remember { mutableStateOf(false) }
+    var reflowing by remember { mutableStateOf(false) }
+    var clearStartPages by remember { mutableFloatStateOf(0f) }
+
     BoxWithConstraints(Modifier.fillMaxWidth()) {
         val viewportPx = constraints.maxWidth.toFloat()
         // 左右留白 = (视口 − 卡宽)/2 ⇒ 每项左边缘对齐 contentPadding 后正好居中。
@@ -253,6 +284,43 @@ internal fun CoverCarousel(
                 }
             }
         }
+        // ── 清除全部：编排（2026-11-07）──
+        // 点下清除那一刻算一次起点 —— 此时数据还在，`layoutInfo` 还是满的，量到的就是
+        // "用户最后看到的那一帧"里新建卡的位置。之后 200ms 里禁止拖动，起点不会失效。
+        val enterInsetPx = with(density) { CLEAR_ENTER_INSET.toPx() }
+        LaunchedEffect(clearToken) {
+            if (clearToken == 0) return@LaunchedEffect
+            clearStartPages = clearStartPagesOf(
+                anchorPages = centerPos.value,
+                viewportPx = viewportPx,
+                cardWPx = cardWPx,
+                pageStep = pageStep,
+                enterInsetPx = enterInsetPx,
+            )
+            clearArmed = true
+            clearing = true
+            delay(DELETE_CARD_MS.toLong())
+            clearing = false
+            onClearSettled()
+        }
+
+        // 数据清空的那一帧把补位进度建成 0 —— 和 `shiftToken` **同一个坑**：
+        // 晚一帧创建的话，最先画出来的那一帧已经是"已落位"，就是瞬移。
+        val reflow = remember(items.isEmpty(), clearArmed) {
+            if (clearArmed && items.isEmpty()) Animatable(0f) else null
+        }
+        LaunchedEffect(reflow) {
+            if (reflow == null) return@LaunchedEffect
+            reflowing = true
+            reflow.animateTo(
+                targetValue = 1f,
+                // 与松手吸附 / 普通补位同一条曲线：临界阻尼、不过冲。
+                animationSpec = spring(dampingRatio = 1f, stiffness = Spring.StiffnessMediumLow),
+            )
+            clearArmed = false
+            reflowing = false
+        }
+
         // 居中页回调：只报「已经吸附到位」的整数页。
         //
         // ⚠️ **绝不能**在这里 `snapTo` 修正位置：会和 LazyRow 自己的 clamp 互相触发补偿滚动，
@@ -297,12 +365,21 @@ internal fun CoverCarousel(
             } else {
                 0f
             }
+            // 清除全部：只有新建卡（page 0）要按起点滑回中间 —— 其余卡这时已经淡出、
+            // 也即将从数据里移除。起点是负数（页）⇒ 它被画在中间左侧，进度走到 1 归位。
+            val rf = reflow
+            val clearExt = if (page == 0 && rf != null) {
+                -(1f - rf.value) * clearStartPages
+            } else {
+                0f
+            }
+            val total = ext + clearExt
             val p = centerPos.value
-            val d = if (p.isNaN()) 1f else (page - p + ext).coerceIn(-1f, 1f)
+            val d = if (p.isNaN()) 1f else (page - p + total).coerceIn(-1f, 1f)
             val s = 1f - (1f - CARD_MIN_SCALE) * abs(d)
             scaleX = s
             scaleY = s
-            if (ext != 0f) translationX = ext * pageStep
+            translationX = total * pageStep
             transformOrigin = TransformOrigin(0.5f, 0.5f)
         }
 
@@ -316,12 +393,16 @@ internal fun CoverCarousel(
             horizontalArrangement = Arrangement.spacedBy(gap),
             flingBehavior = fling,
             verticalAlignment = Alignment.CenterVertically,
+            // 清除全部的淡出期间冻结滚动：起点是"点下清除那一刻"量的，滚了就对不上。
+            userScrollEnabled = !clearing,
         ) {
             item(key = "new") {
                 // 「新建」卡同样**只有居中时才可点**（2026-11-05 用户要求：
                 // 列表里只有中间那张能点，侧卡点了完全无响应，切换靠滑）。
                 val newSettled by remember(centerPos, shiftToken) {
-                    derivedStateOf { settledPage.value == 0 && !shifting }
+                    derivedStateOf {
+                        settledPage.value == 0 && !shifting && !clearing && !reflowing
+                    }
                 }
                 NewCard(
                     cardW = cardW,
@@ -339,7 +420,9 @@ internal fun CoverCarousel(
                 //    只有"离开中心"和"进入中心"这两项的结果会变 ⇒ 只有它们重组，
                 //    不会整条列表一起重组（归位那一帧的卡顿）。
                 val settled by remember(page, shiftToken) {
-                    derivedStateOf { settledPage.value == page && !shifting }
+                    derivedStateOf {
+                        settledPage.value == page && !shifting && !clearing && !reflowing
+                    }
                 }
                 CoverCard(
                     item = item,
@@ -350,8 +433,9 @@ internal fun CoverCarousel(
                     // 滚动中 `settledPage` 是 -1 ⇒ 一律不可点，避免滑动误触。
                     clickable = settled,
                     showDelete = allowDelete && settled && item.id != activeId,
-                    // 确认删除后：卡片与删除钮一起缩小 + 淡出。
-                    removing = item.id == deletingId,
+                    // 确认删除后：卡片与删除钮一起缩小 + 淡出。清除全部时**所有**非新建卡
+                    // 一起播同一段动画（新建卡没有这个参数，永远不淡出）。
+                    removing = clearing || item.id == deletingId,
                     modifier = itemTransform(page),
                     onClick = { haptic(); onFocus(page); onClick(item) },
                     onDelete = { onDelete(item) },
@@ -359,6 +443,35 @@ internal fun CoverCarousel(
             }
         }
     }
+}
+
+/**
+ * 「清除全部」时新建卡的补位起点（页，正数 = 它在中间左侧多少页）。
+ *
+ * | 清除瞬间它在哪 | 起点 | 观感 |
+ * | --- | --- | --- |
+ * | 居中（0 页） | 0 | 不动 |
+ * | 屏幕内左侧（1 页，露一条边） | 当前位置 | 一次普通补位 |
+ * | 已经完全出屏 | 左边缘外 [CLEAR_ENTER_INSET] | 先"传送"过去再补位 |
+ *
+ * 传送本身**看不见** —— 起点终点都在屏幕外，只是把"从很远处高速掠过整个屏幕"换成
+ * "贴着左边缘滑进来"，入场速度和角度才稳定。
+ *
+ * 可见性按**实测**算而不是硬编码页数：新建卡右边缘是否越过视口左边缘。用当前缩放
+ * （离中心超过一页时恒 [CARD_MIN_SCALE]）算半宽，所以 1 页≈露 0.21 屏宽、2 页已在屏外。
+ */
+private fun clearStartPagesOf(
+    anchorPages: Float,
+    viewportPx: Float,
+    cardWPx: Float,
+    pageStep: Float,
+    enterInsetPx: Float,
+): Float {
+    if (anchorPages.isNaN() || anchorPages <= 0f) return 0f
+    val scale = 1f - (1f - CARD_MIN_SCALE) * anchorPages.coerceAtMost(1f)
+    val rightEdge = -anchorPages * pageStep + cardWPx * scale / 2f
+    if (rightEdge > -viewportPx / 2f) return anchorPages
+    return (viewportPx / 2f + cardWPx * CARD_MIN_SCALE / 2f + enterInsetPx) / pageStep
 }
 
 /** 封面卡：图铺满，向内一圈 1dp 纯黑 15% 描边；居中的非当前项才带红色删除钮。 */

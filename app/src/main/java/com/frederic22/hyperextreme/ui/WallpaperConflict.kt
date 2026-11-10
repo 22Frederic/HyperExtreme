@@ -1,6 +1,7 @@
 package com.frederic22.hyperextreme.ui
 
 import android.content.Context
+import com.frederic22.hyperextreme.data.AliveControl
 import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.data.RasterControl
 import com.frederic22.hyperextreme.data.SpatialControl
@@ -21,6 +22,7 @@ internal enum class WallpaperChain {
     PARALLAX,
     SPATIAL,
     RASTER,
+    ALIVE,
 }
 
 /** 同一条链的两种挂载方式（只有空间 / 光栅有；视差只有 hook 一条）。 */
@@ -40,6 +42,7 @@ internal data class RunningWallpaper(
             WallpaperChain.PARALLAX -> "视差壁纸"
             WallpaperChain.SPATIAL -> "空间壁纸"
             WallpaperChain.RASTER -> "光栅壁纸"
+            WallpaperChain.ALIVE -> "Alive壁纸"
         }
 }
 
@@ -65,35 +68,53 @@ internal data class RunningWallpaper(
 internal object WallpaperConflict {
 
     /**
+     * 所有**真的在跑**的链（2026-11-08）。
+     *
+     * 顺序就是优先级：视差 → 空间 → 光栅 → Alive。四链互斥，正常最多一条；
+     * 脏数据（比如手动改过 prefs）下按这个顺序取第一条。
+     */
+    private fun detect(ctx: Context, state: MaskUiState): List<RunningWallpaper> {
+        val prefs = MaskPrefs(ctx)
+        val out = ArrayList<RunningWallpaper>(4)
+        if (state.parallaxActive) {
+            out.add(RunningWallpaper(WallpaperChain.PARALLAX, WallpaperMode.HOOK))
+        }
+        if (prefs.spatialActive) {
+            out.add(RunningWallpaper(WallpaperChain.SPATIAL, WallpaperMode.HOOK))
+        }
+        if (SpatialServiceMode.isRunning(ctx, SpatialWallpaperService::class.java)) {
+            out.add(RunningWallpaper(WallpaperChain.SPATIAL, WallpaperMode.SERVICE))
+        }
+        if (prefs.rasterMountMode == MaskPrefs.RASTER_MOUNT_LSPOSED &&
+            prefs.rasterActiveId.isNotEmpty()
+        ) {
+            out.add(RunningWallpaper(WallpaperChain.RASTER, WallpaperMode.HOOK))
+        }
+        if (SpatialServiceMode.isRunning(ctx, RasterWallpaperService::class.java)) {
+            out.add(RunningWallpaper(WallpaperChain.RASTER, WallpaperMode.SERVICE))
+        }
+        // Alive 只有 HOOK 一条链（要 AOD 动画，系统壁纸服务那条路做不了）。
+        if (prefs.aliveActiveId.isNotEmpty()) {
+            out.add(RunningWallpaper(WallpaperChain.ALIVE, WallpaperMode.HOOK))
+        }
+        return out
+    }
+
+    /**
      * 除 [self] 之外正在运行的链；没有返回 null。
      *
      * 同一 chain 的两种模式一起排除 —— 页面自己不需要被自己拦住。
      */
-    fun running(ctx: Context, state: MaskUiState, self: WallpaperChain): RunningWallpaper? {
-        val prefs = MaskPrefs(ctx)
-        if (self != WallpaperChain.PARALLAX && state.parallaxActive) {
-            return RunningWallpaper(WallpaperChain.PARALLAX, WallpaperMode.HOOK)
-        }
-        if (self != WallpaperChain.SPATIAL) {
-            if (prefs.spatialActive) {
-                return RunningWallpaper(WallpaperChain.SPATIAL, WallpaperMode.HOOK)
-            }
-            if (SpatialServiceMode.isRunning(ctx, SpatialWallpaperService::class.java)) {
-                return RunningWallpaper(WallpaperChain.SPATIAL, WallpaperMode.SERVICE)
-            }
-        }
-        if (self != WallpaperChain.RASTER) {
-            if (prefs.rasterMountMode == MaskPrefs.RASTER_MOUNT_LSPOSED &&
-                prefs.rasterActiveId.isNotEmpty()
-            ) {
-                return RunningWallpaper(WallpaperChain.RASTER, WallpaperMode.HOOK)
-            }
-            if (SpatialServiceMode.isRunning(ctx, RasterWallpaperService::class.java)) {
-                return RunningWallpaper(WallpaperChain.RASTER, WallpaperMode.SERVICE)
-            }
-        }
-        return null
-    }
+    fun running(ctx: Context, state: MaskUiState, self: WallpaperChain): RunningWallpaper? =
+        detect(ctx, state).firstOrNull { it.chain != self }
+
+    /**
+     * **当前正在运行的那一条**（主页「当前运行」卡用，2026-11-08）。
+     *
+     * 与 [running] 共用同一份 [detect]：主页与冲突弹窗对「在不在跑」永远同一个答案。
+     */
+    fun current(ctx: Context, state: MaskUiState): RunningWallpaper? =
+        detect(ctx, state).firstOrNull()
 
     /**
      * 关闭指定那条链（幂等）。
@@ -119,6 +140,7 @@ internal object WallpaperConflict {
                 // 冲突关闭保持**静默**（用户点的是"关闭并应用"，紧接着会有自己的 toast）。
                 RasterControl.disable(ctx, null)
             }
+            WallpaperChain.ALIVE -> AliveControl.disable(ctx, null)
         }
     }
 
@@ -128,6 +150,7 @@ internal object WallpaperConflict {
             WallpaperChain.PARALLAX -> "视差壁纸"
             WallpaperChain.SPATIAL -> "空间壁纸"
             WallpaperChain.RASTER -> "光栅壁纸"
+            WallpaperChain.ALIVE -> "Alive壁纸"
         }
         return "当前${other.label}已生效，应用${selfLabel}需先关闭"
     }

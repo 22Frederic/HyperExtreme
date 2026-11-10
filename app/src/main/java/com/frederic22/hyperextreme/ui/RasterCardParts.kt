@@ -9,6 +9,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.animation.core.animateFloatAsState
@@ -41,6 +43,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import com.frederic22.hyperextreme.data.RasterStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -156,6 +159,11 @@ internal fun rememberCover(file: File?, src: RectF? = null): Bitmap? {
  * ⚠️ **不能直接用 `surfaceContainerHigh`**：这套主题下它和浮页底色**完全一样**（#242424），
  * 空槽会整块融进背景（用户 2026-11-04 报的）。相册那个浮页是「底 #242424 / 卡 #434343」，
  * 这里按同样的关系算：底色往白色 lerp 14% ⇒ 本机正好 #434343，换动态取色主题也能自适应。
+ *
+ * ⚠️ **浅色分支也不能用 `surface`**（2026-11-07 修，用户开启 Monet 后报"卡片与浮页融成一片"）：
+ * Monet 浅色下 `surface` 与浮页底 `surfaceContainer` 被压到同一个近白色（实测两侧都是
+ * #FBF9FE），卡片整块消失、比它深一档的按钮反而成了视觉主体。改成往黑色 lerp 6%
+ * ⇒ 约 #ECEAEE，底 / 卡 / 控件三层都拉得开，且任何配色下都保证至少 6% 的暗度。
  */
 @Composable
 internal fun rememberCardSurface(): Color {
@@ -163,7 +171,7 @@ internal fun rememberCardSurface(): Color {
     return if (cs.surface.luminance() < 0.5f) {
         lerp(cs.surfaceContainerHigh, Color.White, 0.14f)
     } else {
-        cs.surface
+        lerp(cs.surface, Color.Black, 0.06f)
     }
 }
 
@@ -181,8 +189,23 @@ internal fun NewCard(
      * 浮页里这张卡不参与居中逻辑，保持默认的恒可点。
      */
     enabled: Boolean = true,
+    /**
+     * 不可点时把**蓝色加号淡出**（2026-11-09 用户要求）。
+     *
+     * 只给编辑浮页用：那里「不可点」是**选项造成的**（AOD 与锁屏一致 / 桌面跟着锁屏），
+     * 留着加号等于画一个按不动的按钮。一级页卡片流的不可点是「没居中」，
+     * 隐藏加号会改变现有视觉，所以那边保持默认 false。
+     *
+     * 动画与删除钮同一档：150ms、0.75 → 1 缩放 + alpha。
+     */
+    hideAddWhenDisabled: Boolean = false,
     onClick: () -> Unit,
 ) {
+    val add by animateFloatAsState(
+        targetValue = if (enabled || !hideAddWhenDisabled) 1f else 0f,
+        animationSpec = tween(durationMillis = BADGE_FADE_MS),
+        label = "newCardAdd",
+    )
     Box(
         modifier = modifier
             .size(cardW, cardH)
@@ -191,18 +214,107 @@ internal fun NewCard(
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Box(
-            modifier = Modifier
-                .size(cardW * ADD_CIRCLE_RATIO)
-                .clip(CircleShape)
-                .background(MiuixTheme.colorScheme.primary),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                imageVector = MiuixIcons.Add,
-                contentDescription = "新建",
-                tint = MiuixTheme.colorScheme.onPrimary,
-                modifier = Modifier.size(cardW * ADD_ICON_RATIO),
+        if (add > 0.01f) {
+            Box(
+                modifier = Modifier
+                    .size(cardW * ADD_CIRCLE_RATIO)
+                    .graphicsLayer {
+                        val s = BADGE_FROM_SCALE + (1f - BADGE_FROM_SCALE) * add
+                        scaleX = s
+                        scaleY = s
+                        alpha = add
+                    }
+                    .clip(CircleShape)
+                    .background(MiuixTheme.colorScheme.primary),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = MiuixIcons.Add,
+                    contentDescription = "新建",
+                    tint = MiuixTheme.colorScheme.onPrimary,
+                    modifier = Modifier.size(cardW * ADD_ICON_RATIO),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * **单槽选图卡**（2026-11-07 抽出）—— 锁屏遮罩页的右卡（「主体或遮罩」）与视差页共用同一份。
+ *
+ * 空态是加号卡（点它选图）；有图时整张卡也是选图入口，右上角挂红色删除钮。
+ *
+ * ⚠️ **删除钮不参与排版**：它挂在**尺寸写死**的卡盒里、用 `offset` 探出卡角 ——
+ * `offset` 只改绘制位置、不改测量尺寸 ⇒ 调用方按 `cardW` 算居中时**天然不含**那半颗钮。
+ * 卡本体的 `squircleClip` 必须留在**内层**，否则钮会被一起裁掉。
+ *
+ * @param hasImage 有没有候选图。**不能用 [bitmap] 判**：预览是异步解码的，头一两帧还是 null，
+ *   用它判会闪一下加号卡（遮罩页 / 视差页都踩过）。
+ * @param enabled 选图入口是否可点（处理中、替换生效中都传 false）。
+ * @param onClear 删除钮的动作。**恒可点**（与卡片流一致：处理中照样显示，闸门写在回调里），
+ *   需要拦的业务条件（如"生效中请先关闭替换"）由调用方自己判。
+ */
+@Composable
+internal fun PickCard(
+    cardW: Dp,
+    cardH: Dp,
+    radius: Dp,
+    surface: Color,
+    hasImage: Boolean,
+    bitmap: Bitmap?,
+    enabled: Boolean,
+    onPick: () -> Unit,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // 出现 / 消失动画：缩放 75% → 100%、透明度 0 → 1，0.15s（与卡片流同一档）。
+    val deleteAnim by animateFloatAsState(
+        targetValue = if (hasImage) 1f else 0f,
+        animationSpec = tween(durationMillis = BADGE_FADE_MS),
+    )
+    Box(modifier = modifier.size(cardW, cardH)) {
+        if (!hasImage) {
+            NewCard(
+                cardW = cardW,
+                cardH = cardH,
+                radius = radius,
+                modifier = Modifier,
+                surface = surface,
+                enabled = enabled,
+                onClick = onPick,
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .squircleClip(radius)
+                    .background(surface)
+                    .squircleStroke({ CARD_STROKE_WIDTH }, { CARD_STROKE }, radius)
+                    .clickable(enabled = enabled, onClick = onPick),
+            ) {
+                CardImage(bitmap, Modifier.fillMaxSize())
+            }
+        }
+        // `> 0f` 这一段就是"消失动画还在播"的窗口 —— 图已经没了，钮还要把它播完。
+        if (deleteAnim > 0f) {
+            val d = cardW * DELETE_CIRCLE_RATIO
+            RemoveBadge(
+                diameter = d,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    // 卡片本体带 `squircleClip`（离屏 layer），不抬 z 会被压到下面。
+                    .zIndex(1f)
+                    .offset(
+                        x = d * CARD_BADGE_CENTER_RATIO,
+                        y = -d * CARD_BADGE_CENTER_RATIO,
+                    )
+                    .graphicsLayer {
+                        val s = BADGE_FROM_SCALE + (1f - BADGE_FROM_SCALE) * deleteAnim
+                        scaleX = s
+                        scaleY = s
+                        alpha = deleteAnim
+                    },
+                onClick = onClear,
             )
         }
     }

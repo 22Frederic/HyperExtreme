@@ -16,6 +16,7 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.opengl.GLUtils
+import android.os.FileObserver
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -96,6 +97,19 @@ class RasterWallpaperService : WallpaperService() {
         private var uDim = 0
         private var uFromUv = 0
         private var uToUv = 0
+        private var uStyle = 0
+        private var uTransWidth = 0
+        private var uAlphaTransWidth = 0
+        private var uMaskTransWidth = 0
+        private var uBumpScale = 0
+        private var uRefractionScale = 0
+        private var uDispersionFactor = 0
+        private var uShadowStrength = 0
+        private var uStripePeriodPx = 0
+        private var uFrostCellPx = 0
+        private var uScreenW = 0
+        private var uScreenH = 0
+        private var uLightDir = 0
 
         // ── 内容 ──
         private var images: List<String> = emptyList()
@@ -126,6 +140,12 @@ class RasterWallpaperService : WallpaperService() {
         private var panDeg = 25
         /** 「停顿时就近归位」（`RasterServiceTarget` 的 `settle`，默认开）：关 = 停在两张之间不动。 */
         private var settleOnIdle = true
+        /** 「过渡效果」（`RasterServiceTarget` 的 `transition`）：0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲。 */
+        private var style = 0
+        /** 条纹周期（屏幕像素）= screenW × 19/1200，随 surface 尺寸一起更新。 */
+        private var stripePeriodPx = 0f
+        /** 磨砂颗粒（屏幕像素）= screenW × 2/1200。 */
+        private var frostCellPx = 0f
         private var lastMoveDir = 1f
         private var gyroRate = 0f
         private var lastAt = 0L
@@ -150,8 +170,74 @@ class RasterWallpaperService : WallpaperService() {
 
         // ─────────────────────────── 生命周期 ───────────────────────────
 
+        /** 盯住主进程写进 `filesDir` 的 target 文件（2026-11-07）。 */
+        private var targetObserver: FileObserver? = null
+
         override fun onCreate(holder: SurfaceHolder) {
             log("Engine onCreate preview=$isPreview")
+            startTargetWatch()
+        }
+
+        /**
+         * 让「过渡效果 / 停顿时就近归位」**生效中改完立刻生效**（2026-11-07，免 root）。
+         *
+         * 以前只有 `onSurfaceCreated` / `onSurfaceChanged(resized)` / `onVisibilityChanged(true)`
+         * 会调 `ensureContent()` ⇒ 锁屏一直亮着时改选项，壁纸进程根本不知道文件变了，
+         * 要熄屏再亮才生效。`FileObserver` 是事件驱动的，静止时零开销；这条通道全程
+         * 只读写自家 `filesDir` 的文件，**不需要 setprop、不需要 root**。
+         *
+         * 写入方是「先写 `NAME.tmp` 再 rename 成 `NAME`」，所以两个事件都听；哪怕触发
+         * 两次也没关系，[applyRealtimeParams] 会比对值，没变就不动作。
+         */
+        private fun startTargetWatch() {
+            if (targetObserver != null) return
+            val obs = object : FileObserver(
+                applicationContext.filesDir.absolutePath,
+                CLOSE_WRITE or MOVED_TO,
+            ) {
+                override fun onEvent(event: Int, path: String?) {
+                    if (path == null) return
+                    if (path != RasterServiceTarget.NAME &&
+                        path != "${RasterServiceTarget.NAME}.tmp"
+                    ) return
+                    // FileObserver 回调在它自己的线程；所有 GL 状态只能在 GL 线程改。
+                    gl?.post { runCatching { applyRealtimeParams() } }
+                }
+            }
+            runCatching { obs.startWatching() }
+            targetObserver = obs
+        }
+
+        private fun stopTargetWatch() {
+            runCatching { targetObserver?.stopWatching() }
+            targetObserver = null
+        }
+
+        /**
+         * 只热更新「过渡效果 / 停顿归位」两项。
+         *
+         * ⚠️ `panDeg` 故意不读：分母变了会让 `t = pan/panMaxRad` 当场跳图，按用户决定
+         * 角度维持「下一次可见（`ensureContent`）」才生效。所以 UI 改角度虽然也会重写
+         * target、触发 FileObserver，但这里值没变 ⇒ 不归位、也不动角度。
+         */
+        private fun applyRealtimeParams() {
+            if (!visible || destroyed) return
+            val ctx = applicationContext
+            val tr = RasterServiceTarget.readTransition(ctx)
+            val settle = RasterServiceTarget.readSettle(ctx)
+            if (tr == style && settle == settleOnIdle) return
+            style = tr
+            settleOnIdle = settle
+            log(
+                "参数热更新：过渡效果=" + when (tr) {
+                    1 -> "条纹玻璃"
+                    2 -> "磨砂玻璃"
+                    3 -> "条纹玻璃（扭曲变形）"
+                    else -> "默认"
+                } + " 停顿时就近归位=${if (settle) 1 else 0}",
+            )
+            // 用户定：改这两项时立刻硬切归位一次（此刻画面在模块手里，跳变可接受）。
+            if (surfaceReady) resetBase(redraw = true)
         }
 
         override fun onSurfaceCreated(holder: SurfaceHolder) {
@@ -172,6 +258,9 @@ class RasterWallpaperService : WallpaperService() {
                 val resized = width != screenW || height != screenH
                 screenW = width
                 screenH = height
+                // 条纹周期按**屏宽等比**（19 px @1200）：与 hook 链同一口径，换个屏幕不会变粗。
+                stripePeriodPx = width * (RasterGlCore.STRIPE_PERIOD_PX_1200 / RasterGlCore.STRIPE_BASE_W)
+                frostCellPx = width * (RasterGlCore.FROST_CELL_PX_1200 / RasterGlCore.STRIPE_BASE_W)
                 log("surface ${width}x$height")
                 runCatching {
                     // 纹理是按旧屏幕尺寸 cover 裁好的 ⇒ 尺寸变了必须重裁，否则拉伸。
@@ -226,6 +315,7 @@ class RasterWallpaperService : WallpaperService() {
 
         override fun onDestroy() {
             log("Engine onDestroy")
+            stopTargetWatch()
             destroyed = true
             visible = false
             unregisterSensor()
@@ -491,6 +581,19 @@ class RasterWallpaperService : WallpaperService() {
             uDim = GLES20.glGetUniformLocation(p, "uDim")
             uFromUv = GLES20.glGetUniformLocation(p, "uFromUv")
             uToUv = GLES20.glGetUniformLocation(p, "uToUv")
+            uStyle = GLES20.glGetUniformLocation(p, "uStyle")
+            uTransWidth = GLES20.glGetUniformLocation(p, "uTransWidth")
+            uAlphaTransWidth = GLES20.glGetUniformLocation(p, "uAlphaTransWidth")
+            uMaskTransWidth = GLES20.glGetUniformLocation(p, "uMaskTransWidth")
+            uBumpScale = GLES20.glGetUniformLocation(p, "uBumpScale")
+            uRefractionScale = GLES20.glGetUniformLocation(p, "uRefractionScale")
+            uDispersionFactor = GLES20.glGetUniformLocation(p, "uDispersionFactor")
+            uShadowStrength = GLES20.glGetUniformLocation(p, "uShadowStrength")
+            uStripePeriodPx = GLES20.glGetUniformLocation(p, "uStripePeriodPx")
+            uFrostCellPx = GLES20.glGetUniformLocation(p, "uFrostCellPx")
+            uScreenW = GLES20.glGetUniformLocation(p, "uScreenW")
+            uScreenH = GLES20.glGetUniformLocation(p, "uScreenH")
+            uLightDir = GLES20.glGetUniformLocation(p, "uLightDir")
             val verts = floatArrayOf(
                 -1f, -1f, 0f, 1f,
                 1f, -1f, 1f, 1f,
@@ -554,6 +657,20 @@ class RasterWallpaperService : WallpaperService() {
             if (settle != settleOnIdle) {
                 settleOnIdle = settle
                 log("停顿时就近归位=${if (settle) 1 else 0}")
+            }
+            // 「过渡效果」同一条通道（2026-11-06）：独立于组内容。
+            // 2026-11-07：改完由 FileObserver 实时生效，这里是「下次可见」的兜底重读。
+            val tr = RasterServiceTarget.readTransition(ctx)
+            if (tr != style) {
+                style = tr
+                log(
+                    "过渡效果=" + when (tr) {
+                        1 -> "条纹玻璃"
+                        2 -> "磨砂玻璃"
+                        3 -> "条纹玻璃（扭曲变形）"
+                        else -> "默认"
+                    },
+                )
             }
             val key = RasterServiceTarget.readKey(ctx)
             if (key == null) {
@@ -804,9 +921,23 @@ class RasterWallpaperService : WallpaperService() {
             GLES20.glUniform1f(uDir, dir)
             GLES20.glUniform4f(uFromUv, uvF[0], uvF[1], uvF[2], uvF[3])
             GLES20.glUniform4f(uToUv, uvT[0], uvT[1], uvT[2], uvT[3])
-            GLES20.glUniform1f(uBand, RasterGlCore.BAND)
             // 系统壁纸服务链由**系统**做 AOD 压暗（setWallPaperAnimProcess），这里恒 1.0。
             GLES20.glUniform1f(uDim, 1f)
+            // 「过渡效果」四档：与 hook 链同一份 shader、同一套像素口径。
+            val sp = RasterGlCore.paramsOf(style)
+            GLES20.glUniform1f(uStyle, style.toFloat())
+            GLES20.glUniform1f(uTransWidth, RasterGlCore.VIVO_TRANS_WIDTH)
+            GLES20.glUniform1f(uAlphaTransWidth, RasterGlCore.VIVO_ALPHA_TRANS_WIDTH)
+            GLES20.glUniform1f(uMaskTransWidth, RasterGlCore.VIVO_MASK_TRANS_WIDTH)
+            GLES20.glUniform1f(uBumpScale, sp.bump)
+            GLES20.glUniform1f(uRefractionScale, sp.refract)
+            GLES20.glUniform1f(uDispersionFactor, sp.dispersion)
+            GLES20.glUniform1f(uShadowStrength, sp.shadow)
+            GLES20.glUniform1f(uStripePeriodPx, stripePeriodPx.coerceAtLeast(1f))
+            GLES20.glUniform1f(uFrostCellPx, frostCellPx.coerceAtLeast(0.5f))
+            GLES20.glUniform1f(uScreenW, screenW.toFloat().coerceAtLeast(1f))
+            GLES20.glUniform1f(uScreenH, screenH.toFloat().coerceAtLeast(1f))
+            GLES20.glUniform3f(uLightDir, sp.lightX, RasterGlCore.TWIST_LIGHT_Y, RasterGlCore.TWIST_LIGHT_Z)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             GLES20.glDisableVertexAttribArray(aPos)
             GLES20.glDisableVertexAttribArray(aUv)

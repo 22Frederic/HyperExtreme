@@ -282,9 +282,6 @@ internal object RecentsStateProbe {
         }
     }
 
-    /** 累计收到的状态变更次数（诊断用）。 */
-    fun events(): Int = eventCount.get()
-
     // ---------------------------------------------------------------- 诊断辅助
 
     /**

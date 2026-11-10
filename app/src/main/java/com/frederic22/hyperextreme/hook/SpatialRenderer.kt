@@ -83,16 +83,6 @@ internal object SpatialRenderer {
     private const val SPHERE_HALF_V_RAD = SpatialGlCore.SPHERE_HALF_V_RAD
     private const val DRAW_EPS = SpatialGlCore.DRAW_EPS
 
-    /**
-     * 透视相机：FOV **60°**（手机壁纸的自然视角）。`CAM_DIST = 1/tan(30°)` ⇒ 世界坐标 ±1 铺满屏幕。
-     *
-     * ⚠️ 2026-10-23 定案：**所有层共用一个 z**（不再按 depthMean 拉开层间距）。
-     * 因为透视下 z 差 = 缩放差（远层更小）⇒ 静止时层与层永远对不齐，
-     * 而「层间拉开」改成靠**逐像素位移场**实现。
-     */
-    private const val FOV_DEG = 60f
-    private const val CAM_DIST = 1.732f
-
     /** 见 [SpatialGlCore.SPHERE_SAFE]（1.15：位移余量 1.45 倍）。 */
     private const val SPHERE_SAFE = SpatialGlCore.SPHERE_SAFE
 
@@ -101,12 +91,6 @@ internal object SpatialRenderer {
 
     /** 见 [SpatialGlCore.DK_TH]（0.08：只有 Δk<0.08 的近深度区域才融合）。 */
     private const val DK_TH = SpatialGlCore.DK_TH
-
-    /** 透视旋转的折减：只给一点点「整体跟着转」的几何感（0.35 ⇒ 约 1°）。 */
-    private const val PERSPECTIVE_K = 0.35f
-
-    /** 安全区：整体放大倍率。位移最大 54px(4.5%) ⇒ 每边 4.5% ⇒ 1.09 刚够。 */
-    private const val SAFE = 1.09f
 
     /** 见 [SpatialGlCore.FULL_SCALE_RAD]（10°：手腕自然转动就能打到满幅）。 */
     private const val FULL_SCALE_RAD = SpatialGlCore.FULL_SCALE_RAD
@@ -391,9 +375,6 @@ internal object SpatialRenderer {
     internal fun cropUniforms(): FloatArray =
         floatArrayOf(runningCropScale, runningCropOffX, runningCropOffY)
 
-    /** 当前姿态（弧度）：`[yaw, pitch]`。 */
-    internal fun attitude(): FloatArray = floatArrayOf(yaw, pitch)
-
     /**
      * 当前姿态对应的 `uShift`（已按 span 归一化）—— 与 [drawScene] 里那行**同一公式**：
      *
@@ -503,6 +484,19 @@ internal object SpatialRenderer {
     /** AOD 期间冻结：不积分、不重绘。 */
     @Volatile private var aodFrozen = false
 
+    /**
+     * **是否处于 AOD**（v1.20.5，2026-11-07）。真值唯一来源 = [SpatialAod] 挂的
+     * `doWallpaperBlackAnim(show)`：`false` = 进 AOD、`true` = 回锁屏。
+     *
+     * 与 `RasterRenderer.aodActive` **同一口径、同一套清除路径**（进/出 AOD + 解锁 +
+     * 渲染器重建），两边必须一致 —— 少一条就是「回锁屏没有主体」或「AOD 上留着主体」。
+     *
+     * AOD 与锁屏共用同一条 leash、同一个 [lockScs]，但语义相反：AOD 要「壁纸可见 +
+     * 主体不可见」。复位通道（`resetAlpha` 的三个入口）不知道自己在 AOD 里，会把主体
+     * 一起拉回来 —— v1.20.5 真机 bug 的另一半。
+     */
+    @Volatile private var aodActive = false
+
     /** 当前压暗系数（1 = 原亮度，0 = 全黑）。只在 GL 线程读写。 */
     private var aodDim = 1f
 
@@ -530,6 +524,15 @@ internal object SpatialRenderer {
 
     /** 压暗动画的代际号（语义同 [aodGen]）。 */
     private var dimGen = 0
+
+    /**
+     * 压暗渐变的**目标值**（没有渐变时等于上一趟的终点，初始 1）。
+     *
+     * 存在的唯一理由：亮屏兜底必须能区分「正往 0 走（进 AOD）」与「正往 1 走（出 AOD）」——
+     * 前者要作废并直接落到 1；后者**绝不能掐**，掐断就再没人把亮度抬回来
+     * （2026-11-07 真机日志：掐在 0.36 / 0.21，此后 1.7s 一直是该值，直到解锁才恢复）。
+     */
+    @Volatile private var dimTarget = 1f
 
     private const val AOD_ANIM_MS = 300L
     private const val AOD_STEP_MS = 16L
@@ -587,6 +590,9 @@ internal object SpatialRenderer {
                 HookRuntime.log("SPATIAL 解锁：压暗复位 1.0（AOD 直接解锁不经过 onExitAod）")
             }
             aodFrozen = false
+            // **AOD 直接解锁不经过 `onExitAod()`** ⇒ 标志必须在这里清（v1.20.5），否则残留
+            // true 会让下一次回锁屏的复位只抬 GL 份、主体永远不显。
+            aodActive = false
             // 幂等：两个触发点（退场动画起点 / 锁屏状态跳变）都会到，先到者生效。
             // 少了这句，第二次触发会把已淡到一半的 alpha 重置回 1（看得见的回弹）。
             if (fadeTick != null) return@post
@@ -722,10 +728,21 @@ internal object SpatialRenderer {
         val h = handler ?: return
         h.post {
             if (runningKey == null) return@post
+            aodActive = true
             // 归位期间必须能画，先把冻结解开（重复进 AOD / 连续两次调用也安全）
             aodFrozen = false
+            // 诊断（2026-11-07）：自定义 AOD 下 black=1.0 ⇒ 目标 0（全黑）。
+            HookRuntime.log(
+                "SPATIAL AOD 进入 black=${"%.2f".format(black)} " +
+                    "目标=${"%.2f".format(1f - black.coerceIn(0f, 1f))} " +
+                    "aodDim=${"%.2f".format(aodDim)} transFrozen=$transitionFrozen",
+            )
             startAodHomingLocked(h)
             animateDimLocked(h, 1f - black.coerceIn(0f, 1f), AOD_ANIM_MS)
+            // **AOD 第一帧就要可见**（v1.20.5）：进 AOD 可能紧跟一次解锁淡出，alpha 停在 0
+            // 且 800ms 锁存把复位压到 ~817ms 后 ⇒ 那段露的是系统原壁纸。
+            // 顺序放在压暗之后：先下发内容（dim 目标）再抬 alpha，避免"新 alpha + 旧亮帧"闪一帧。
+            raiseLockedNow("进入 AOD")
         }
     }
 
@@ -738,12 +755,23 @@ internal object SpatialRenderer {
         val h = handler ?: return
         h.post {
             if (runningKey == null) return@post
+            aodActive = false
             cancelAodHomeLocked()
             aodFrozen = false
+            // **必须解冻再跑复位渐变**（2026-11-07）：`applyDimLocked` 走 `requestDraw`，
+            // 而 `requestDraw` 在 `transitionFrozen` 时整段早退 ⇒ 渐变数值在涨、buffer 却
+            // 一直是黑帧，表现和「压暗不恢复」一模一样（退出回调本身不来时就是真不恢复）。
+            unfreezeTransition()
             animateDimLocked(h, 1f, AOD_ANIM_MS)
             HookRuntime.appContext()?.let { reregisterSensor(it) }
+            // **回锁屏必须可见**（v1.20.5）：自定义 AOD 全程黑屏，进 AOD 时若是停在淡出的 0
+            // 上（锁存没落地 / 压根没有 raise 来过）根本看不出来，退出时也没人再抬 ⇒ 锁屏缺图。
+            raiseLockedNow("退出 AOD")
             forceDraw()
-            HookRuntime.log("SPATIAL AOD 退出：亮度复位 + 解冻")
+            HookRuntime.log(
+                "SPATIAL AOD 退出：亮度复位 + 解冻（aodDim=${"%.2f".format(aodDim)} " +
+                    "dimTick=${dimTick != null} transFrozen=$transitionFrozen）",
+            )
         }
     }
 
@@ -821,6 +849,7 @@ internal object SpatialRenderer {
         // 同一时刻只允许一条渐变：否则进/出 AOD 挨得近时两条 tick 会互相覆盖，终值不可预期。
         cancelDimAnimLocked()
         val from = aodDim
+        dimTarget = target
         if (kotlin.math.abs(target - from) < 0.001f) {
             applyDimLocked(target)
             return
@@ -907,6 +936,21 @@ internal object SpatialRenderer {
      * ⇒ 该闸恒真、永久锁死，回锁屏也永不复位（黑屏）。已删，只留日志参考。
      */
     private fun requestRaiseLocked(h: android.os.Handler) {
+        // **AOD 里没有「锁屏界面」**（v1.20.5，2026-11-07）：这里同时是「锁存泵 ~817ms 落地」
+        // 和「亮屏兜底」的必经之路。AOD 期间到达的复位只允许抬 GL 份（AOD 显示的就是它），
+        // **绝不能调 `SpatialOverlay.resetAlpha()`** —— 主体由 `onEnterAod` 淡到 0，被这里
+        // 一拉就留在 AOD 上了（真机 bug）。主体恢复交给 `onExitAod()` / 解锁那条路。
+        if (aodActive) {
+            raiseLockedNow("AOD 中收到复位")
+            return
+        }
+        // **灭屏态完全不该受锁存约束**（v1.20.7）：锁存只对「解锁动画期间的复位噪声」有意义，
+        // 灭屏 / 进 AOD 时屏幕已不交互，不可能还在解锁 —— 还拖着不复位，屏一亮就是系统
+        // 原壁纸（真机：AOD 首帧 1~2 帧的"极快闪一下"）。draw=false：灭屏 swap 会阻塞。
+        if (!screenOn()) {
+            raiseLockedNow("灭屏态复位", draw = false)
+            return
+        }
         // 闸 1：淡出还在跑 —— 只登记，让它自己跑完
         if (fadeTick != null) {
             pendingRaise = true
@@ -948,6 +992,36 @@ internal object SpatialRenderer {
             // 复位只写了 alpha，内容还是淡出前那一帧 ⇒ 必须重画（否则锁屏静止时永远是旧图）
             forceDraw()
         }
+    }
+
+    /**
+     * **立刻把锁屏份抬到 1，旁路淡出锁存**（v1.20.5，2026-11-07）。与
+     * `RasterRenderer.raiseLockedNow` 同一口径。
+     *
+     * 锁存（[FADE_LATCH_MS]）只在**解锁**语境里成立；AOD 要的是当帧可见 —— 真机日志实测
+     * 复位被闸到 817ms 后才放行，而那时早已进了 AOD，屏上先露系统原壁纸再"恢复我们的层"。
+     * 只碰 GL 锁屏份，**绝不碰前景主体**（主体在 AOD 里必须保持 0）。
+     */
+    private fun raiseLockedNow(reason: String, draw: Boolean = true) {
+        // 正在跑淡出就先掐掉：它的 tick 每 16ms 用**自己记的** lastA 覆写 alpha，
+        // 不掐的话我们抬到 1 会被下一帧拉回去（AOD 里 = 继续露系统壁纸）。
+        cancelFadeLocked()
+        // 淡出起的 `transitionFrozen` 只有跑完才解，半路掐掉就永远停着 ⇒ 之后 2s 全部
+        // 重绘被闸掉（v1.20.6）。
+        unfreezeTransition()
+        fadeDoneAt = 0L
+        pendingRaise = false
+        raiseScheduled = false
+        // 灭屏 / AOD / AOD 中复位，此刻都在**锁屏侧**。
+        showingDesktop = false
+        val scs = lockScs
+        if (scs.isEmpty()) return
+        if (currentAlpha >= 0.99f) return
+        // **先补帧、再抬 alpha**：反过来 SF 会拿「新 alpha + 上一帧（旧亮度）」合成一帧。
+        // 灭屏路径 `draw=false`：那时任何 swap 都可能阻塞。
+        if (draw) requestDraw(force = true)
+        HookRuntime.log("SPATIAL 抬 alpha（$reason：${"%.2f".format(currentAlpha)} → 1.00）")
+        applyAlphaTo(scs, 1f)
     }
 
     /** 排一次补发（**防重复 post**：同一个 pending 只排一次）。 */
@@ -1449,22 +1523,53 @@ internal object SpatialRenderer {
         if (screenReceiver != null) return
         val r = object : BroadcastReceiver() {
             override fun onReceive(c: Context?, i: Intent?) {
+                // **灭屏立刻抬锁屏份**（v1.20.6）：锁屏 / AOD 紧跟着就出现，而复位入口还被
+                // 800ms 淡出锁存挡着 ⇒ 那段时间屏上是系统原壁纸（真机日志实测 387ms）。
+                // 这里旁路锁存先抬 alpha 且**不补帧**（灭屏时任何 swap 都可能阻塞）。
+                if (i?.action == Intent.ACTION_SCREEN_OFF) {
+                    handler?.post {
+                        if (runningKey == null) return@post
+                        raiseLockedNow("灭屏", draw = false)
+                    }
+                    return
+                }
                 if (i?.action != Intent.ACTION_SCREEN_ON) return
                 HookRuntime.log("SPATIAL 亮屏 → 重新注册传感器")
                 handler?.post {
+                    // 诊断（2026-11-07）：亮屏时压暗渐变是否还在跑、值是多少、往哪走。
+                    HookRuntime.log(
+                        "SPATIAL 亮屏兜底 aodDim=${"%.2f".format(aodDim)} " +
+                            "dimTarget=${"%.2f".format(dimTarget)} dimTick=${dimTick != null} " +
+                            "frozen=$aodFrozen transFrozen=$transitionFrozen",
+                    )
                     // **亮屏兜底解冻**（2026-11-05 v1.17.6，与光栅 `RasterRenderer.watchScreen` 对齐）：
                     // 亮屏意味着 AOD 一定结束了 ⇒ 任何残留的冻结 / 归位 / 压暗动画都该作废。
                     // 少了这句，只要某条解锁路径没走到 `onExitAod()`、而 `fadeOutOnUnlock()` 又被
                     // 后落地的归位 tick 覆盖，传感器就会一直冻着，直到下一次进出 AOD。
                     cancelAodHomeLocked()
-                    cancelDimAnimLocked()
                     aodFrozen = false
                     unfreezeTransition()
+                    // ── 压暗复位（2026-11-07 修「AOD 出来整层保持压暗」）──
+                    // 旧代码无条件 `cancelDimAnimLocked()`：广播与 `doWallpaperBlackAnim(show=true)`
+                    // 是两条独立通道，谁先到是掷硬币。若退出回调先到、它刚起的 0→1 渐变被这里
+                    // 掐掉，`aodDim` 就**冻在中间值**（真机日志：0.36 / 0.21），此后没人再抬它，
+                    // 直到解锁走 `fadeOutOnUnlock()`。
+                    // ⇒ 只作废**往 0 走**的那条（进 AOD 的残留），往 1 走的让它自己走完；
+                    //   没有渐变却还压着暗的（退出回调压根没来）在这里直接补到 1。
+                    val rampToBright = dimTick != null && dimTarget >= 0.999f
+                    if (!rampToBright) {
+                        cancelDimAnimLocked()
+                        dimTarget = 1f
+                        if (aodDim < 0.999f) applyDimLocked(1f)
+                    }
                     reregisterSensor(c ?: ctx)
                 }
             }
         }
-        val filter = IntentFilter(Intent.ACTION_SCREEN_ON)
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
         runCatching {
             if (android.os.Build.VERSION.SDK_INT >= 33) {
                 ctx.registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -1473,7 +1578,7 @@ internal object SpatialRenderer {
                 ctx.registerReceiver(r, filter)
             }
             screenReceiver = r
-        }.onFailure { HookRuntime.log("SPATIAL 注册亮屏广播失败：${it.javaClass.simpleName}") }
+        }.onFailure { HookRuntime.log("SPATIAL 注册灭亮屏广播失败：${it.javaClass.simpleName}") }
     }
 
     /** 摘掉旧的监听器再走一遍 [startSensor]（内部会重建 listener 并重新注册）。 */
@@ -1650,6 +1755,8 @@ internal object SpatialRenderer {
 
     private fun stopInternal(reason: String) {
         val id = runningKey
+        // 渲染器重建 ⇒ AOD 状态一起归零（否则下次启动会带着上一轮的 true，主体永不复位）。
+        aodActive = false
         // 传感器先摘（否则回调还会往已销毁的 GL 上 post）
         runCatching { gravityListener?.let { sensorManager?.unregisterListener(it) } }
         runCatching { screenReceiver?.let { HookRuntime.appContext()?.unregisterReceiver(it) } }
@@ -2197,66 +2304,6 @@ internal object SpatialRenderer {
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         }
         GLES20.glDisableVertexAttribArray(aPos)
-    }
-
-    // ───────────────────────── 4×4 矩阵（column-major，和 GL 一致） ─────────────────────────
-
-    private fun translate(x: Float, y: Float, z: Float) = floatArrayOf(
-        1f, 0f, 0f, 0f,
-        0f, 1f, 0f, 0f,
-        0f, 0f, 1f, 0f,
-        x, y, z, 1f,
-    )
-
-    private fun scaleM(x: Float, y: Float, z: Float) = floatArrayOf(
-        x, 0f, 0f, 0f,
-        0f, y, 0f, 0f,
-        0f, 0f, z, 0f,
-        0f, 0f, 0f, 1f,
-    )
-
-    private fun rotY(a: Float): FloatArray {
-        val c = kotlin.math.cos(a)
-        val s = kotlin.math.sin(a)
-        return floatArrayOf(
-            c, 0f, -s, 0f,
-            0f, 1f, 0f, 0f,
-            s, 0f, c, 0f,
-            0f, 0f, 0f, 1f,
-        )
-    }
-
-    private fun rotX(a: Float): FloatArray {
-        val c = kotlin.math.cos(a)
-        val s = kotlin.math.sin(a)
-        return floatArrayOf(
-            1f, 0f, 0f, 0f,
-            0f, c, s, 0f,
-            0f, -s, c, 0f,
-            0f, 0f, 0f, 1f,
-        )
-    }
-
-    private fun perspective(fovYDeg: Float, aspect: Float, near: Float, far: Float): FloatArray {
-        val f = 1f / kotlin.math.tan(Math.toRadians(fovYDeg.toDouble() / 2.0)).toFloat()
-        return floatArrayOf(
-            f / aspect, 0f, 0f, 0f,
-            0f, f, 0f, 0f,
-            0f, 0f, (far + near) / (near - far), -1f,
-            0f, 0f, 2f * far * near / (near - far), 0f,
-        )
-    }
-
-    private fun mul(a: FloatArray, b: FloatArray): FloatArray {
-        val r = FloatArray(16)
-        for (c in 0 until 4) {
-            for (row in 0 until 4) {
-                var sum = 0f
-                for (k in 0 until 4) sum += a[k * 4 + row] * b[c * 4 + k]
-                r[c * 4 + row] = sum
-            }
-        }
-        return r
     }
 
     /**

@@ -1,10 +1,11 @@
 <p align="center">
-  <img src="app/src/main/res/drawable-nodpi/logo.png" alt="LOGO" width="128">
+  <img
+    src="app/src/main/res/drawable-nodpi/cover.png"
+    alt="COVER"
+    width="100%"
+    style="height: auto;"
+  >
 </p>
-
-<h1 align="center"><strong>HyperExtreme</strong></h1>
-
-<p align="center">Extreme for HyperOS</p>
 
 <p align="center">
   <img src="https://img.shields.io/github/v/release/22Frederic/HyperExtreme?style=flat" alt="release">
@@ -14,11 +15,15 @@
   <img src="https://img.shields.io/badge/License-AGPL--3.0-yellow?style=flat" alt="license">
 </p>
 
+## 介绍
+
+HyperExtreme是一款LSPosed美化模块，支持空间壁纸、光栅壁纸、Alive壁纸等功能，部分功能支持免Root运行。
+
 ## 兼容性
 
-对于空间壁纸与光栅壁纸：LSPosed模式只在澎湃OS4上测试，也只会对澎湃OS4适配；系统壁纸服务（免Root）模式理论支持到安卓13，但对安卓17之外的安卓版本未测试。
+对于空间壁纸、光栅壁纸：LSPosed模式只在澎湃OS4上测试，也只会对澎湃OS4适配，**不受理任何澎湃OS4以外系统的使用问题**；系统壁纸服务（免Root）模式理论支持到安卓13，但对安卓17之外的安卓版本未测试。
 
-对于其他功能：都需要Root与LSPosed，只会对澎湃OS4适配。
+对于Alive壁纸与其他功能：都需要Root与LSPosed，只会对澎湃OS4适配，**不受理任何澎湃OS4以外系统的使用问题**。
 
 ## 使用说明
 

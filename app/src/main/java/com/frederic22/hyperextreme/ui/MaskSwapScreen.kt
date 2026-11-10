@@ -3,7 +3,6 @@ package com.frederic22.hyperextreme.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
-import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
@@ -70,16 +69,11 @@ import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import com.frederic22.hyperextreme.data.AodPackageName
 import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.ui.icons.CheckCircleOutlineIcon
 import com.frederic22.hyperextreme.ui.icons.ErrorOutlineIcon
 import com.frederic22.hyperextreme.ui.nav.NavTab
-import com.frederic22.hyperextreme.ui.nav.NavBgLayer
-import com.frederic22.hyperextreme.ui.nav.SliderTouchGesture
-import com.frederic22.hyperextreme.ui.nav.reportRootOrigin
 import com.frederic22.hyperextreme.ui.nav.Os4FloatingNavigationBar
-import com.frederic22.hyperextreme.ui.nav.rememberNavBgState
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
@@ -105,7 +99,6 @@ import com.frederic22.hyperextreme.ui.icons.SettingsIcon
 import com.frederic22.hyperextreme.ui.icons.TuneIcon
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.theme.ThemeController
 import top.yukonga.miuix.kmp.utils.PagerGestureNestedScrollConnection
 import top.yukonga.miuix.kmp.utils.PagerNavigationSpringSpec
 import top.yukonga.miuix.kmp.utils.pagerGestureOverride
@@ -113,7 +106,6 @@ import top.yukonga.miuix.kmp.utils.springAnimateToPage
 import top.yukonga.miuix.kmp.window.WindowDialog
 
 /** 目标应用（= 模块的作用域），定义在 data 层，这里只做别名。 */
-private const val TargetPackage = AodPackageName
 
 /**
  * 启动后多久做一次激活体检。
@@ -139,7 +131,7 @@ private const val BottomFadeAlpha = 0.85f
  * 二级页是**盖住底栏**的全屏页（用户指定），所以它们不占 [Tab] 的位置。
  * 见 [FunctionHome] / [MaskReplaceDetail] / [SystemUiDetail] / [DesktopDetail]。
  */
-internal enum class DetailPage { MaskReplace, ParallaxBg, SpatialWallpaper, RasterWallpaper, SystemUi, Desktop }
+internal enum class DetailPage { MaskReplace, ParallaxBg, SpatialWallpaper, RasterWallpaper, AliveWallpaper, SystemUi, Desktop }
 
 // 二级页（[DetailPage]）的转场**不归本文件管**：它现在是独立 Activity（[MaskDetailActivity]），
 // 转场由**系统的 Activity 动画**负责 —— 为什么必须如此、以及为什么不在这里复刻，见那个类的注释。
@@ -160,10 +152,10 @@ fun MaskSwapApp(onDarkModeChange: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val prefs = remember { MaskPrefs(context) }
     var themeMode by remember { mutableStateOf(ThemeMode.of(prefs.themeMode)) }
-    // ThemeController 的 colorSchemeMode 是 val，只能换实例来切换深浅色。
-    val controller = remember(themeMode) {
-        ThemeController(colorSchemeMode = themeMode.toColorSchemeMode())
-    }
+    // 「启用Monet颜色」（2026-11-07）：状态提到这一层，因为换配色必须**换 ThemeController 实例**
+    //（它的 lightColors / darkColors 都是 val）。真正的换实例逻辑在 [rememberThemeController]。
+    var monetColor by remember { mutableStateOf(prefs.monetColor) }
+    val controller = rememberThemeController(themeMode, monetColor)
 
     // textStyles 用 [HyperTextStyles]：miuix 默认的正文是 400，HyperOS 系统界面是 MiSans Medium，
     // 不补这一档字重就会"比系统显示的细一档"（详见该文件里的说明）。
@@ -173,6 +165,7 @@ fun MaskSwapApp(onDarkModeChange: (Boolean) -> Unit = {}) {
                 themeMode = mode
                 prefs.setThemeMode(mode.id)
             },
+            onMonetChange = { monetColor = it },
             onDarkModeChange = onDarkModeChange,
         )
     }
@@ -181,6 +174,7 @@ fun MaskSwapApp(onDarkModeChange: (Boolean) -> Unit = {}) {
 @Composable
 private fun MaskSwapShell(
     onThemeModeChange: (ThemeMode) -> Unit,
+    onMonetChange: (Boolean) -> Unit,
     onDarkModeChange: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -206,9 +200,6 @@ private fun MaskSwapShell(
     val selectedIndex = remember { mutableIntStateOf(pagerState.currentPage) }
     val navJob = remember { mutableStateOf<Job?>(null) }
     var navigating by remember { mutableStateOf(false) }
-    // 「测试 → 使用自定义背景」（2026-10-06，测试功能）：整页背景换成自选图，专门用来观察
-    // 底栏玻璃在真实图案下的表现。状态一份，设置页与下面的背景层共用 —— 详见 `NavBg.kt`。
-    val navBg = rememberNavBgState(prefs, scope)
     fun animatePagerTo(target: Int) {
         if (target == selectedIndex.intValue) return
         navJob.value?.cancel()
@@ -378,29 +369,17 @@ private fun MaskSwapShell(
                     modifier = Modifier
                         .fillMaxSize()
                         .layerBackdrop(backdrop)
-                        .background(MiuixTheme.colorScheme.surface)
-                        // 下面两件事都挂在 pager 的**祖先**上（见 NavBg.kt 的说明）：
-                        // ① 报告自己的窗口原点，好把指针位置换算成同一套坐标；
-                        // ② 在 Initial 阶段接管滑块那一行的横向拖动 —— pager 的 PagerSwipeNode
-                        //    在 Main 阶段比子节点先拿到水平手势，不接管的话滑块永远拖不动。
-                        .reportRootOrigin(navBg)
-                        .SliderTouchGesture(navBg),
+                        .background(MiuixTheme.colorScheme.surface),
                 ) {
-                    // 「使用自定义背景」（测试功能，2026-10-06）：**第一个子节点** ⇒ 画在自绘底色
-                    // 之上、内容之下。不透明，正好盖住那层底色；又因为在这一层里，底栏玻璃
-                    // 录背景时会把照片一起录进去（所以底栏一行都不用改）。
-                    NavBgLayer(navBg)
                     HorizontalPager(
                         state = pagerState,
                         modifier = Modifier
                             .fillMaxSize()
                             // miuix 0.9.4 的 CrossAxis 手势（PagerSwipeNode）：跟手拖动 +
                             // 松手走 PagerNavigationSpringSpec，纵向拖动会退出、交给页面自己滚。
-                            // ⚠️ `enabled = !navBg.sliderTouching`：手指按在「模糊半径」滑块上时把翻页
-                            // 手势关掉，否则它会在 Main 阶段抢走那串横向事件（见 NavBg.kt 的说明）。
                             .pagerGestureOverride(
                                 pagerState = pagerState,
-                                enabled = !navBg.sliderTouching,
+                                enabled = true,
                             ),
                         // miuix 的 CrossAxis 手势接管：pager 自己的触摸滚动关掉，
                         // 由 pagerGestureOverride 的识别器仲裁（横滑翻页 / 竖滑交给页面内容）。
@@ -412,18 +391,21 @@ private fun MaskSwapShell(
                         val tab = Tab.entries[page]
                         TabHost(title = tab.label, onRestartAod = { askRestartAod = true }) {
                             when (tab) {
-                                // 主页（2026-10-29：状态卡搬回最上面、「去选图替换」按钮已删）
-                                Tab.Home -> HomeTab(state)
+                                // 主页（2026-10-29：状态卡搬回最上面、「去选图替换」按钮已删；
+                                // 2026-11-08：「当前运行」卡可直点进二级页 ⇒ 走同一个 onOpen）
+                                Tab.Home -> HomeTab(state, onOpen = { page ->
+                                    MaskDetailActivity.start(context, page)
+                                })
 
                                 // 一级功能页现在只有两张入口卡片，真正的内容在二级页（独立 Activity）里。
                                 Tab.Function -> FunctionHome(onOpen = { page ->
                                     MaskDetailActivity.start(context, page)
                                 })
 
-                                Tab.Settings -> SettingsTab(state, navBg) { mode ->
+                                Tab.Settings -> SettingsTab(state, onThemeModeChange = { mode ->
                                     state.applyThemeMode(mode)
                                     onThemeModeChange(mode)
-                                }
+                                }, onMonetChange = onMonetChange)
 
                                 Tab.About -> AboutTab(state)
                             }
@@ -869,7 +851,7 @@ internal fun BigStatusCard(
                     Column {
                         Text(text = statusText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(1.dp))
-                        // `versionName` 是 "0.5 Beta2"（不带 v），界面统一拼一个 "v" 显示。
+                        // `versionName` 是 "1.0 Beta1"（不带 v），界面统一拼一个 "v" 显示。
                         Text(text = "v$version", fontSize = 15.sp)
                     }
                 }
@@ -914,12 +896,6 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 internal fun appVersion(context: Context): String = runCatching {
     context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "1.0"
 }.getOrDefault("1.0")
-
-internal fun isInstalled(context: Context, packageName: String): Boolean = runCatching {
-    context.packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0L))
-}.isSuccess
-
-internal fun targetInstalled(context: Context): Boolean = isInstalled(context, TargetPackage)
 
 /** 系统属性（MIUI/HyperOS 版本号都在这里）。 */
 internal fun systemProperty(key: String): String? = runCatching {

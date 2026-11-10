@@ -21,15 +21,6 @@ class MaskPrefs(context: Context) {
         get() = prefs.getBoolean(KEY_VERBOSE, false)
 
     /**
-     * 设置页是否显示「自检」与「最近操作」两块（默认关）。
-     *
-     * 这两块都是排查用的，平时用不到、开着界面会长一截，所以塞进「测试」分组里由用户按需打开。
-     * 与 [verboseLog] 是两回事：那个控制 hook 往 LSPosed 日志里写多少，这个只管界面显示。
-     */
-    val showDiagnostics: Boolean
-        get() = prefs.getBoolean(KEY_SHOW_DIAGNOSTICS, false)
-
-    /**
      * 解除「主体遮挡时间过多」判定（默认关）。
      *
      * **编辑器和锁屏是两套判定，都要覆盖**（2026-10-01 定案）：
@@ -125,6 +116,20 @@ class MaskPrefs(context: Context) {
     }
 
     /**
+     * 启用 **Alive 壁纸**锁屏景深（默认关）—— 照光栅同一语义（2026-11-08）。
+     *
+     * 开 = SystemUI 保留 `keyguard_foreground_layer`，把我们抠好的主体换上去；
+     * 关 = 整层压掉（旧壁纸的人像不能浮在新图上）。
+     * Alive 只有 LSPosed 一条链，所以没有"挂载模式"限制。
+     */
+    val aliveLockDepth: Boolean
+        get() = prefs.getBoolean(KEY_ALIVE_LOCK_DEPTH, false)
+
+    fun setAliveLockDepth(value: Boolean) {
+        prefs.edit().putBoolean(KEY_ALIVE_LOCK_DEPTH, value).commit()
+    }
+
+    /**
      * 光栅壁纸的**最大幅度角度**（度，15..45，默认 25）—— 2026-11-04 用户要求。
      *
      * 语义：从第一张擦到最后一张需要的**横向转角**。值越大越"钝"（要转更多才换一张）。
@@ -142,6 +147,26 @@ class MaskPrefs(context: Context) {
     fun setRasterMaxAngle(value: Int) {
         prefs.edit().putInt(KEY_RASTER_MAX_ANGLE, value.coerceIn(RASTER_ANGLE_MIN, RASTER_ANGLE_MAX))
             .commit()
+    }
+
+    /**
+     * 光栅壁纸「过渡效果」：擦除带里要不要叠一层玻璃。
+     *
+     * | 值 | 含义 |
+     * |---|---|
+     * | 0 [RASTER_TRANSITION_DEFAULT] | 默认：纯擦除（对应 vivo 的 d2） |
+     * | 1 [RASTER_TRANSITION_STRIPE] | 条纹玻璃：一维余弦法线 + 折射 + 色散 + 弱阴影（d1） |
+     * | 2 [RASTER_TRANSITION_FROST] | 磨砂玻璃：二维噪声法线 + 折射，无阴影（d3） |
+     * | 3 [RASTER_TRANSITION_TWIST] | 条纹玻璃（扭曲变形）：强法线 + 强折射 + 强阴影 + 漫反射（d4） |
+     *
+     * 只在**擦除带内**生效（vivo 口径），不是 MIUI moru 那种全屏条纹玻璃（见《99》§99.11）。
+     * 2026-11-07 起是**纯渲染参数**：生效中改立即热更新并硬切归位一次，不再等下一次应用。
+     */
+    val rasterTransition: Int
+        get() = prefs.getInt(KEY_RASTER_TRANSITION, RASTER_TRANSITION_DEFAULT).coerceIn(0, 3)
+
+    fun setRasterTransition(value: Int) {
+        prefs.edit().putInt(KEY_RASTER_TRANSITION, value.coerceIn(0, 3)).commit()
     }
 
     /**
@@ -295,33 +320,6 @@ class MaskPrefs(context: Context) {
     }
 
     /**
-     * **最近一次生成成功**的图层缓存键（即使还没生效也记着）。
-     *
-     * 为什么要持久化：页面里的 `picked` 是 `remember`，一退页面就没了、缓存键也跟着丢，
-     * 于是「立即替换」永远判成"没生成过"。把它落盘后，重进页面也能直接替换/关闭。
-     */
-    val spatialLastKey: String
-        get() = prefs.getString(KEY_SPATIAL_LAST_KEY, "").orEmpty()
-
-    fun setSpatialLastKey(key: String?) {
-        prefs.edit().putString(KEY_SPATIAL_LAST_KEY, key.orEmpty()).commit()
-    }
-
-    /**
-     * 最近一次**选中**的图（候选）的缓存键；空串 = 当前没有选中任何图。
-     *
-     * 「清空选择」清的就是它（以及页面里的预览）—— 2026-11-03 起**连 `spatialLastKey` 一起清**：
-     * 清空后点「立即替换」应当提示「请先选择图片」，而不是拿上一次的缓存直接替换。
-     * 磁盘上的层图不删，重新选同一张图仍命中缓存。
-     */
-    val spatialSourceKey: String
-        get() = prefs.getString(KEY_SPATIAL_SOURCE_KEY, "").orEmpty()
-
-    fun setSpatialSourceKey(key: String?) {
-        prefs.edit().putString(KEY_SPATIAL_SOURCE_KEY, key.orEmpty()).commit()
-    }
-
-    /**
      * 候选图的**排列顺序**（2026-11-04，二级页改卡片式后引入）。
      *
      * 候选本身来自 `files/spatial/<key>/` 的目录扫描，顺序不能靠文件系统（不稳定）。
@@ -356,6 +354,47 @@ class MaskPrefs(context: Context) {
         prefs.edit()
             .putString(KEY_RASTER_GROUP_ORDER, ids.filter { it.isNotEmpty() }.joinToString(","))
             .commit()
+    }
+
+    // ───────────────────────────── Alive 壁纸（2026-11-07）─────────────────────────────
+
+    /**
+     * Alive 壁纸**当前使用中的卡 id**；空串 = 还没应用。
+     *
+     * 卡的内容不在这里（`files/alive/<id>/` 目录即真相，见 [AliveStore]），这里只留指针。
+     * Alive **只有 LSPosed 一种挂载方式**（要 AOD 动画，系统壁纸服务那条路做不了），
+     * 所以没有挂载模式 / 生效范围两项。
+     */
+    val aliveActiveId: String
+        get() = prefs.getString(KEY_ALIVE_ACTIVE, "").orEmpty()
+
+    fun setAliveActiveId(id: String?) {
+        prefs.edit().putString(KEY_ALIVE_ACTIVE, id.orEmpty()).commit()
+    }
+
+    /** Alive 卡的显示顺序（逗号分隔的 id）；应用 / 新建置顶后持久化。 */
+    val aliveGroupOrder: List<String>
+        get() = prefs.getString(KEY_ALIVE_GROUP_ORDER, "").orEmpty()
+            .split(',')
+            .filter { it.isNotEmpty() }
+
+    fun setAliveGroupOrder(ids: List<String>) {
+        prefs.edit()
+            .putString(KEY_ALIVE_GROUP_ORDER, ids.filter { it.isNotEmpty() }.joinToString(","))
+            .commit()
+    }
+
+    /**
+     * Alive 壁纸的**壁纸基准**（换壁纸自动关闭用）。
+     *
+     * 与光栅 [KEY_RASTER_FP] 同构：aod 侧的换壁纸检测拿它当比对值，判据一变就自动关闭。
+     */
+    val aliveWallpaperFp: String
+        get() = prefs.getString(KEY_ALIVE_FP, "").orEmpty()
+
+    fun setAliveWallpaperFp(value: String) {
+        if (value == aliveWallpaperFp) return
+        prefs.edit().putString(KEY_ALIVE_FP, value).commit()
     }
 
     /**
@@ -484,39 +523,18 @@ class MaskPrefs(context: Context) {
         prefs.edit().putBoolean(KEY_ROOT_AVAILABLE, value).commit()
     }
 
-    /**
-     * 诊断行：只记"最近一次和状态判定有关的事"，给界面显示用。
-     *
-     * 现在有两个写入点：`ScreenDisarm` 收到亮屏广播时（证明广播真的到了）、
-     * `MaskUiState.awaitWallpaperSize()`（hook 探测成功 / 超时，写清走的是哪条路）。
-     * 这两条链路原来都用 `runCatching` 把失败吞掉了，界面上完全看不出卡在哪 —— 真机上没法排查。
-     */
-    val diagNote: String
-        get() = prefs.getString(KEY_DIAG_NOTE, "").orEmpty()
-
-    fun setDiagNote(value: String) {
-        prefs.edit().putString(KEY_DIAG_NOTE, value).commit()
-    }
-
     val themeMode: String
         get() = prefs.getString(KEY_THEME_MODE, THEME_SYSTEM) ?: THEME_SYSTEM
 
     /**
-     * 「设置 → 测试 → 使用自定义背景」的开关（2026-10-06，**测试功能**，默认关）。
+     * 「设置 → 外观 → 启用Monet颜色」开关（2026-11-07 加，默认关）。
      *
-     * 打开后整页背景换成用户自选图，用来观察底栏玻璃在真实图案下的表现；
-     * 关闭时 [navBgRadiusPx] 归零、`filesDir/navbg/` 整个目录删掉（见 `NavBgState`）。
+     * 打开后主题配色改成**系统的 Monet 动态色**（miuix 的 `platformDynamicColors`，
+     * 读 `android.R.color.system_accent*` / `system_neutral*` 再按 miuix 的调色板重算），
+     * 随壁纸取色变化；关掉回 miuix 自带配色。**纯界面选项**，不碰任何 hook / 渲染逻辑。
      */
-    val navBgEnabled: Boolean
-        get() = prefs.getBoolean(KEY_NAV_BG_ENABLED, false)
-
-    /** 背景图的模糊半径，**单位 px**、0~50 整数档（用户 2026-10-06 定）。 */
-    val navBgRadiusPx: Int
-        get() = prefs.getInt(KEY_NAV_BG_RADIUS, 0).coerceIn(0, NAV_BG_RADIUS_MAX)
-
-    /** 所选图片的**原相册文件名**，只用于设置页那行 summary 显示。 */
-    val navBgFileName: String
-        get() = prefs.getString(KEY_NAV_BG_NAME, "").orEmpty()
+    val monetColor: Boolean
+        get() = prefs.getBoolean(KEY_MONET_COLOR, false)
 
     // ---------------------------------------------------------------- 视差壁纸效果（2026-10-12 加）
 
@@ -535,10 +553,6 @@ class MaskPrefs(context: Context) {
     fun setParallaxBgActive(value: Boolean) {
         prefs.edit().putBoolean(KEY_PARALLAX_ACTIVE, value).commit()
     }
-
-    /** 「视差壁纸效果」开 / 关指令的请求号（App 发显式广播给 SystemUI，ParallaxBg 回执）。 */
-    val parallaxToken: Long
-        get() = prefs.getLong(KEY_PARALLAX_TOKEN, 0L)
 
     fun requestParallax(): Long {
         val token = System.currentTimeMillis()
@@ -684,13 +698,6 @@ class MaskPrefs(context: Context) {
         prefs.edit().putString(KEY_SPATIAL_FP, value).commit()
     }
 
-    /**
-     * 「点『选择图片』前的景深检查」的请求号 —— App 写、aod 侧 hook 读
-     * （`--arg depth=<请求号>`），hook 读 `wallpaper_effect_type_2` 后带同一个号回写。
-     */
-    val depthProbeToken: Long
-        get() = prefs.getLong(KEY_DEPTH_PROBE_TOKEN, 0L)
-
     fun requestDepthProbe(): Long {
         val token = System.currentTimeMillis()
         prefs.edit().putLong(KEY_DEPTH_PROBE_TOKEN, token).commit()
@@ -717,10 +724,6 @@ class MaskPrefs(context: Context) {
             .commit()
     }
 
-    /** 由 hook 通过 provider 回写的注入状态。 */
-    val injectedProcess: String?
-        get() = prefs.getString(KEY_INJECTED_PROCESS, null)
-
     /**
      * 抓到的「壁纸**原图**」尺寸（`宽x高`）—— 也就是 `templates/current/wallpaper` 那一份。
      *
@@ -734,10 +737,6 @@ class MaskPrefs(context: Context) {
     /** 这份尺寸是哪一个「探测请求号」回写的（`0` = 旧数据 / root 脚本写的）。 */
     val wallpaperSizeToken: Long
         get() = prefs.getLong(KEY_WALLPAPER_SIZE_TOKEN, 0L)
-
-    /** 这份尺寸回写的时刻（只在 `token > 0` 时更新）。 */
-    val wallpaperSizeAt: Long
-        get() = prefs.getLong(KEY_WALLPAPER_SIZE_AT, 0L)
 
     /**
      * 「hook 探测壁纸原图」的请求号：App 点「选择图片」时写，hook 在宿主进程（com.miui.aod）里读，
@@ -780,10 +779,7 @@ class MaskPrefs(context: Context) {
         if (token > applyAck) prefs.edit().putLong(KEY_APPLY_ACK, token).commit()
     }
 
-    /** 「替替换后自动灭亮屏」的请求号 / 回执号（App 发广播，SystemUI 侧 hook 回执）。 */
-    val flashToken: Long
-        get() = prefs.getLong(KEY_FLASH_TOKEN, 0L)
-
+    /** 「替换后自动灭亮屏」的回执号（App 发广播，SystemUI 侧 hook 回执）。 */
     fun requestFlash(): Long {
         val token = System.currentTimeMillis()
         prefs.edit().putLong(KEY_FLASH_TOKEN, token).commit()
@@ -806,19 +802,6 @@ class MaskPrefs(context: Context) {
         prefs.edit().putString(KEY_DISPLAY_WALLPAPER_SIZE, value).commit()
     }
 
-    val injectedAt: Long
-        get() = prefs.getLong(KEY_INJECTED_AT, 0L)
-
-    val injectedRevision: Long
-        get() = prefs.getLong(KEY_INJECTED_REVISION, -1L)
-
-    val injectedDetail: String?
-        get() = prefs.getString(KEY_INJECTED_DETAIL, null)
-
-    /** 框架（LSPosed）把服务 binder 送进来的时间，>0 表示模块已被激活。 */
-    val frameworkConnectedAt: Long
-        get() = prefs.getLong(KEY_FRAMEWORK_AT, 0L)
-
     /**
      * 注入完成时记录的"当时壁纸内容指纹"—— 换壁纸检测的比对基准。
      *
@@ -833,10 +816,6 @@ class MaskPrefs(context: Context) {
 
     fun setVerboseLog(value: Boolean) {
         prefs.edit().putBoolean(KEY_VERBOSE, value).commit()
-    }
-
-    fun setShowDiagnostics(value: Boolean) {
-        prefs.edit().putBoolean(KEY_SHOW_DIAGNOSTICS, value).commit()
     }
 
     fun setDepthOcclusionRemoved(value: Boolean) {
@@ -855,36 +834,13 @@ class MaskPrefs(context: Context) {
         prefs.edit().putString(KEY_THEME_MODE, id).commit()
     }
 
-    fun setNavBgEnabled(value: Boolean) {
-        prefs.edit().putBoolean(KEY_NAV_BG_ENABLED, value).commit()
-    }
-
-    fun setNavBgRadiusPx(value: Int) {
-        prefs.edit()
-            .putInt(KEY_NAV_BG_RADIUS, value.coerceIn(0, NAV_BG_RADIUS_MAX))
-            .commit()
-    }
-
-    fun setNavBgFileName(value: String) {
-        prefs.edit().putString(KEY_NAV_BG_NAME, value).commit()
+    fun setMonetColor(value: Boolean) {
+        prefs.edit().putBoolean(KEY_MONET_COLOR, value).commit()
     }
 
     /** 图片内容变化后调用，hook 侧靠它判断缓存是否过期。 */
     fun bumpRevision() {
         prefs.edit().putLong(KEY_REVISION, revision + 1L).commit()
-    }
-
-    fun recordInjection(processName: String, at: Long, revision: Long, detail: String) {
-        prefs.edit()
-            .putString(KEY_INJECTED_PROCESS, processName)
-            .putLong(KEY_INJECTED_AT, at)
-            .putLong(KEY_INJECTED_REVISION, revision)
-            .putString(KEY_INJECTED_DETAIL, detail)
-            .commit()
-    }
-
-    fun recordFrameworkConnected(at: Long) {
-        prefs.edit().putLong(KEY_FRAMEWORK_AT, at).commit()
     }
 
     fun setInjectedWallpaper(md5: String) {
@@ -902,7 +858,6 @@ class MaskPrefs(context: Context) {
             putString(KEY_WALLPAPER_SIZE, value)
             if (token > 0L) {
                 putLong(KEY_WALLPAPER_SIZE_TOKEN, token)
-                putLong(KEY_WALLPAPER_SIZE_AT, System.currentTimeMillis())
             }
         }.commit()
     }
@@ -933,7 +888,6 @@ class MaskPrefs(context: Context) {
         const val FINGERPRINT_WEAK = "weak"
         const val KEY_REVISION = "revision"
         const val KEY_VERBOSE = "verbose_log"
-        const val KEY_SHOW_DIAGNOSTICS = "show_diagnostics"
         /** 「解除景深遮挡限制」——让避让判定恒通过（仅图像景深）。 */
         const val KEY_DEPTH_OCCLUSION = "depth_occlusion_removed"
         /** 空间壁纸的推理短边（像素档位）。 */
@@ -946,16 +900,6 @@ class MaskPrefs(context: Context) {
         const val KEY_SPATIAL_APPLIED_CROP_STAMP = "spatial_applied_crop_stamp"
         /** 当前生效的图层缓存键（图片 sha256 前 16 位）。 */
         const val KEY_SPATIAL_KEY = "spatial_key"
-        /** 最近一次**生成成功**的图层缓存键（不管有没有生效）。 */
-        const val KEY_SPATIAL_LAST_KEY = "spatial_last_key"
-        /**
-         * 最近一次**选中**的图（候选）的缓存键。
-         *
-         * 与 [KEY_SPATIAL_LAST_KEY] 分开：选图时就能确定（并已在缓存目录里复制了 `source` 原图），
-         * 而 `lastKey` 只有「深度 + 层图都生成成功」才有。页面重建后就靠它把预览框恢复成
-         * 用户选的那张原图，避免出现「预览显示着、实际却没选中」的状态。
-         */
-        const val KEY_SPATIAL_SOURCE_KEY = "spatial_source_key"
 
         /** 候选图的排列顺序（逗号分隔的 16 位 hex key）。 */
         const val KEY_SPATIAL_CANDIDATE_ORDER = "spatial_candidate_order"
@@ -973,12 +917,17 @@ class MaskPrefs(context: Context) {
          */
         const val KEY_RASTER_ACTIVE = "raster_active_id"
 
-        /** 光栅壁纸的挂载模式 / 生效范围 / 锁屏景深 / 最大幅度角度 / 停顿时就近归位。 */
+        /** 光栅壁纸的挂载模式 / 生效范围 / 锁屏景深 / 最大幅度角度 / 过渡效果 / 停顿时就近归位。 */
         const val KEY_RASTER_MOUNT_MODE = "raster_mount_mode"
         const val KEY_RASTER_SCOPE = "raster_scope"
         const val KEY_RASTER_LOCK_DEPTH = "raster_lock_depth"
+        const val KEY_ALIVE_LOCK_DEPTH = "alive_lock_depth"
         const val KEY_RASTER_MAX_ANGLE = "raster_max_angle"
+        const val KEY_RASTER_TRANSITION = "raster_transition"
         const val KEY_RASTER_SETTLE = "raster_settle"
+
+        /** 「过渡效果」四档：0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃（扭曲变形）。 */
+        const val RASTER_TRANSITION_DEFAULT = 0
 
         /** 光栅组的显示顺序（逗号分隔的组 id）—— 应用 / 新建置顶后持久化，2026-11-05。 */
         const val KEY_RASTER_GROUP_ORDER = "raster_group_order"
@@ -1003,6 +952,11 @@ class MaskPrefs(context: Context) {
          * 两套壁纸的提示内容不同，勾掉一套不该让另一套静默消失。
          */
         const val KEY_RASTER_MOUNT_WARNED = "raster_mount_warned"
+
+        /** Alive 壁纸：当前使用的卡 id / 卡片顺序 / 壁纸基准（2026-11-07）。 */
+        const val KEY_ALIVE_ACTIVE = "alive_active_id"
+        const val KEY_ALIVE_GROUP_ORDER = "alive_group_order"
+        const val KEY_ALIVE_FP = "alive_wallpaper_fp"
 
         /**
          * **挂载模式**（2026-10-30）：空间壁纸怎么加载。
@@ -1078,15 +1032,10 @@ class MaskPrefs(context: Context) {
 
         const val KEY_PROTECTING = "protecting"
         const val KEY_ROOT_AVAILABLE = "root_available"
-        const val KEY_DIAG_NOTE = "diag_note"
         const val KEY_THEME_MODE = "theme_mode"
         const val THEME_SYSTEM = "system"
-        const val KEY_INJECTED_PROCESS = "injected_process"
-        const val KEY_INJECTED_AT = "injected_at"
-        const val KEY_INJECTED_REVISION = "injected_revision"
-        const val KEY_INJECTED_DETAIL = "injected_detail"
-        /** 带 _v2：早期版本在 provider onCreate 里误记过，换 key 让那条脏数据失效。 */
-        const val KEY_FRAMEWORK_AT = "framework_connected_v2_at"
+        /** 「启用Monet颜色」（2026-11-07）：关 = miuix 自带配色，开 = 系统动态色。 */
+        const val KEY_MONET_COLOR = "monet_color"
         const val KEY_INJECTED_WALLPAPER = "injected_wallpaper_md5"
         const val KEY_WALLPAPER_SIZE = "wallpaper_size"
         const val KEY_DISPLAY_WALLPAPER_SIZE = "display_wallpaper_size"
@@ -1098,13 +1047,6 @@ class MaskPrefs(context: Context) {
         const val KEY_FLASH_TOKEN = "flash_token"
         const val KEY_FLASH_ACK = "flash_ack"
         const val KEY_WALLPAPER_SIZE_TOKEN = "wallpaper_size_token"
-        const val KEY_WALLPAPER_SIZE_AT = "wallpaper_size_at"
-        /** 「测试 → 使用自定义背景」（测试功能，默认关）；下面两个键只在它打开时有意义。 */
-        const val KEY_NAV_BG_ENABLED = "nav_bg_enabled"
-        const val KEY_NAV_BG_RADIUS = "nav_bg_radius_px"
-        const val KEY_NAV_BG_NAME = "nav_bg_file_name"
-        /** 背景模糊半径上限（px）—— 用户定的滑块量程 0~50。 */
-        const val NAV_BG_RADIUS_MAX = 50
 
         /** 「视差壁纸效果」：开启状态 + 指令号 / 回执号（SystemUI 侧 ParallaxBg 消费）。 */
         const val KEY_PARALLAX_ACTIVE = "parallax_bg_active"

@@ -38,7 +38,6 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 /**
  * 「视差壁纸效果」在 `com.android.systemui` 里的整条链（2026-10-12 起）——**独立链**：
@@ -1089,16 +1088,6 @@ internal object ParallaxBg {
             }
             receiverInstalled = ok
             HookRuntime.log("视差壁纸效果：广播接收器注册${if (ok) "成功" else "失败"}")
-            if (!ok) {
-                runCatching {
-                    app.contentResolver.call(
-                        MaskProvider.configUri(),
-                        MaskProvider.METHOD_NOTE,
-                        "视差壁纸效果：广播接收器注册失败（见 LSPosed 日志）",
-                        null,
-                    )
-                }
-            }
         }
     }
 
@@ -1125,7 +1114,6 @@ internal object ParallaxBg {
                 coverFlag = false
                 coverFlagAt = SystemClock.elapsedRealtime()
             }
-            val placed = backdropRef?.get()?.isAttachedToWindow == true
             val worker = Thread {
                 runCatching {
                     context.contentResolver.call(
@@ -1135,15 +1123,6 @@ internal object ParallaxBg {
                         null,
                     )
                 }.onFailure { HookRuntime.log("视差壁纸效果：回执失败：$it") }
-                runCatching {
-                    context.contentResolver.call(
-                        MaskProvider.configUri(),
-                        MaskProvider.METHOD_NOTE,
-                        "视差壁纸效果：${if (config?.active == true) "已开启" else "已关闭"}" +
-                            "（背景层${if (placed) "已就位" else "未就位"}）",
-                        null,
-                    )
-                }
             }
             worker.isDaemon = true
             worker.start()

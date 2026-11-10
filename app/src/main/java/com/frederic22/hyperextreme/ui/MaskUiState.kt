@@ -23,9 +23,7 @@ import com.frederic22.hyperextreme.data.RestartTargets
 import com.frederic22.hyperextreme.data.RootReplacer
 import com.frederic22.hyperextreme.data.RootShell
 import com.frederic22.hyperextreme.data.RunLog
-import com.frederic22.hyperextreme.data.SelfTest
 import com.frederic22.hyperextreme.data.SystemUiPackageName
-import com.frederic22.hyperextreme.data.WallpaperSource
 import com.frederic22.hyperextreme.data.WallpaperVersion
 import com.frederic22.hyperextreme.hook.HookRuntime
 import com.frederic22.hyperextreme.hook.ParallaxBg
@@ -39,9 +37,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * 界面状态与动作的唯一出处。四个 Tab 共用它，方便以后继续加功能。
@@ -61,10 +56,6 @@ class MaskUiState(
     var sizes by mutableStateOf(roleState { MaskStore.sizeText(context, it) })
 
     var verbose by mutableStateOf(prefs.verboseLog)
-
-    /** 设置页是否显示「自检」与「最近操作」（默认关，见 MaskPrefs.showDiagnostics）。 */
-    var showDiagnostics by mutableStateOf(prefs.showDiagnostics)
-        private set
 
     /** 解除编辑器的「主体遮挡时间过多」判定（默认关，见 `MaskPrefs.depthOcclusionRemoved`）。 */
     var depthOcclusionRemoved by mutableStateOf(prefs.depthOcclusionRemoved)
@@ -96,6 +87,16 @@ class MaskUiState(
         private set
 
     /**
+     * 「视差壁纸效果」有没有候选图（`files/parallax_bg.png` 存在且非空）。
+     *
+     * ⚠️ 界面**不能用 [parallaxPreview] 判空态**：预览是 `onResume` 里异步解码的，
+     * 进来的头一两帧还是 null ⇒ 有图也会先闪一下加号卡（锁屏遮罩页 2026-11-07 踩过同一个坑）。
+     * 这里只看文件，`refreshLocal()` 同步刷新（`isFile + length` 两次 stat，开销可忽略）。
+     */
+    var parallaxHasBg by mutableStateOf(MaskStore.parallaxExists(context))
+        private set
+
+    /**
      * 「视差壁纸效果 → 参数调整」5 参数（2026-10-13 加）。
      *
      * 权威存储仍在 prefs（SystemUI 侧经 provider config 快照 3s TTL 读取）；这里的镜像只服务 UI 显示。
@@ -103,8 +104,8 @@ class MaskUiState(
      * 若覆盖它们会把正在拖的滑块弹回去；prefs 的写入方也只有本值（拖动抬手 / 开关切换时）
      * —— 单一写者，无需回读对账。
      *
-     * 拖动中 [applyParallaxSubjectScale] 等以 `persist = false` 只更新内存（防 `commit()` 卡拖动，
-     * 与 NavBg 滑块同一教训），抬手时 [persistParallaxParams] 一次性落盘。
+     * 拖动中 [applyParallaxSubjectScale] 等以 `persist = false` 只更新内存（防 `commit()` 卡拖动），
+     * 抬手时 [persistParallaxParams] 一次性落盘。
      */
     var parallaxReverse by mutableStateOf(prefs.parallaxReverse)
         private set
@@ -155,9 +156,8 @@ class MaskUiState(
 
     var themeMode by mutableStateOf(ThemeMode.of(prefs.themeMode))
 
-    var selfTestLines by mutableStateOf<List<String>>(emptyList())
-
-    var hookStatus by mutableStateOf(readHookStatus(prefs))
+    /** 「启用Monet颜色」（2026-11-07）：只影响应用配色，见 [MaskPrefs.monetColor]。 */
+    var monetColor by mutableStateOf(prefs.monetColor)
 
     /**
      * 记录下来的 root 可用性：null = 还没测过。
@@ -199,9 +199,6 @@ class MaskUiState(
 
     var busy by mutableStateOf(false)
 
-    /** 正在等待相册返回的角色。 */
-    var pendingRole by mutableStateOf<MaskRole?>(null)
-
     val configuredRoles: List<MaskRole>
         get() = MaskRole.selectable.filter { sizes[it] != null }
 
@@ -210,20 +207,12 @@ class MaskUiState(
      * * 框架把服务 binder 送过来了（[ActivationState.frameworkConnected]）；
      * * 或者框架把模块注入进了本进程（[HookRuntime.selfInjected]）。
      *
-     * **不能**再用 `prefs.frameworkConnectedAt`（历史时间戳）或 `hookStatus.process`（注入记录）——
+     * **不能**再用 `prefs.frameworkConnectedAt`（历史时间戳）或注入记录（`prefs.injectedProcess`）——
      * 它们是持久化的历史值，用户在 LSPosed 里取消勾选后还会一直为真，界面就永远显示"已激活"。
      * 现在"掉激活"在两种情况能立刻反映：回到前台时 binder 探活失败，或者应用重启后本进程没再收到 binder。
      */
     val activated: Boolean
         get() = frameworkConnected || HookRuntime.selfInjected
-
-    /** 激活来源，给界面显示用。 */
-    val activationSource: String?
-        get() = when {
-            frameworkConnected -> "框架已连接"
-            HookRuntime.selfInjected -> "本应用（框架已注入）"
-            else -> null
-        }
 
     /**
      * 状态是否为「模块已激活」—— 也就是界面上唯一那个**完全可用**的状态。
@@ -258,10 +247,6 @@ class MaskUiState(
     var injectedRoles by mutableStateOf(MaskStore.injectedRoles(context))
         private set
 
-    /** 界面上"当前生效的角色"：候选优先（还没注入），否则看已注入的快照。 */
-    val effectiveRoles: List<MaskRole>
-        get() = configuredRoles.ifEmpty { injectedRoles }
-
     suspend fun reloadPreviews() {
         previews = withContext(Dispatchers.IO) {
             // 遮罩页两个候选（主体 / 遮罩）预览也**不压分辨率**了（2026-10-13 用户要求）：
@@ -281,10 +266,11 @@ class MaskUiState(
         try {
             revision = prefs.revision
             sizes = roleState { MaskStore.sizeText(context, it) }
-            hookStatus = readHookStatus(prefs)
             frameworkConnected = ActivationState.frameworkConnected
             themeMode = ThemeMode.of(prefs.themeMode)
+            monetColor = prefs.monetColor
             parallaxActive = prefs.parallaxBgActive
+            parallaxHasBg = MaskStore.parallaxExists(context)
             syncProtectionState()
         } finally {
             refreshing = false
@@ -367,8 +353,26 @@ class MaskUiState(
         prefs.requestWallpaperProbe()
         // 后台唤醒宿主：不阻塞"打开相册"；选完图回来时 [awaitWallpaperSize] 才开始等结果。
         scope.launch(Dispatchers.IO) {
-            val error = wakeAod(prefs.probeToken.toString())
-            if (error.isNotEmpty()) prefs.setDiagNote("壁纸尺寸探测：唤醒宿主失败（$error）")
+            wakeAod(prefs.probeToken.toString())
+        }
+    }
+
+    /**
+     * 只请 hook 重推一次「当前锁屏壁纸」缩略图（2026-11-07 第二轮加）。
+     *
+     * 锁屏遮罩页「当前壁纸」卡在**进页面 / 回到前台**时调它（用户报"换了壁纸卡片不刷新"）。
+     * 和 [beginWallpaperProbe] 的区别：**不动请求号、不等回执**，只是借 provider 那一次调用
+     * 让宿主进程里的 hook 顺手把缩略图重新编码推回来；宿主没起时这条调用会把它拉起来。
+     *
+     * [force] = true：无条件重推（App 侧的缩略图缓存丢了 / 从来没有过）；
+     * [force] = false：交给 hook 按「同一张壁纸不重推」去重 —— 重推会让卡片重新渐显闪一下。
+     *
+     * 唤醒 / 编码都不便宜，调用方负责节流（见 `MaskTabs.requestLockThumb`）。
+     */
+    fun refreshLockThumb(force: Boolean) {
+        val arg = if (force) THUMB_ARG_FORCE else "thumb=1"
+        scope.launch(Dispatchers.IO) {
+            wakeAod(arg)
         }
     }
 
@@ -391,11 +395,9 @@ class MaskUiState(
         }
         if (hook != null) {
             wallpaperSize = hook
-            prefs.setDiagNote("壁纸尺寸探测：${hook.first}×${hook.second}（hook）")
             return hook
         }
         toast("分辨率对比失败，请手动检查后再开始替换")
-        prefs.setDiagNote("壁纸尺寸探测：hook 超时（未取到分辨率，已提示手动检查）")
         return null
     }
 
@@ -421,15 +423,15 @@ class MaskUiState(
         prefs.setThemeMode(mode.id)
     }
 
+    /** 切换「启用Monet颜色」。换配色要重建 ThemeController，所以同 [applyThemeMode] 要往上报一层。 */
+    fun applyMonetColor(value: Boolean) {
+        monetColor = value
+        prefs.setMonetColor(value)
+    }
+
     fun applyVerbose(value: Boolean) {
         verbose = value
         prefs.setVerboseLog(value)
-    }
-
-    /** 切换设置页「自检 / 最近操作」两块的显示（只管界面，不影响任何判定逻辑）。 */
-    fun applyShowDiagnostics(value: Boolean) {
-        showDiagnostics = value
-        prefs.setShowDiagnostics(value)
     }
 
     /** 切换「解除景深遮挡限制」——让编辑器里的避让判定恒通过（视频景深不受影响）。 */
@@ -775,7 +777,7 @@ class MaskUiState(
      * 含倍率联动夹取后的值）。
      *
      * 拖动中不落盘（`applyXxx(persist = false)` 只改内存）——`MaskPrefs` 用同步 `commit()`，
-     * 每帧写盘会把拖动卡成"一顿一顿"（NavBg 滑块的同一教训）；抬手补一次即可。
+     * 每帧写盘会把拖动卡成"一顿一顿"（滑块类设置的同一教训）；抬手补一次即可。
      */
     fun persistParallaxParams() {
         prefs.setParallaxSubjectScale(parallaxSubjectScale)
@@ -797,20 +799,11 @@ class MaskUiState(
         withContext(Dispatchers.IO) { wakeAod("depth=$token") }
         val value = withContext(Dispatchers.IO) { waitDepthAnswer(token) }
         return when (value) {
-            null -> {
-                prefs.setDiagNote("景深检查：hook 超时（未拦截，继续）")
-                true
-            }
-
-            -1 -> {
-                prefs.setDiagNote("景深检查：读值失败（未拦截，继续）")
-                true
-            }
+            null, -1 -> true
 
             2 -> true
 
             else -> {
-                prefs.setDiagNote("景深检查：未开启（已拦截）")
                 toast("请先在系统锁屏编辑开启景深效果")
                 false
             }
@@ -842,12 +835,15 @@ class MaskUiState(
     }
 
     /**
-     * 「清空选择」：只清掉这个角色的候选图（已经写进系统的快照不动）。
+     * 锁屏遮罩页的「清空选择」（2026-11-07）：**两个角色一起清**。
+     *
+     * 新 UI 只有一个槽（选一张图、自动判定主体或遮罩），所以"清空"就该把这一个槽清干净 ——
+     * 不必让用户先想清楚刚才那张被判成了主体还是遮罩。
      */
-    fun clearRole(role: MaskRole) {
-        MaskStore.clear(context, role)
+    fun clearRoles() {
+        MaskRole.selectable.forEach { role -> MaskStore.clear(context, role) }
         prefs.bumpRevision()
-        sizes = sizes.toMutableMap().apply { put(role, null) }
+        sizes = sizes.toMutableMap().apply { MaskRole.selectable.forEach { put(it, null) } }
         refreshLocal()
         toast("已清空")
     }
@@ -927,6 +923,16 @@ class MaskUiState(
         /** 宿主模板 provider（清单里 `exported=true`）——「立即替换」与「壁纸探测」都靠唤醒它落到 hook 上。 */
         const val AOD_PROVIDER_URI = "content://miui.keyguard.editor.templatefileprovider"
         const val AOD_PROVIDER_METHOD = "callGetHistoryTemplates"
+
+        /**
+         * 「只重推当前壁纸缩略图」的 provider arg（见 [MaskUiState.refreshLockThumb]）。
+         *
+         * hook 侧只认 `apply=` / `depth=` / 纯数字三种 arg，其余都会落到兜底分支 ——
+         * 那里本来就会推一次缩略图，所以这条 arg 只是"意图标记"，用来区分去重策略：
+         * `thumb=force` = 无条件重推（App 缓存丢了），`thumb=1` = 同一张壁纸不重推。
+         */
+        const val THUMB_ARG_PREFIX = "thumb="
+        const val THUMB_ARG_FORCE = "thumb=force"
 
         /** 「视差壁纸效果」指令回执的等待时长（SystemUI 侧 = 读图 + 插层 + 回执，1.5s 足够）。 */
         const val ParallaxAckTimeoutMs = 1_500L
@@ -1096,12 +1102,6 @@ class MaskUiState(
             MaskStore.clearInjected(context, role)
         }
         prefs.setInjectedWallpaper("")
-        prefs.recordInjection(
-            processName = "本应用（hook 注入）",
-            at = System.currentTimeMillis(),
-            revision = prefs.revision,
-            detail = "保护已结束：hook 直接落盘并触发重新解码，替换已生效；候选与注入快照已一并清除。",
-        )
     }
 
     /**
@@ -1141,14 +1141,6 @@ class MaskUiState(
             "失败（hook 无回执，su 也失败）"
         }
     }
-
-    fun runSelfTest() {
-        scope.launch {
-            busy = true
-            selfTestLines = withContext(Dispatchers.IO) { SelfTest.run(context) }
-            busy = false
-        }
-    }
 }
 
 /**
@@ -1163,20 +1155,6 @@ const val PreviewMaxEdge = 4096
 internal fun <T> roleState(block: (MaskRole) -> T): Map<MaskRole, T> =
     MaskRole.selectable.associateWith(block)
 
-internal fun readHookStatus(prefs: MaskPrefs): HookStatus = HookStatus(
-    process = prefs.injectedProcess,
-    at = prefs.injectedAt,
-    revision = prefs.injectedRevision,
-    detail = prefs.injectedDetail,
-)
-
-internal fun formatTime(at: Long): String =
-    if (at <= 0L) "未知时间" else SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(at))
-
-/** 判据是 sha1，界面上只显示头尾，免得一行放不下。 */
-internal fun String.abbreviate(max: Int = 18): String =
-    if (length <= max) this else take(max / 2) + "…" + takeLast(max / 2)
-
 /** 解析 `宽x高`（[MaskPrefs.wallpaperSize] 的格式）；不是这个格式就返回 null。 */
 internal fun String.toSizeOrNull(): Pair<Int, Int>? {
     val parts = split('x', 'X')
@@ -1186,11 +1164,3 @@ internal fun String.toSizeOrNull(): Pair<Int, Int>? {
     if (width <= 0 || height <= 0) return null
     return width to height
 }
-
-/** hook / root 回写的替换状态。 */
-data class HookStatus(
-    val process: String?,
-    val at: Long,
-    val revision: Long,
-    val detail: String?,
-)

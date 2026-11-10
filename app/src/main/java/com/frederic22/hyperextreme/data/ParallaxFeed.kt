@@ -1,7 +1,6 @@
 package com.frederic22.hyperextreme.data
 
 import android.content.Context
-import java.io.File
 
 /**
  * 把视差用的两张图推送进 `com.miui.miwallpaper` 进程（2026-10-21）。
@@ -32,10 +31,6 @@ internal object ParallaxFeed {
 
     /** 主体的源头：编辑器生成的透明抠像，与「已应用壁纸」逐像素对齐。 */
     private const val CROP_SUBJECT = "/data/system/theme_magic/users/0/wallpaper/crop_subject"
-
-    fun bgPath(): String = "$DIR/$BG_NAME"
-
-    fun subjectPath(): String = "$DIR/$SUBJECT_NAME"
 
     /**
      * 把当前背景（+ 主体）推进 miwallpaper。需 root；同步执行，调用方自己丢后台线程。

@@ -183,10 +183,6 @@ object WallpaperVersion {
         return Version("", DETAIL_NONE, "")
     }
 
-    /** 指纹值（不含前缀的人类可读形式），日志用。 */
-    fun short(fingerprint: String): String =
-        if (fingerprint.length <= 12) fingerprint else fingerprint.take(12) + "…"
-
     // ---------------------------------------------------------------- 兜底判据
 
     private data class FilesDigest(val digest: String, val detail: String)

@@ -26,7 +26,7 @@ class XposedProvider : ContentProvider() {
         val binder = extras?.getBinder(KEY_BINDER)
         if (method == METHOD_SEND_BINDER && binder != null) {
             frameworkBinder = binder
-            context?.let { ActivationState.recordFrameworkConnected(it) }
+            ActivationState.recordFrameworkConnected()
         }
         return Bundle()
     }

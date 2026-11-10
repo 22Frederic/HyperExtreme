@@ -43,6 +43,9 @@ internal object HookRuntime {
 
     private const val STATE_FILE = ".glass_mask_state"
 
+    /** 「当前壁纸」缩略图的短边（像素）—— 锁屏遮罩页那张卡最宽 0.42 屏宽，720 足够。 */
+    private const val THUMB_SHORT_SIDE = 720
+
     /** 没有变化时也定期回写一次状态，界面才能显示"已注入"。 */
     private const val REPORT_INTERVAL_MS = 30_000L
 
@@ -126,6 +129,10 @@ internal object HookRuntime {
          * 与空间一样**没有配套开关**：检测到换壁纸就无条件关。
          */
         val rasterWallpaperFp: String,
+        /** 「Alive 壁纸」是否生效中（2026-11-07，供换壁纸检测用；只看 id 非空）。 */
+        val aliveActive: Boolean,
+        /** 「Alive 壁纸基准」壁纸判据（空 = 尚未记录，检测时惰性补记）。 */
+        val aliveWallpaperFp: String,
     ) {
         /** 该角色在模块里设置了图片 —— 没有开关，设了就是生效。 */
         fun has(role: MaskRole): Boolean = role.id in present
@@ -149,37 +156,12 @@ internal object HookRuntime {
     }
 
     /**
-     * 等 Application 就绪后，把"已激活"写进模块自己的 SharedPreferences。
-     * 万一界面在另一个 classloader 里拿不到上面的静态标记，也能靠这条记录显示已激活。
-     */
-    fun reportSelfActivationAsync() {
-        Thread {
-            repeat(20) {
-                val context = appContext()
-                if (context != null) {
-                    runCatching {
-                        val prefs = MaskPrefs(context)
-                        prefs.recordInjection(
-                            processName = SELF_PROCESS_LABEL,
-                            at = System.currentTimeMillis(),
-                            revision = prefs.revision,
-                            detail = "LSPosed 已加载模块（勾选即激活）",
-                        )
-                    }
-                    return@Thread
-                }
-                Thread.sleep(500L)
-            }
-        }.start()
-    }
-
-    /**
      * 在**目标应用进程**里也装一份"灭亮屏 → 结束保护"的观察者。
      *
      * 模块 app 可能早就被系统杀掉了（用户正在锁屏界面上），那时只有这里注册的接收者还活着。
      * 两边都注册一份、各自幂等，解除动作统一走 provider，所以谁先醒都行。
      *
-     * Application 就绪前拿不到 Context，所以和 [reportSelfActivationAsync] 一样轮询等一会儿。
+     * Application 就绪前拿不到 Context，所以先轮询等一会儿。
      */
     fun installScreenDisarmAsync() {
         Thread {
@@ -250,6 +232,8 @@ internal object HookRuntime {
                 spatialWallpaperFp = data.getString(MaskProvider.KEY_SPATIAL_FP).orEmpty(),
                 rasterActive = data.getBoolean(MaskProvider.KEY_RASTER_ACTIVE, false),
                 rasterWallpaperFp = data.getString(MaskProvider.KEY_RASTER_FP).orEmpty(),
+                aliveActive = data.getBoolean(MaskProvider.KEY_ALIVE_ACTIVE, false),
+                aliveWallpaperFp = data.getString(MaskProvider.KEY_ALIVE_FP).orEmpty(),
             )
         }
 
@@ -493,7 +477,8 @@ internal object HookRuntime {
         val parallaxWatch = parallaxWatchOf(config)
         val spatialWatch = spatialWatchOf(config)
         val rasterWatch = rasterWatchOf(config)
-        if (!replaceWatch && !parallaxWatch && !spatialWatch && !rasterWatch) return
+        val aliveWatch = aliveWatchOf(config)
+        if (!replaceWatch && !parallaxWatch && !spatialWatch && !rasterWatch && !aliveWatch) return
         val now = SystemClock.elapsedRealtime()
         if (now - lastVersionAt < VERSION_CHECK_INTERVAL_MS) return
         lastVersionAt = now
@@ -504,6 +489,7 @@ internal object HookRuntime {
         if (parallaxWatch) checkParallaxBranch(context, config, version)
         if (spatialWatch) checkSpatialBranch(context, config, version)
         if (rasterWatch) checkRasterBranch(context, config, version)
+        if (aliveWatch) checkAliveBranch(context, config, version)
     }
 
     /**
@@ -519,7 +505,8 @@ internal object HookRuntime {
         val parallaxWatch = parallaxWatchOf(config)
         val spatialWatch = spatialWatchOf(config)
         val rasterWatch = rasterWatchOf(config)
-        if (!replaceWatch && !parallaxWatch && !spatialWatch && !rasterWatch) return
+        val aliveWatch = aliveWatchOf(config)
+        if (!replaceWatch && !parallaxWatch && !spatialWatch && !rasterWatch && !aliveWatch) return
 
         val version = runCatching { WallpaperVersion.computeFrom(context, templateInfo) }.getOrNull() ?: return
         if (!version.usable) return
@@ -527,6 +514,7 @@ internal object HookRuntime {
         if (parallaxWatch) checkParallaxBranch(context, config, version)
         if (spatialWatch) checkSpatialBranch(context, config, version)
         if (rasterWatch) checkRasterBranch(context, config, version)
+        if (aliveWatch) checkAliveBranch(context, config, version)
     }
 
     /** 替换链的守护条件：保护期内 + 基准指纹可用（空 / weak 都不自动解除）。 */
@@ -549,6 +537,9 @@ internal object HookRuntime {
      * 另外，空间壁纸**没有开关** —— 用户定的是"检测到换壁纸就无条件关"。
      */
     private fun spatialWatchOf(config: HookConfig): Boolean = config.spatialActive
+
+    /** Alive 壁纸的守护条件：只看是否生效中（与光栅同构，**没有开关**）。 */
+    private fun aliveWatchOf(config: HookConfig): Boolean = config.aliveActive
 
     /**
      * 光栅壁纸的守护条件：**只看是否生效中**（2026-11-05，与空间完全同构）。
@@ -692,6 +683,65 @@ internal object HookRuntime {
         rasterAutoOffFromWallpaper(context, version.detail)
     }
 
+    /**
+     * **Alive 壁纸：壁纸判据变化 → 无条件自动关闭**（2026-11-07，与光栅同构）。
+     *
+     * 三条保护逐字一致：基准空 / weak ⇒ 惰性补记不动作（升级保护）；
+     * 判据升级（换尺子）⇒ 只更新基准不关闭。
+     */
+    private fun checkAliveBranch(context: Context, config: HookConfig, version: WallpaperVersion.Version) {
+        val base = config.aliveWallpaperFp
+        if (base.isEmpty() || base == MaskPrefs.FINGERPRINT_WEAK) {
+            log("Alive壁纸基准：首次记录（${version.detail}）")
+            updateAliveFingerprint(context, version)
+            return
+        }
+        if (version.value == base) return
+        if (WallpaperVersion.kindOf(version.value) != WallpaperVersion.kindOf(base)) {
+            log("Alive壁纸基准：判据升级（${version.detail}），只更新基准不关闭")
+            updateAliveFingerprint(context, version)
+            return
+        }
+        log("Alive壁纸：壁纸已变化（${version.detail}），自动关闭")
+        aliveAutoOffFromWallpaper(context, version.detail)
+    }
+
+    /** 更新「Alive 壁纸基准」指纹（惰性补记 / 判据升级时用）。 */
+    private fun updateAliveFingerprint(context: Context, version: WallpaperVersion.Version) {
+        runCatching {
+            val extras = Bundle().apply {
+                putString(MaskProvider.KEY_ALIVE_FP, version.value)
+            }
+            context.contentResolver.call(
+                MaskProvider.configUri(),
+                MaskProvider.METHOD_ALIVE_FP,
+                null,
+                extras,
+            )
+        }.onFailure { error -> log("更新 Alive 壁纸基准失败：$error") }
+    }
+
+    /**
+     * 「换壁纸 → 关闭 Alive 壁纸」的收尾。
+     *
+     * 全部动作在 **provider 进程**里完成（改 prefs → 推系统属性 → toast），
+     * 与 App 手动「取消应用」共用 `AliveControl.disable`。
+     */
+    private fun aliveAutoOffFromWallpaper(context: Context, detail: String) {
+        runCatching {
+            context.contentResolver.call(
+                MaskProvider.configUri(),
+                MaskProvider.METHOD_ALIVE_AUTO_OFF,
+                detail,
+                null,
+            )
+            configAt = 0L
+            configValue = null
+            lastVersionAt = 0L
+            lastReportAt = SystemClock.elapsedRealtime()
+        }.onFailure { error -> log("自动关闭 Alive 壁纸失败：$error") }
+    }
+
     /** 更新「光栅壁纸基准」指纹（惰性补记 / 判据升级时用；不碰开关与指令号）。 */
     private fun updateRasterFingerprint(context: Context, version: WallpaperVersion.Version) {
         runCatching {
@@ -794,6 +844,11 @@ internal object HookRuntime {
             lastVersionAt = 0L
             lastReportAt = SystemClock.elapsedRealtime()
         }.onFailure { error -> log("解除保护失败：$error") }
+        // 这一条的触发点就是「检测到用户换了壁纸」或「保护收尾」——顺手让「当前壁纸」缩略图
+        // 重推一次（按文件指纹去重，没换就什么都不做），锁屏遮罩页的左卡才不会停在旧壁纸上。
+        val thumbWorker = Thread { runCatching { pushLockWallpaperThumb(context) } }
+        thumbWorker.isDaemon = true
+        thumbWorker.start()
     }
 
     // ---------------------------------------------------------------- 替换图
@@ -982,15 +1037,19 @@ internal object HookRuntime {
      * 宿主进程**刚起来**时调一次：如果模块 App 正在等探测，就尽快响应。
      *
      * `onPackageReady` 那一刻 Application 可能还没建好（[appContext] 仍为 null），所以轮询几秒。
+     *
+     * 2026-11-07 起**不再早退**：除了尺寸探测，还要顺手把「当前壁纸缩略图」推给 App
+     * （锁屏遮罩页「当前壁纸」卡要显示它，见 [pushLockWallpaperThumb]）。
      */
     fun probeWallpaperOnStart() {
-        if (runCatching { probeTokenRemote() }.getOrDefault(0L) <= lastProbedToken) return
+        val probePending = runCatching { probeTokenRemote() }.getOrDefault(0L) > lastProbedToken
         val worker = Thread {
             var i = 0
             while (i < 30) {
                 val context = appContext()
                 if (context != null) {
-                    probeWallpaperIfRequested(context)
+                    if (probePending) probeWallpaperIfRequested(context)
+                    pushLockWallpaperThumb(context)
                     break
                 }
                 runCatching { Thread.sleep(100L) }
@@ -1000,6 +1059,101 @@ internal object HookRuntime {
         worker.isDaemon = true
         worker.start()
     }
+
+    /** 上一次推给 App 的缩略图指纹（同进程内去重：同一张壁纸不重复推）。 */
+    private var lastThumbFingerprint = ""
+
+    /**
+     * 把**当前锁屏壁纸的缩略图**推给模块 App（2026-11-07，锁屏遮罩页「当前壁纸」卡用）。
+     *
+     * ## 为什么必须借这条通道
+     *
+     * `WallpaperManager` 的读接口对第三方应用已经封死：`getWallpaperFile()` 从 Android 13 起
+     * 只返回默认壁纸、Android 14 起直接抛 `SecurityException`，`getDrawable(FLAG_LOCK)` 同理；
+     * 唯一豁免是 `MANAGE_EXTERNAL_STORAGE` / 系统签名的 `READ_WALLPAPER_INTERNAL`。
+     * 而本进程（com.miui.aod）就在壁纸编辑器里，`templates/current/wallpaper` 读得到 ——
+     * 与壁纸尺寸探测**同一条通道**，不需要任何额外权限、也不需要 root。
+     *
+     * 缩到短边 [THUMB_SHORT_SIDE] 再压 JPEG：卡片最宽也就 0.42 屏宽，720 绰绰有余；
+     * base64 之后约 150~250KB，Binder 事务（1MB）装得下。
+     */
+    /**
+     * 后台推一次「当前壁纸」缩略图（[pushLockWallpaperThumb] 的异步外壳）。
+     *
+     * provider call 的拦截跑在 binder 线程上，而解码 + 缩放要几百毫秒，所以这里起一条
+     * daemon 线程 —— 调用方（[HookEntry] 的 call 拦截）不用等。
+     *
+     * [force] 透传给 [pushLockWallpaperThumb]：`thumb=force`（App 缓存丢了）才无条件重推；
+     * 其余按文件指纹去重，避免界面每次进出页面都重新解码、卡片白闪。
+     */
+    fun requestLockWallpaperThumb(context: Context, force: Boolean = false) {
+        val worker = Thread { runCatching { pushLockWallpaperThumb(context, force = force) } }
+        worker.isDaemon = true
+        worker.start()
+    }
+
+    /**
+     * [force] = true：**不看指纹**，无条件重推（App 的缩略图缓存不存在时用 —— hook 这边
+     * 并不知道对面清没清缓存）。[force] = false：同一张壁纸只推一次（进程启动、进页面、
+     * 换壁纸检测都走这一档；指纹含路径 + 长度 + mtime ⇒ 真换了壁纸必推）。
+     *
+     * ## 取哪一份图（2026-11-07 第二轮改）
+     *
+     * 原来只认模板原图 `templates/current/wallpaper`。但换壁纸后**模板目录不保证立刻跟着刷新**
+     * （它是锁屏编辑器的工作副本），而主题管理器那份"已应用的锁屏壁纸"是换壁纸时**当场重写**的。
+     * 所以现在两份都当候选、**mtime 新的优先**：编辑器里改 → 模板那份最新；系统设置里换 →
+     * 已应用那份最新。谁先解码成功就用谁（第一份解不出来就退到下一份）。
+     */
+    private fun pushLockWallpaperThumb(context: Context, force: Boolean = false) {
+        val candidates = listOfNotNull(
+            runCatching { WallpaperSource.appliedLockWallpaper(context) }.getOrNull(),
+            runCatching { WallpaperSource.resolveSourceSpace(context) }.getOrNull(),
+        ).distinctBy { it.absolutePath }.sortedByDescending { it.lastModified() }
+        for (file in candidates) {
+            val fingerprint = "${file.absolutePath}:${file.length()}:${file.lastModified()}"
+            if (!force && fingerprint == lastThumbFingerprint) return
+            val bytes = encodeThumb(file) ?: continue
+            val ok = runCatching {
+                context.contentResolver.call(
+                    MaskProvider.configUri(),
+                    MaskProvider.METHOD_LOCK_WALLPAPER,
+                    android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP),
+                    null,
+                )
+            }.isSuccess
+            if (ok) {
+                lastThumbFingerprint = fingerprint
+                log("当前壁纸缩略图已推送（${bytes.size / 1024} KB，来自 ${file.absolutePath}）")
+            }
+            return
+        }
+    }
+
+    /** 解码 → 缩到短边 [THUMB_SHORT_SIDE] → JPEG 字节；任一步失败返回 null。 */
+    private fun encodeThumb(file: File): ByteArray? = runCatching {
+        val full = BitmapFactory.decodeFile(file.absolutePath) ?: return@runCatching null
+        val shortSide = minOf(full.width, full.height)
+        if (shortSide <= 0) {
+            full.recycle()
+            return@runCatching null
+        }
+        val scale = THUMB_SHORT_SIDE.toFloat() / shortSide
+        val scaled = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                full,
+                (full.width * scale).toInt().coerceAtLeast(1),
+                (full.height * scale).toInt().coerceAtLeast(1),
+                true,
+            )
+        } else {
+            full
+        }
+        val out = java.io.ByteArrayOutputStream()
+        scaled.compress(Bitmap.CompressFormat.JPEG, 88, out)
+        if (scaled !== full) scaled.recycle()
+        full.recycle()
+        out.toByteArray()
+    }.getOrNull()
 
     /** 已经处理过的「景深检查请求号」——同一次请求不重复读。 */
     private var lastDepthProbedToken = 0L
@@ -1097,8 +1251,8 @@ internal object HookRuntime {
     /**
      * 把抓到的壁纸尺寸回写给模块，带上**空间标记**。
      *
-     * 界面导入替换图时要用**原图**的尺寸当对齐锚点（不是屏幕尺寸、也不是裁切矩形那份的尺寸，
-     * 见 [WallpaperSource.currentSize]）。而模块 app 进程自己往往读不到那些文件 ——
+     * 界面导入替换图时要用**原图**的尺寸当对齐锚点（不是屏幕尺寸、也不是裁切矩形那份的尺寸）。
+     * 而模块 app 进程自己往往读不到那些文件 ——
      * 本进程（com.miui.aod）读得到，顺手带回去；显示空间的尺寸只作诊断对照，别进锚点。
      */
     private fun reportWallpaperSize(context: Context, bitmap: Bitmap, sourceSpace: Boolean) =
@@ -1412,9 +1566,6 @@ internal object HookRuntime {
     fun vlog(message: String) {
         if (configValue?.verbose == true) log(message)
     }
-
-    /** 界面显示"已注入 xxx"时用的标签。 */
-    const val SELF_PROCESS_LABEL = "本应用（框架已注入）"
 
     /**
      * 系统设置里「景深开关」的键 —— 值 `2` = 开着

@@ -15,7 +15,8 @@ import java.io.File
  */
 internal object RasterServiceTarget {
 
-    private const val NAME = "raster_service_target.json"
+    /** 供 [RasterWallpaperService] 的 `FileObserver` 过滤文件名（2026-11-07）。 */
+    internal const val NAME = "raster_service_target.json"
 
     private fun file(ctx: Context) = File(ctx.filesDir, NAME)
     private fun tmp(ctx: Context) = File(ctx.filesDir, "$NAME.tmp")
@@ -27,13 +28,24 @@ internal object RasterServiceTarget {
      * 分两个文件就会出现「组换了、角度还是旧的」。
      *
      * @param panDeg 15..45（度）；越界按 25 兜底
+     * @param transition 过渡效果（0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃·扭曲）
      * @param settle 停顿时是否就近归位（默认开）
+     *
+     * 2026-11-07：生效中改 transition / settle 也会走这里，**实时**触发壁纸进程的
+     * `FileObserver`；`panDeg` 只在壁纸进程下次可见（`ensureContent`）时才被应用。
      */
-    fun write(ctx: Context, key: String, panDeg: Int = 25, settle: Boolean = true) {
+    fun write(
+        ctx: Context,
+        key: String,
+        panDeg: Int = 25,
+        transition: Int = 0,
+        settle: Boolean = true,
+    ) {
         runCatching {
             val json = org.json.JSONObject()
                 .put("key", key)
                 .put("panDeg", panDeg.coerceIn(15, 45))
+                .put("transition", transition.coerceIn(0, 3))
                 .put("settle", settle)
                 .put("at", System.currentTimeMillis())
             val f = tmp(ctx)
@@ -58,6 +70,13 @@ internal object RasterServiceTarget {
         if (!f.isFile) return true
         org.json.JSONObject(f.readText()).optBoolean("settle", true)
     }.getOrDefault(true)
+
+    /** 「过渡效果」：0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲；没写 / 读不出来按 **0**（= 加这个选项之前的行为）。 */
+    fun readTransition(ctx: Context): Int = runCatching {
+        val f = file(ctx)
+        if (!f.isFile) return 0
+        org.json.JSONObject(f.readText()).optInt("transition", 0).coerceIn(0, 3)
+    }.getOrDefault(0)
 
     /** 主进程：点「恢复默认」时清掉，免得壁纸进程下次可见还去加载。 */
     fun clear(ctx: Context) {

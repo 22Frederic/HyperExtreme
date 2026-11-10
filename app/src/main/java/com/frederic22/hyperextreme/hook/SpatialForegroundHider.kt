@@ -69,6 +69,9 @@ internal object SpatialForegroundHider {
     // ── 开关读取（300ms 缓存：方法调用频繁，属性反射不宜每次付） ──
     @Volatile private var cacheAt = 0L
     @Volatile private var cacheValue = false
+
+    /** 当前 Alive 卡是否带锁屏景深主体（`enabled()` 里顺手算好，`handle()` 直接用）。 */
+    @Volatile private var aliveDepthOn = false
     private const val CACHE_MS = 300L
 
     private fun enabled(): Boolean {
@@ -88,9 +91,24 @@ internal object SpatialForegroundHider {
             com.frederic22.hyperextreme.data.RasterFlag.PROP_SCOPE,
         ).trim().toIntOrNull() ?: MaskPrefs.SPATIAL_SCOPE_LOCK
         val rasterOn = rasterActive && rasterScope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
-        val v = spatialOn || rasterOn
+        // **Alive 壁纸同样要撤这一层**（2026-11-07）：它也挂在壁纸 leash 上、全屏不透明，
+        // 系统那层 `keyguard_foreground_layer`（主体抠像 + 景深色带）会压在它的图上面。
+        // 2026-11-08 起分两档：**有景深主体**（`alive_depth=1`）⇒ 保留这一层、
+        // 把里面的 `deducted_image_view` 换成我们的主体（见 [AliveOverlay]）；
+        // **没有主体** ⇒ 走"旧链"整层压掉。
+        val aliveActive = HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.AliveFlag.PROP_ACTIVE,
+        ).trim() == "1"
+        val aliveDepth = aliveActive && HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.AliveFlag.PROP_DEPTH,
+        ).trim() == "1"
+        aliveDepthOn = aliveDepth
+        val v = spatialOn || rasterOn || aliveActive
         if (v != cacheValue) {
-            log("开关 -> $v（空间=$spatialOn[$active/$scope] 光栅=$rasterOn[$rasterActive/$rasterScope]）")
+            log(
+                "开关 -> $v（空间=$spatialOn[$active/$scope] 光栅=$rasterOn[$rasterActive/$rasterScope] " +
+                    "Alive=$aliveActive/景深=$aliveDepth）",
+            )
         }
         cacheAt = now
         cacheValue = v
@@ -179,6 +197,17 @@ internal object SpatialForegroundHider {
         // 旧链：整层压掉
         SpatialOverlay.onDisabled()
         RasterOverlay.onDisabled()
+        // Alive 有主体 ⇒ 不压层：**摘掉系统主体 + 自己插一个主体 View**。
+        // ⚠️ 与光栅（`RasterOverlay`）逐字同构。不能只"保留层 + 换系统那个 ImageView 的图"——
+        //    那张图的 drawable / alpha / visibility 全由 KeyguardPanelViewController 每帧重算，
+        //    换上去会被覆盖、设可见会被 folme 翻回去（2026-11-08 踩过一整天）。
+        if (aliveDepthOn) {
+            AliveOverlay.detachSystemSubject(layer)
+            AliveOverlay.ensure(layer)
+            logOnceAliveDepth()
+            return
+        }
+        AliveOverlay.onDisabled()
         val view = layer as View
         if (Looper.myLooper() == Looper.getMainLooper()) {
             view.visibility = View.INVISIBLE
@@ -215,14 +244,21 @@ internal object SpatialForegroundHider {
             mgr.javaClass.getMethod("fullAodEnable").invoke(mgr) as? Boolean
         }.getOrNull() ?: return
         val scale = if (full) 1.05f else 1f
-        // 两套壁纸（空间 / 光栅）共用同一层，缩放口径也必须一致 —— 谁在跑谁吃这个值。
+        // 三套壁纸（空间 / 光栅 / Alive）共用同一层，缩放口径也必须一致 —— 谁在跑谁吃这个值。
         SpatialOverlay.setLeashScale(scale)
         RasterOverlay.setLeashScale(scale)
+        AliveOverlay.setLeashScale(scale)
     }
 
     private fun logOnceDepth() {
         if (logged.putIfAbsent("depth", true) == null) {
             log("锁屏景深开：前景层保留，只压系统主体 + 插入我们自己的主体 View")
+        }
+    }
+
+    private fun logOnceAliveDepth() {
+        if (logged.putIfAbsent("alive-depth", true) == null) {
+            log("Alive 景深开：摘掉系统主体 + 插入 Alive 自己的主体 View")
         }
     }
 

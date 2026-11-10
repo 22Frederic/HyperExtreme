@@ -31,7 +31,6 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.abs
-import kotlin.math.atan2
 import kotlin.math.roundToInt
 
 /**
@@ -100,9 +99,31 @@ internal object RasterRenderer {
      * 本次运行是否「停顿时就近归位」（`RasterFlag.PROP_SETTLE`）—— 2026-11-04。
      *
      * 开（默认）= 静止后补完当前一擦；关 = **停在两张之间不动**。
-     * 同样只在 [startInternal] 读一次（与「生效范围 / 最大幅度角度」一个语义）。
+     * 2026-11-07 起运行中可由 [applyRealtime] 热更新（启动时仍读一次做基线）。
      */
     private var settleOnIdle = true
+
+    /**
+     * 本次运行的「过渡效果」（`RasterFlag.PROP_TRANSITION`）：0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲 ——
+     * 2026-11-06 按 vivo 的 `styleId` 扩到四档。
+     *
+     * 2026-11-07 起运行中可由 [applyRealtime] 热更新（启动时仍读一次做基线）。
+     */
+    private var style = 0
+
+    /** 条纹周期（屏幕像素）= `screenW × 19/1200`；启动时按实际屏宽算好。 */
+    private var stripePeriodPx = 0f
+
+    /** 磨砂颗粒（屏幕像素）= `screenW × 2/1200`。 */
+    private var frostCellPx = 0f
+
+    /** 四档的中文名（日志用）。 */
+    private fun styleLabel(): String = when (style) {
+        RasterGlCore.STYLE_STRIPE -> "条纹玻璃"
+        RasterGlCore.STYLE_FROST -> "磨砂玻璃"
+        RasterGlCore.STYLE_TWIST -> "条纹玻璃（扭曲变形）"
+        else -> "默认"
+    }
 
     /** 给 [RasterOverlay] 的 AGSL 用：与 GL **同一个**压暗值（AOD 时两边必须同步）。 */
     internal fun aodDimValue(): Float = dim
@@ -167,6 +188,19 @@ internal object RasterRenderer {
     private var uDim = 0
     private var uFromUv = 0
     private var uToUv = 0
+    private var uStyle = 0
+    private var uTransWidth = 0
+    private var uAlphaTransWidth = 0
+    private var uMaskTransWidth = 0
+    private var uBumpScale = 0
+    private var uRefractionScale = 0
+    private var uDispersionFactor = 0
+    private var uShadowStrength = 0
+    private var uStripePeriodPx = 0
+    private var uFrostCellPx = 0
+    private var uScreenW = 0
+    private var uScreenH = 0
+    private var uLightDir = 0
 
     /** 组内图片文件名（顺序 = 浮页格子顺序，第 0 张就是基点图）。 */
     private var images: List<String> = emptyList()
@@ -234,6 +268,30 @@ internal object RasterRenderer {
     // AOD / 灭屏
     private var aodFrozen = false
     private var fullAod = false
+    /**
+     * **是否处于 AOD**（v1.20.5，2026-11-07）。
+     *
+     * 真值只有一个来源：[SpatialAod] 挂的 `doWallpaperBlackAnim(show)` —— `false` = 进 AOD、
+     * `true` = 回锁屏。所以只在 [onEnterAod] / [onExitAod] / [fadeOutOnUnlock] 三处翻
+     * （AOD 直接解锁不经过 `onExitAod`，必须由解锁那条自己清，否则标志残留 ⇒ 回锁屏
+     * 主体永远不显）。
+     *
+     * 为什么必须独立成状态位：AOD 与锁屏共用同一条 leash、同一个 [lockScs]，但语义相反 ——
+     * AOD 要「壁纸可见 + 主体不可见」。复位通道不知道自己在 AOD 里，会把主体一起拉回来
+     * （v1.20.5 真机 bug：进 AOD 被复位 ⇒ 主体留在 AOD 上）。
+     */
+    @Volatile private var aodActive = false
+    /** AOD 归位驱动（null = 没有在跑）。只在 GL 线程读写。 */
+    private var aodHomeTick: Runnable? = null
+    /**
+     * AOD 归位的代际号（2026-11-06，照抄 `SpatialRenderer.aodGen` 的教训）。
+     *
+     * `removeCallbacks` 只能摘掉**还没出队**的那条；tick 已在跑时取消会落空，
+     * 它会在结尾把 `aodFrozen` 又写成 true。取消时自增代际，tick 每帧先比对，过期直接退出。
+     */
+    private var aodHomeGen = 0
+    /** AOD 归位时长（毫秒）—— 与空间壁纸 `HOME_DURATION_MS` 同一手感。 */
+    private val AOD_HOME_MS = 750L
     /** AOD 压暗系数（1 = 原亮度）。**volatile**：景深层 AGSL 在主线程读同一个值。 */
     @Volatile private var dim = 1f
     private var screenReceiver: BroadcastReceiver? = null
@@ -426,6 +484,19 @@ internal object RasterRenderer {
         uDim = GLES20.glGetUniformLocation(program, "uDim")
         uFromUv = GLES20.glGetUniformLocation(program, "uFromUv")
         uToUv = GLES20.glGetUniformLocation(program, "uToUv")
+        uStyle = GLES20.glGetUniformLocation(program, "uStyle")
+        uTransWidth = GLES20.glGetUniformLocation(program, "uTransWidth")
+        uAlphaTransWidth = GLES20.glGetUniformLocation(program, "uAlphaTransWidth")
+        uMaskTransWidth = GLES20.glGetUniformLocation(program, "uMaskTransWidth")
+        uBumpScale = GLES20.glGetUniformLocation(program, "uBumpScale")
+        uRefractionScale = GLES20.glGetUniformLocation(program, "uRefractionScale")
+        uDispersionFactor = GLES20.glGetUniformLocation(program, "uDispersionFactor")
+        uShadowStrength = GLES20.glGetUniformLocation(program, "uShadowStrength")
+        uStripePeriodPx = GLES20.glGetUniformLocation(program, "uStripePeriodPx")
+        uFrostCellPx = GLES20.glGetUniformLocation(program, "uFrostCellPx")
+        uScreenW = GLES20.glGetUniformLocation(program, "uScreenW")
+        uScreenH = GLES20.glGetUniformLocation(program, "uScreenH")
+        uLightDir = GLES20.glGetUniformLocation(program, "uLightDir")
 
         // 位置 + UV（Bitmap 第 0 行在顶部，GL 的 (0,0) 在左下 ⇒ v 要反过来）
         val verts = floatArrayOf(
@@ -481,6 +552,19 @@ internal object RasterRenderer {
             com.frederic22.hyperextreme.data.RasterFlag.PROP_SETTLE,
         ).trim() != "0"
         HookRuntime.log("RASTER 停顿时就近归位=${if (settleOnIdle) 1 else 0}")
+
+        // 「过渡效果」：同样只读一次；属性没写 / 非法按 0（= 加这个选项之前的行为）。
+        style = HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.RasterFlag.PROP_TRANSITION,
+        ).trim().toIntOrNull()?.coerceIn(0, 3) ?: 0
+        // 周期 / 颗粒都按**屏宽等比**（19px、2px @1200）。像素口径 ⇒ AOD 的 5% 缩放不会变形。
+        stripePeriodPx = screenW * (RasterGlCore.STRIPE_PERIOD_PX_1200 / RasterGlCore.STRIPE_BASE_W)
+        frostCellPx = screenW * (RasterGlCore.FROST_CELL_PX_1200 / RasterGlCore.STRIPE_BASE_W)
+        HookRuntime.log(
+            "RASTER 过渡效果=${styleLabel()}" +
+                "（条纹周期 ${"%.1f".format(stripePeriodPx)}px、" +
+                "磨砂颗粒 ${"%.1f".format(frostCellPx)}px @ ${screenW}px 宽）",
+        )
 
         dirty = true
         runningKey = key
@@ -599,6 +683,8 @@ internal object RasterRenderer {
         val had = runningKey != null
         runningKey = null
         runningScope = -1
+        // 渲染器重建 ⇒ AOD 状态一起归零（否则下次启动会带着上一轮的 true，主体永不复位）。
+        aodActive = false
         runCatching { sensorListener?.let { sensorManager?.unregisterListener(it) } }
         runCatching { screenReceiver?.let { appCtx?.unregisterReceiver(it) } }
         sensorListener = null
@@ -657,6 +743,7 @@ internal object RasterRenderer {
         lastDrawnDim = -1f
         aodFrozen = false
         fullAod = false
+        cancelAodHoming()
         dim = 1f
         currentAlpha = 1f
         cancelFade()
@@ -973,6 +1060,30 @@ internal object RasterRenderer {
         HookRuntime.log("RASTER 基点重设（$reason）")
     }
 
+    /**
+     * 「过渡效果 / 停顿时就近归位」**运行中热更新**（2026-11-07）。
+     *
+     * 由 `HookEntry` 的属性轮询在这两项变化时调用。它们都是纯渲染参数：不换图、
+     * 不拆渲染器、不重载纹理 ⇒ 只改字段 + 补一帧即可。按用户要求，改完**立刻硬切
+     * 归位一次**（此刻画面在模块手里，跳变可接受）。
+     *
+     * ⚠️ 角度 `PROP_PAN_DEG` 故意不在这里读：分母变了会让 `t = pan/panMaxRad` 跳图，
+     * 它维持「下一次替换（重启渲染器）」才生效。
+     */
+    internal fun applyRealtime(newStyle: Int, newSettle: Boolean) {
+        handler?.post {
+            if (runningKey == null) return@post
+            if (newStyle == style && newSettle == settleOnIdle) return@post
+            style = newStyle.coerceIn(0, 3)
+            settleOnIdle = newSettle
+            HookRuntime.log(
+                "RASTER 参数热更新：过渡效果=${styleLabel()}" +
+                    " 停顿时就近归位=${if (settleOnIdle) 1 else 0}",
+            )
+            resetNow("过渡效果/停顿归位实时更新")
+        }
+    }
+
     // ───────────────────────────── 灭屏 / AOD ─────────────────────────────
 
     private fun watchScreen(ctx: Context) {
@@ -983,7 +1094,13 @@ internal object RasterRenderer {
                     Intent.ACTION_SCREEN_OFF -> onScreenOff()
                     // 灭亮屏后系统会停掉传感器，必须重新注册（空间壁纸踩过同一个坑）。
                     Intent.ACTION_SCREEN_ON -> handler?.post {
+                        // 诊断（2026-11-07）：亮屏这一刻的压暗值 / 冻结状态是关键证据。
+                        HookRuntime.log(
+                            "RASTER 亮屏兜底 dim=${"%.2f".format(dim)} " +
+                                "frozen=$aodFrozen transFrozen=$transitionFrozen",
+                        )
                         // 灭屏那一帧置的冻结必须在这里解开 —— 没有 AOD 的机型不会走 onExitAod。
+                        cancelAodHoming()
                         aodFrozen = false
                         unfreezeTransition()
                         reregisterSensor(c ?: ctx)
@@ -1028,6 +1145,11 @@ internal object RasterRenderer {
     private fun onScreenOff() {
         handler?.post {
             if (runningKey == null) return@post
+            // **灭屏这一刻就要把锁屏份抬起来**（v1.20.6）：锁屏/AOD 马上就会出现，
+            // 而复位入口还被 800ms 淡出锁存挡着 ⇒ 那段时间锁屏露的是系统原壁纸
+            // （真机日志实测 387ms）。这里旁路锁存先抬 alpha；**不补帧**（灭屏时
+            // 任何 swap 都可能阻塞），内容仍是最后那一帧锁屏画面，AOD 进入时会重画。
+            raiseLockedNow("灭屏", draw = false)
             aodFrozen = true
             resetRun?.let { handler?.removeCallbacks(it) }
             val r = Runnable {
@@ -1040,49 +1162,143 @@ internal object RasterRenderer {
 
     /**
      * 进入 AOD。`black` 是系统给的目标压暗值：
-     * * **1.0** = 自定义 AOD ⇒ 立刻重设基点（无过渡）；
-     * * **0.5** = 与锁屏一致的全屏 AOD ⇒ 先只压暗，退出时再带过渡擦回。
+     * * **1.0** = 自定义 AOD ⇒ 立刻重设基点（无过渡，屏已全黑）；
+     * * **0.5** = 与锁屏一致的全屏 AOD ⇒ **先归位（750ms）再冻结**（2026-11-06 用户要求）。
+     *
+     * 全屏 AOD 的归位**不受「停顿时就近归位」开关影响**：那个开关管的是"停在两张之间"，
+     * 这里必须回到第 1 张 —— 与退出 AOD 后的基准一致，否则 AOD 里就停在半擦状态。
      */
     fun onEnterAod(black: Float) {
         handler?.post {
             if (runningKey == null) return@post
-            aodFrozen = true
+            aodActive = true
             dim = (1f - black.coerceIn(0f, 1f))
+            // 诊断（2026-11-07）：自定义 AOD 下 black=1.0 ⇒ dim=0（全黑），最容易暴露「不恢复」。
+            HookRuntime.log(
+                "RASTER AOD 进入 black=${"%.2f".format(black)} dim=${"%.2f".format(dim)} " +
+                    "frozen=$aodFrozen transFrozen=$transitionFrozen",
+            )
+            // **AOD 第一帧就要可见**（v1.20.5）：进 AOD 可能紧跟在一次解锁淡出之后
+            // （解锁 → 立刻按电源），此时 alpha 还停在 0、800ms 锁存又把复位压到 ~817ms 后
+            // ⇒ 那 817ms 里 AOD 露的是系统原壁纸。这里旁路锁存直接抬，窗口归零。
+            raiseLockedNow("进入 AOD")
             // 景深主体同步淡出（它在窗口里，AOD 时不该留在屏上）。
             runCatching { RasterOverlay.onEnterAod() }
             if (black >= 0.99f) {
                 fullAod = false
                 resetRun?.let { handler?.removeCallbacks(it) }
                 resetRun = null
+                cancelAodHoming()
+                aodFrozen = true
                 resetNow("进入自定义 AOD")
             } else {
                 fullAod = true
                 resetRun?.let { handler?.removeCallbacks(it) }
                 resetRun = null
+                // 归位期间必须能画 ⇒ 先解冻，归位 tick 落地时才置 true。
+                aodFrozen = false
+                startAodHoming()
             }
             dirty = true
             renderIfNeeded(force = true)
         }
     }
 
-    /** 退出 AOD（回锁屏）：解冻 + 压暗复位 + **重注册传感器** + 补一帧；全屏 AOD 还要"带过渡擦回第一张"。 */
+    /**
+     * AOD 归位：用 handler 节拍把 `pan` 抹回 0（第 1 张），**不依赖陀螺仪**
+     * （灭屏时系统会停掉这个非 wake-up 传感器 —— 空间壁纸 2026-10-29 实证）。
+     *
+     * 曲线与 `SpatialRenderer.startAodHomingLocked` 逐字一致：ease-out quartic / 750ms。
+     * 归位**落地后才冻结**，期间保持重绘。
+     */
+    private fun startAodHoming() {
+        // **幂等早退**：AOD 期间系统会反复调 `doWallpaperBlackAnim`（真机日志：0.1~1.8s 一次），
+        // 每次重开 750ms 动画会让归位永远走不到终点。已经在跑就不再重启。
+        if (aodHomeTick != null) return
+        // 已经在第 1 张：不用动画，直接冻结。
+        if (abs(pan) < 1e-4f) {
+            pan = 0f
+            aodFrozen = true
+            HookRuntime.log("RASTER AOD 归位：本来就在第 1 张 ⇒ 直接冻结")
+            return
+        }
+        // 归位的目标就是第 1 张 ⇒ 正在跑的收尾 / 擦回都作废，否则会和归位抢 pan。
+        cancelSnap()
+        cancelHome()
+        val from = pan
+        val t0 = SystemClock.elapsedRealtime()
+        val gen = ++aodHomeGen
+        val tick = object : Runnable {
+            override fun run() {
+                // 已被取消 / 被新一次归位顶掉 ⇒ 立刻退出，**绝不写 aodFrozen**。
+                if (gen != aodHomeGen) return
+                if (runningKey == null) {
+                    aodHomeTick = null
+                    return
+                }
+                val t = ((SystemClock.elapsedRealtime() - t0).toFloat() / AOD_HOME_MS)
+                    .coerceIn(0f, 1f)
+                val u = 1f - t
+                val u2 = u * u
+                val eased = 1f - u2 * u2
+                pan = from * (1f - eased)
+                dirty = true
+                renderIfNeeded(force = true)
+                if (t >= 1f) {
+                    pan = 0f
+                    lastGyroAt = 0L
+                    gyroRate = 0f
+                    aodFrozen = true
+                    aodHomeTick = null
+                    HookRuntime.log("RASTER AOD 归位完成 → 冻结（不再响应传感器）")
+                    return
+                }
+                handler?.postDelayed(this, 16L)
+            }
+        }
+        aodHomeTick = tick
+        handler?.post(tick)
+        HookRuntime.log("RASTER AOD 归位：${"%.3f".format(from)} → 0 rad（${AOD_HOME_MS}ms）")
+    }
+
+    private fun cancelAodHoming() {
+        aodHomeGen++
+        aodHomeTick?.let { handler?.removeCallbacks(it) }
+        aodHomeTick = null
+    }
+
+    /**
+     * 退出 AOD（回锁屏）：解冻 + 压暗复位 + **重注册传感器** + 补一帧。
+     *
+     * **不再「带过渡擦回第一张」**（2026-11-06）：进入 AOD 时已经归位到第 1 张，
+     * 这里再 `armHomeWipe()` 会挂一个"等第一个运动方向"的待命，把退出后的**第一次转头吞掉**。
+     */
     fun onExitAod() {
         handler?.post {
             if (runningKey == null) return@post
+            aodActive = false
+            // 归位没跑完就退出 ⇒ 作废，别让它的 tick 落地又把自己冻回去。
+            cancelAodHoming()
             aodFrozen = false
             unfreezeTransition()
             dim = 1f
+            // 诊断（2026-11-07）：确认退出回调真的到过、以及当时的冻结状态。
+            HookRuntime.log(
+                "RASTER AOD 退出 dim→1.00 frozen=$aodFrozen " +
+                    "transFrozen=$transitionFrozen",
+            )
             // 景深主体淡回 1（幂等兜底，与空间壁纸同一处）。
             runCatching { RasterOverlay.onExitAod() }
             lastGyroAt = 0L
             gyroRate = 0f
             // 灭屏时系统会停掉这个非 wake-up 传感器，不重注册就一直静止（空间壁纸 2026-10-29 实证）。
             appCtx?.let { reregisterSensor(it) }
+            // **回锁屏必须可见**（v1.20.5）：自定义 AOD 全程黑屏，进 AOD 时若是停在淡出的 0 上
+            // （锁存没落地 / 压根没有 raise 来过）根本看不出来，退出时也没人再抬 ⇒ 锁屏缺图。
+            // 放在 forceDraw 之前：写完 alpha 再补帧，一帧到位。
+            raiseLockedNow("退出 AOD")
             forceDraw()
-            if (fullAod) {
-                fullAod = false
-                armHomeWipe()
-            }
+            fullAod = false
         }
     }
 
@@ -1118,6 +1334,12 @@ internal object RasterRenderer {
             }
             // 冻结同样要解：AOD 里 aodFrozen=true，这条路径上没有 onExitAod 帮它解。
             // 两个标志都要清：aodFrozen 拦的是绘制，transitionFrozen 拦的是采样/重绘。
+            // AOD 归位 tick 也必须作废 —— 否则它落地后会把 aodFrozen 又写成 true
+            // （空间壁纸 v1.17.6 真机日志实证的顺序）。
+            cancelAodHoming()
+            // **AOD 直接解锁不经过 `onExitAod()`** ⇒ 标志必须在这里清（v1.20.5），
+            // 否则残留 true 会让下一次回锁屏的复位只抬 GL 份、主体永远不显。
+            aodActive = false
             aodFrozen = false
             unfreezeTransition()
             if (lockScs.isEmpty()) {
@@ -1236,6 +1458,21 @@ internal object RasterRenderer {
 
     private fun requestRaiseLocked(h: Handler) {
         if (runningKey == null) return
+        // **AOD 里没有「锁屏界面」**（v1.20.5，2026-11-07）：这里同时是「锁存泵 ~817ms 落地」
+        // 和「亮屏兜底」的必经之路。AOD 期间到达的复位只允许抬 GL 份（AOD 显示的就是它），
+        // **绝不能碰景深主体** —— 主体由 `RasterOverlay.onEnterAod()` 淡到 0，被这里一拉就
+        // 留在 AOD 上了（真机 bug）。主体恢复交给 `onExitAod()` / 解锁那条路。
+        if (aodActive) {
+            raiseLockedNow("AOD 中收到复位")
+            return
+        }
+        // **灭屏态完全不该受锁存约束**（v1.20.7）：锁存是给「解锁动画期间的复位噪声」用的，
+        // 而灭屏 / 进 AOD 时屏幕已经不交互，不可能还在解锁 —— 这时还把复位拖着，屏一亮
+        // 就是系统原壁纸（真机：AOD 首帧 1~2 帧的"极快闪一下"）。draw=false：灭屏 swap 会阻塞。
+        if (!screenOn()) {
+            raiseLockedNow("灭屏态复位", draw = false)
+            return
+        }
         // 闸 1：淡出还在跑 —— 只登记，让它自己跑完（打断会让 alpha 冻在半路）。
         if (fadeTick != null) {
             pendingRaise = true
@@ -1276,6 +1513,43 @@ internal object RasterRenderer {
             // 复位只写了 alpha，内容还是淡出前那一帧 ⇒ 必须重画（否则锁屏静止时永远是旧图）。
             forceDraw()
         }
+    }
+
+    /**
+     * **立刻把锁屏份抬到 1，旁路淡出锁存**（v1.20.5，2026-11-07）。
+     *
+     * 锁存（[FADE_LATCH_MS]）是「解锁动画期间别闪回」的时间闸 —— 它只在**解锁**语境里成立。
+     * AOD 不是解锁，它要的是**当帧可见**：真机日志实测，解锁淡出落地 540ms 后锁屏出现触发复位，
+     * 被闸挡下 ⇒ 泵到 817ms 才放行，而那时早已进了 AOD（`RASTER AOD 进入` 之后 260ms）——
+     * 屏上先露系统原壁纸、再"恢复我们的层"，就是这 817ms。
+     *
+     * **只碰 GL 锁屏份，绝不碰景深主体**（主体在 AOD 里必须保持 0，由 [RasterOverlay] 自己管）。
+     *
+     * 同时清掉 pending 与锁存：这次抬升已经达成了复位的全部目的，泵不必再补一发。
+     */
+    private fun raiseLockedNow(reason: String, draw: Boolean = true) {
+        // 正在跑淡出就先掐掉：它的 tick 每 16ms 用**自己记的** lastA 覆写 alpha，
+        // 不掐的话我们抬到 1 会被下一帧拉回去（AOD 里 = 继续露系统壁纸）。
+        cancelFade()
+        // 淡出是在 `fadeOutOnUnlock` 里 `freezeTransition()` 开的、跑完才解 —— 半路掐掉就
+        // 永远停着，接下来 2s 的所有重绘都被闸掉（屏上停在旧帧）。必须在这里解（v1.20.6）。
+        unfreezeTransition()
+        fadeDoneAt = 0L
+        pendingRaise = false
+        raiseScheduled = false
+        // 灭屏 / AOD / AOD 中复位，此刻都在**锁屏侧**：桌面份不该再画（也保证下面补帧落到锁屏 SC）。
+        showingDesktop = false
+        val scs = lockScs
+        if (scs.isEmpty()) return
+        if (currentAlpha >= 0.99f) return
+        // **先补帧、再抬 alpha**：反过来的话 SF 会拿「新 alpha + 上一帧（旧亮度）」合成一帧，
+        // 肉眼就是"极快的闪一下"（v1.20.6）。灭屏路径 `draw=false`：那时 swap 可能阻塞。
+        if (draw) {
+            dirty = true
+            renderIfNeeded(force = true)
+        }
+        HookRuntime.log("RASTER 抬 alpha（$reason：${"%.2f".format(currentAlpha)} → 1.00）")
+        applyAlphaTo(scs, 1f)
     }
 
     /** 排一次补发（**防重复 post**：同一个 pending 只排一次）。 */
@@ -1586,11 +1860,11 @@ internal object RasterRenderer {
             t = 0f
         }
 
-        // **景深层同帧同步**（2026-11-04）：把与背景**完全相同**的 (from, to, t, dir) 推给
+        // **景深层同帧同步**（2026-11-04）：把与背景**完全相同**的 (from, to, t, dir, style) 推给
         // [RasterOverlay] —— 两边各算一遍迟早漂移，主体就会和背景错位。
-        // 没开景深时它自己空转（view 为 null 直接 return）。
+        // 2026-11-06：连「过渡效果」档位一起推（主体也要跟着做同一档玻璃）。
         if (runningLockDepth) {
-            runCatching { RasterOverlay.onSceneChanged(fromIdx, toIdx, t, dir) }
+            runCatching { RasterOverlay.onSceneChanged(fromIdx, toIdx, t, dir, style) }
         }
 
         GLES20.glViewport(0, 0, screenW, screenH)
@@ -1626,8 +1900,23 @@ internal object RasterRenderer {
         GLES20.glUniform1f(uDir, dir)
         GLES20.glUniform4f(uFromUv, uvF[0], uvF[1], uvF[2], uvF[3])
         GLES20.glUniform4f(uToUv, uvT[0], uvT[1], uvT[2], uvT[3])
-        GLES20.glUniform1f(uBand, RasterGlCore.BAND)
         GLES20.glUniform1f(uDim, dim)
+        // 「过渡效果」四档：两条链共用同一份 shader ⇒ 参数含义唯一。
+        // 周期 / 颗粒 / 屏宽都按像素传，shader 里不用 uv（AOD 的 5% leash 缩放不影响条纹粗细）。
+        val sp = RasterGlCore.paramsOf(style)
+        GLES20.glUniform1f(uStyle, style.toFloat())
+        GLES20.glUniform1f(uTransWidth, RasterGlCore.VIVO_TRANS_WIDTH)
+        GLES20.glUniform1f(uAlphaTransWidth, RasterGlCore.VIVO_ALPHA_TRANS_WIDTH)
+        GLES20.glUniform1f(uMaskTransWidth, RasterGlCore.VIVO_MASK_TRANS_WIDTH)
+        GLES20.glUniform1f(uBumpScale, sp.bump)
+        GLES20.glUniform1f(uRefractionScale, sp.refract)
+        GLES20.glUniform1f(uDispersionFactor, sp.dispersion)
+        GLES20.glUniform1f(uShadowStrength, sp.shadow)
+        GLES20.glUniform1f(uStripePeriodPx, stripePeriodPx.coerceAtLeast(1f))
+        GLES20.glUniform1f(uFrostCellPx, frostCellPx.coerceAtLeast(0.5f))
+        GLES20.glUniform1f(uScreenW, screenW.toFloat().coerceAtLeast(1f))
+        GLES20.glUniform1f(uScreenH, screenH.toFloat().coerceAtLeast(1f))
+        GLES20.glUniform3f(uLightDir, sp.lightX, RasterGlCore.TWIST_LIGHT_Y, RasterGlCore.TWIST_LIGHT_Z)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(aPos)
         GLES20.glDisableVertexAttribArray(aUv)

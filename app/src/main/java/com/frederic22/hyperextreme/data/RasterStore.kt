@@ -88,7 +88,6 @@ internal object RasterStore {
     const val CARD_SHORT_SIDE = 540
 
     /** 浮页排序行的小缩略图**短边**（显示只有 32×56dp）。 */
-    const val ROW_SHORT_SIDE = 160
 
     /**
      * 图片文件名前缀；**内容指纹**编在名字里，格式 `img_<时间戳>_<16位hex>.<ext>`。
@@ -421,6 +420,75 @@ internal object RasterStore {
         ok
     }.onFailure { Log.w(TAG, "导入遮罩失败：${it.message}") }.getOrDefault(false)
 
+    /**
+     * **通用版探测**：目标换成任意壁纸文件（Alive 用，2026-11-08）。
+     *
+     * 判据、采样尺寸、返回结构都与 [probeSubject] 完全一致，只是不依赖 `RasterGroup`。
+     */
+    fun probeSubjectOf(ctx: Context, target: File, uri: Uri): SubjectProbe? =
+        runCatching {
+            if (!target.isFile) return null
+            val dstW = boundsOf(target)?.first ?: return null
+            val dstH = boundsOf(target)?.second ?: return null
+            val srcBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            ctx.contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, srcBounds)
+            }
+            val srcW = srcBounds.outWidth
+            val srcH = srcBounds.outHeight
+            if (dstW <= 0 || dstH <= 0 || srcW <= 0 || srcH <= 0) return null
+            val sample = decodeSampled(ctx, uri, PROBE_SHORT_SIDE) ?: return null
+            val kind = classify(sample)
+            sample.recycle()
+            SubjectProbe(srcW, srcH, dstW, dstH, kind)
+        }.onFailure { Log.w(TAG, "探测遮罩失败：${it.message}") }.getOrNull()
+
+    /**
+     * **通用版导入**：把用户选的图存成**主体**，直接写到 [out]（Alive 用）。
+     *
+     * * [SubjectKind.SUBJECT]：缩放到与原图同尺寸后存；
+     * * [SubjectKind.MASK]：`maskOf` 定遮罩来源 → [MaskComposer.compose] 合成（黑→透明、白→保留）。
+     *
+     * 与 [applySubject] 同一套算法，只是输出路径由调用方给。
+     */
+    fun applySubjectOf(
+        ctx: Context,
+        target: File,
+        uri: Uri,
+        kind: SubjectKind,
+        out: File,
+    ): Boolean = runCatching {
+        if (kind == SubjectKind.INVALID) return false
+        if (!target.isFile) return false
+        val wallpaper = decodeSampled(target, WORK_SHORT_SIDE) ?: return false
+        val chosen = decodeSampled(ctx, uri, WORK_SHORT_SIDE) ?: run {
+            wallpaper.recycle()
+            return false
+        }
+        val result = when (kind) {
+            SubjectKind.SUBJECT -> {
+                val scaled = Bitmap.createScaledBitmap(
+                    chosen, wallpaper.width, wallpaper.height, true,
+                )
+                if (scaled !== chosen) chosen.recycle()
+                scaled
+            }
+            else -> {
+                val mask = maskOf(chosen)
+                val composed = MaskComposer.compose(wallpaper, mask)
+                if (mask !== chosen) mask.recycle()
+                chosen.recycle()
+                composed
+            }
+        }
+        wallpaper.recycle()
+        val ok = out.outputStream().use {
+            result.compress(Bitmap.CompressFormat.PNG, 100, it)
+        }
+        result.recycle()
+        ok && out.isFile
+    }.onFailure { Log.w(TAG, "导入遮罩失败：${it.message}") }.getOrDefault(false)
+
     /** 读文件尺寸（只读 bounds）。 */
     private fun boundsOf(f: File): Pair<Int, Int>? = runCatching {
         val b = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -428,8 +496,21 @@ internal object RasterStore {
         if (b.outWidth <= 0 || b.outHeight <= 0) null else b.outWidth to b.outHeight
     }.getOrNull()
 
+    /**
+     * 只判「这张图是主体还是遮罩」—— 锁屏遮罩页选完图后调它（IO 线程）。
+     *
+     * 判据与光栅的组合编辑**完全同一套**（[classify] 的两条规则），只是不需要和壁纸比尺寸：
+     * 锁屏遮罩那条链只要一张图，钩子侧会自己按 alpha 合成白剪影。
+     */
+    fun probeKind(file: File): SubjectKind = runCatching {
+        val sample = decodeSampled(file, PROBE_SHORT_SIDE) ?: return SubjectKind.INVALID
+        val kind = classify(sample)
+        sample.recycle()
+        kind
+    }.onFailure { Log.w(TAG, "判定主体/遮罩失败：${it.message}") }.getOrDefault(SubjectKind.INVALID)
+
     /** 采样分类（见 [probeSubject] 的规则表）。 */
-    private fun classify(bmp: Bitmap): SubjectKind {
+    internal fun classify(bmp: Bitmap): SubjectKind {
         val w = bmp.width
         val h = bmp.height
         if (w <= 0 || h <= 0) return SubjectKind.INVALID
@@ -588,9 +669,6 @@ internal object RasterStore {
      * 短边采到 1200（服务自己会缩到长边 1600），内存约 12MB，不会 OOM。
      */
     fun decodeForMask(file: File): Bitmap? = decodeSampled(file, 1200)
-
-    /** 浮页行的小缩略图（按短边 [ROW_SHORT_SIDE] 采样）。 */
-    fun decodeRow(file: File): Bitmap? = decodeSampled(file, ROW_SHORT_SIDE)
 
     /**
      * 解码并按短边 [maxShort] 做 `inSampleSize` 采样。

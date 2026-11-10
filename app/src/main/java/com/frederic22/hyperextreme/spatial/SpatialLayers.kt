@@ -10,10 +10,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 
 /**
  * 空间壁纸：**层图与位移场生成**（app 进程，同步阻塞，调用方放 IO 线程）。
@@ -702,30 +700,8 @@ internal object SpatialLayers {
 
         // 统计（判据 + 自适应层数）
         var fgPx = 0
-        var fgSum = 0.0
-        var fgSq = 0.0
-        var bgSum = 0.0
-        var bgSq = 0.0
-        var bgMin = 1f
-        var bgMax = 0f
-        for (i in 0 until n) {
-            val d = depthMed[i]
-            if (bodyMask[i]) {
-                fgPx++
-                fgSum += d
-                fgSq += d.toDouble() * d
-            } else {
-                bgSum += d
-                bgSq += d.toDouble() * d
-                if (d < bgMin) bgMin = d
-                if (d > bgMax) bgMax = d
-            }
-        }
-        val bgPx = n - fgPx
+        for (i in 0 until n) if (bodyMask[i]) fgPx++
         val fgRatio = fgPx.toFloat() / n
-        val fgSpread = stdOf(fgSum, fgSq, fgPx)
-        val bgSpread = stdOf(bgSum, bgSq, bgPx)
-        val bgRange = bgMax - bgMin
         val separation = otsuFull.separation
         val band = hi - lo
 
@@ -2227,7 +2203,6 @@ internal object SpatialLayers {
                 sum -= (alpha[row + (x - r).coerceIn(0, w - 1)].toInt() and 0xFF)
             }
         }
-        val col = IntArray(h)
         for (x in 0 until w) {
             var sum = 0
             for (y in -r..r) sum += tmp[y.coerceIn(0, h - 1) * w + x]

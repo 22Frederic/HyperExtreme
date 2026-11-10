@@ -49,6 +49,18 @@ internal object SpatialAod {
     /** 同一条日志只打一次（方法每次进/出 AOD 都会调，但没必要每次都刷）。 */
     private val logged = ConcurrentHashMap<String, Boolean>()
 
+    /**
+     * **诊断日志**（2026-11-07，排查「AOD 自定义模式 → 锁屏压暗不恢复」）。
+     *
+     * `doWallpaperBlackAnim` 在 AOD 期间会被系统反复调（真机实测 0.1~1.8s 一次），
+     * 全打会刷爆日志；但 `show` 变化那一刻必须留痕，否则无法判断某次退出到底
+     * 收没收 `show=true`。⇒ **状态跳变必打，同状态节流 2s 一条**。
+     * 本轮只加日志，不改任何压暗 / 冻结逻辑。
+     */
+    @Volatile private var callLogAt = 0L
+    @Volatile private var callLogShow = -1 // -1 未初始化 / 0 = false / 1 = true
+    private const val CALL_LOG_MS = 2000L
+
     /** 与 [SpatialForegroundHider] / [SpatialUnlockFade] 同一判据 + 300ms 缓存。 */
     @Volatile private var cacheAt = 0L
     @Volatile private var cacheValue = false
@@ -86,12 +98,40 @@ internal object SpatialAod {
                     val show = args.getOrNull(0) as? Boolean
                         ?: args.filterIsInstance<Boolean>().firstOrNull()
                     val black = args.filterIsInstance<Float>().firstOrNull()
+                    // ⚠️ **Alive 在跑时把这次压黑整个拦掉**（2026-11-07）。
+                    //
+                    // HyperOS 的自定义 AOD 会给 `black = 1.0`，系统随后把壁纸层压到全黑；
+                    // 我们的 SC 挂在壁纸 leash 下，会被一起压暗 ⇒ AOD 里只剩黑屏，
+                    // 「启航」的小球根本看不见（真机日志 black=1.00 / dim=0.00 已证实）。
+                    //
+                    // 只拦 Alive 这一条：四条壁纸链互斥，此刻空间 / 光栅不可能在跑；
+                    // 而 Alive 需要 AOD 持续自转，本来就不能让系统把壁纸压没。
+                    if (show == false && AliveRenderer.isRunning()) {
+                        runCatching { AliveRenderer.onEnterAod(black ?: 1f) }
+                        log(
+                            "Alive 在跑 ⇒ 拦下 doWallpaperBlackAnim（不压黑，" +
+                                "black=${"%.2f".format(black ?: 1f)}）",
+                        )
+                        return null
+                    }
                     val result = chain.proceed()
                     if (show == null || black == null) return result
+                    // 诊断：每次调用的 show/black 都要能复盘（状态跳变必打，同状态 2s 一条）。
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    val s = if (show) 1 else 0
+                    if (s != callLogShow || now - callLogAt >= CALL_LOG_MS) {
+                        callLogShow = s
+                        callLogAt = now
+                        log("call show=$show black=${"%.2f".format(black)} @$now")
+                    }
                     // **光栅壁纸也要这套时机**（2026-11-04）：它不做静止归位，只在这里重设基点。
                     // 与空间壁纸的开关无关，各自判各自在不在跑（没跑就是空操作）。
                     runCatching {
                         if (show) RasterRenderer.onExitAod() else RasterRenderer.onEnterAod(black)
+                    }
+                    // Alive 壁纸也吃同一个时机（没在跑就是空操作）。
+                    runCatching {
+                        if (show) AliveRenderer.onExitAod() else AliveRenderer.onEnterAod(black)
                     }
                     if (!enabled()) return result
                     runCatching {

@@ -34,6 +34,7 @@ import com.frederic22.hyperextreme.applyAppSystemBars
 import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.data.MaskRole
 import com.frederic22.hyperextreme.data.MaskStore
+import com.frederic22.hyperextreme.data.RasterStore
 import com.frederic22.hyperextreme.requestHighRefreshRate
 import com.frederic22.hyperextreme.resolveAppDark
 import kotlinx.coroutines.Dispatchers
@@ -41,7 +42,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.theme.ThemeController
 import top.yukonga.miuix.kmp.window.WindowDialog
 import java.io.File
 
@@ -85,10 +85,8 @@ class MaskDetailActivity : ComponentActivity() {
         setContent {
             val prefs = remember { MaskPrefs(this) }
             val themeMode = remember { ThemeMode.of(prefs.themeMode) }
-            // ThemeController 的 colorSchemeMode 是 val，只能换实例来切换深浅色。
-            val controller = remember(themeMode) {
-                ThemeController(colorSchemeMode = themeMode.toColorSchemeMode())
-            }
+            // 「启用Monet颜色」二级页只读一次（本页不提供切换入口，重开生效），与 themeMode 同一口径。
+            val controller = rememberThemeController(themeMode, remember { prefs.monetColor })
             // textStyles 与一级页面一致（[HyperTextStyles]，见该文件里的说明）。
             MiuixTheme(controller = controller, textStyles = HyperTextStyles) {
                 MaskDetailScreen(page = page, onClose = { finish() })
@@ -169,9 +167,7 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
     val picker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
-        val role = state.pendingRole
-        state.pendingRole = null
-        if (uri == null || role == null) return@rememberLauncherForActivityResult
+        if (uri == null) return@rememberLauncherForActivityResult
 
         scope.launch {
             // 兜底：从点"选择图片"到选完图之间 root 可能被撤销，没 root 就别导入（选了也不生效）。
@@ -187,6 +183,20 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                 withContext(Dispatchers.IO) { cached.delete() }
                 AppToast.show(context, "无法识别所选图片的尺寸")
                 return@launch
+            }
+            // 主体还是遮罩**不再让用户选**（2026-11-07 改版）：复用光栅组合编辑那一套判定
+            //（`RasterStore.classify`：有 alpha + 有颜色 ⇒ 主体；纯灰度 ⇒ 遮罩；
+            // 既不透明又不是灰度 ⇒ 判不出来）。判不出来就拒掉，别塞进一个错的角色。
+            val kind = withContext(Dispatchers.IO) { RasterStore.probeKind(cached) }
+            if (kind == RasterStore.SubjectKind.INVALID) {
+                withContext(Dispatchers.IO) { cached.delete() }
+                AppToast.show(context, "无法检测出该图片为遮罩或主体", long = true)
+                return@launch
+            }
+            val role = if (kind == RasterStore.SubjectKind.SUBJECT) {
+                MaskRole.SUBJECT
+            } else {
+                MaskRole.SUBJECT_MASK
             }
             // 对齐锚点用**当前壁纸原图**（`templates/current/wallpaper`）的尺寸，不是屏幕尺寸：
             // 替换的是抠像层，它和壁纸的像素网格对齐。
@@ -205,23 +215,17 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
     }
 
     /**
-     * 「选图」的入口（本页两张角色卡都走它）。
+     * 「选图」的入口（锁屏遮罩页那张「主体或遮罩」卡走它）。
      *
-     * 两道闸门：① 没 root 直接拦下；② 主体 / 遮罩互斥，另一边已经选过就先提示清空，
-     * 别让两边同时有图。
+     * 只有一道前置闸门：没 root 直接拦下（替换要写系统文件）。角色互斥那条已经不需要了 ——
+     * 页面上只有一个槽，判成哪个角色由 [RasterStore.probeKind] 决定。
      */
-    val pickRole: (MaskRole) -> Unit = { role ->
+    val pickRole: () -> Unit = {
         scope.launch {
             if (!state.ensureRoot()) return@launch
             // 发起一次「hook 探测壁纸原图」：写请求号 + 后台重启宿主（kill → provider 拉起），
             // 让 hook 在宿主机进程里读 `templates/current/wallpaper`。结果由 awaitWallpaperSize 收取。
             state.beginWallpaperProbe()
-            val other = if (role == MaskRole.SUBJECT) MaskRole.SUBJECT_MASK else MaskRole.SUBJECT
-            if (state.sizes[other] != null) {
-                AppToast.show(context, "已选择${other.title}，请先清空再选择")
-                return@launch
-            }
-            state.pendingRole = role
             picker.launch(
                 PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
             )
@@ -281,6 +285,7 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                 DetailPage.ParallaxBg -> "视差壁纸"
                 DetailPage.SpatialWallpaper -> "空间壁纸"
                 DetailPage.RasterWallpaper -> "光栅壁纸"
+                DetailPage.AliveWallpaper -> "Alive壁纸"
                 DetailPage.SystemUi -> "系统界面"
                 DetailPage.Desktop -> "系统桌面"
             },
@@ -294,6 +299,8 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                 DetailPage.SpatialWallpaper -> SpatialWallpaperDetail(state)
                 // 「光栅壁纸」（2026-11-03）：目前只是**主体验证页**，渲染链还没接。
                 DetailPage.RasterWallpaper -> RasterWallpaperDetail(state)
+                // 「Alive壁纸」（2026-11-07）：照片透镜「启航」，三态（AOD / 锁屏 / 桌面）。
+                DetailPage.AliveWallpaper -> AliveWallpaperDetail(state)
                 DetailPage.SystemUi -> SystemUiDetail(state)
                 DetailPage.Desktop -> DesktopDetail(state)
             }

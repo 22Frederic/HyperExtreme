@@ -1,6 +1,5 @@
 package com.frederic22.hyperextreme.data
 
-import android.content.Context
 
 /**
  * 模块"是否被框架激活"的判定。
@@ -16,17 +15,15 @@ object ActivationState {
     var frameworkConnected: Boolean = false
         private set
 
-    fun recordFrameworkConnected(context: Context) {
+    fun recordFrameworkConnected() {
         frameworkConnected = true
-        runCatching { MaskPrefs(context).recordFrameworkConnected(System.currentTimeMillis()) }
     }
 
     /**
      * 框架 binder 已经失效（用户在 LSPosed 里取消了勾选 / 停用了模块）。
      *
-     * **注意**：判定"是否激活"只看这个进程内标记（外加 [com.frederic22.hyperextreme.hook.HookRuntime.selfInjected]），
-     * **不要**再用持久化的 `frameworkConnectedAt` 时间戳 —— 那是历史值、永不清零，
-     * 会出现"取消了勾选界面还一直显示已激活"（实测踩过）。
+     * **注意**：判定"是否激活"只看这个进程内标记（外加 [com.frederic22.hyperextreme.hook.HookRuntime.selfInjected]）——
+     * 不能靠任何持久化时间戳（历史值永不清零，会出现"取消了勾选界面还一直显示已激活"，实测踩过）。
      */
     fun markDisconnected() {
         frameworkConnected = false

@@ -38,19 +38,6 @@ object WallpaperSource {
     val sourceTemplateNames = listOf("wallpaper", "wallpaper_copied")
 
     /**
-     * 探测脚本里**唯一**允许当锚点的文件名 —— 用户要求："只读 `templates/current/wallpaper`"。
-     *
-     * 脚本那条路不再碰 `wallpaper_copied` / 配置原图 / 显示空间候选（真机上它们会读到
-     * 屏幕尺度的预览图或别的文件）；进程内的 [sourceCandidates] 仍保留 `wallpaper_copied` 兜底，
-     * 那是 hook 在宿主进程里合成主体时用的旧路径，与探测脚本无关。
-     */
-    val anchorTemplateNames = listOf("wallpaper")
-
-    /** 已应用的锁屏壁纸路径 —— 只作为 `crop_subject` 的对齐基准，绝不参与锚点挑选。 */
-    fun appliedLockPath(userId: Int): String =
-        displayPaths(userId).first { it.endsWith("lock_wallpaper.jpg") }
-
-    /**
      * 显示空间的文件名 —— **不能**当对齐锚点，也不要拿去和遮罩合成。
      *
      * `wallpaper_cropped` / `wallpaper_scaled.jpg` 的尺寸 = 原图里那块可见窗口
@@ -71,12 +58,6 @@ object WallpaperSource {
         "/data/system/users/$userId/wallpaper_lock",
         "/data/system/users/$userId/wallpaper_lock_orig",
         "/data/system/users/$userId/wallpaper",
-    )
-
-    /** 指纹的补充来源（切壁纸一定会被改写）。 */
-    fun fingerprintExtras(userId: Int): List<String> = listOf(
-        "/data/system/theme_magic/users/$userId/wallpaper/data/lock.xml",
-        "/data/system/theme_magic/users/$userId/wallpaper/data/home.xml",
     )
 
     /** 小于这个的多半是缩略图 / 配置文件，不是壁纸。 */
@@ -152,17 +133,6 @@ object WallpaperSource {
             .firstOrNull { usable(it) }
 
     /**
-     * 「原图」的像素尺寸 —— 导入替换图时的对齐锚点。
-     *
-     * 只取本进程能直接读到的原图空间候选。**拿不到就返回 null**，调用方据此跳过检查：
-     * 宁可不说，也不能退回显示空间乱报（那正是之前"提示的分辨率随壁纸缩放变化"的原因）。
-     */
-    fun currentSize(context: Context): Pair<Int, Int>? {
-        resolveSourceSpace(context)?.let { file -> MaskStore.readSize(file)?.let { return it } }
-        return null
-    }
-
-    /**
      * 候选能否装下裁切矩形。
      *
      * 判据来自 `GestureManager.getPosition()`：矩形是**原图坐标**里的可见窗口，所以原图必然满足
@@ -172,21 +142,4 @@ object WallpaperSource {
     fun fits(size: Pair<Int, Int>, position: WallpaperPosition, tolerance: Int = 2): Boolean =
         size.first + tolerance >= position.right.toDouble().let { Math.ceil(it).toInt() } &&
             size.second + tolerance >= position.bottom.toDouble().let { Math.ceil(it).toInt() }
-
-    /**
-     * 在 [sizes]（与候选一一对应）里挑原图，返回下标；空列表返回 -1。
-     *
-     * 1. 没有裁切信息 → 取第一个（列表本身就是优先级）；
-     * 2. 有裁切信息 → 取第一个**装得下**矩形的；一个都装不下也取第一个，让调用方记一条日志
-     *    （那种情况说明列表里的候选都不像"编辑器用的那份原图"）。
-     *
-     * 注意**不要**在这里按"像素最多"挑：配置里的原图路径可能是个几千万像素的相册原图，
-     * 那会把真正的编辑器原图挤掉。
-     */
-    fun chooseSource(sizes: List<Pair<Int, Int>>, position: WallpaperPosition?): Int {
-        if (sizes.isEmpty()) return -1
-        if (position == null || !position.valid) return 0
-        sizes.indexOfFirst { fits(it, position) }.let { if (it >= 0) return it }
-        return 0
-    }
 }

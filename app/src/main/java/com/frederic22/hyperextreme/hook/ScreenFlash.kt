@@ -54,16 +54,6 @@ internal object ScreenFlash {
             }
             installed = ok
             HookRuntime.log("灭亮屏 hook：注册${if (ok) "成功" else "失败"}")
-            if (!ok) {
-                runCatching {
-                    app.contentResolver.call(
-                        MaskProvider.configUri(),
-                        MaskProvider.METHOD_NOTE,
-                        "灭亮屏 hook：注册失败（见 LSPosed 日志）",
-                        null,
-                    )
-                }
-            }
         }
     }
 
@@ -79,14 +69,6 @@ internal object ScreenFlash {
             true
         }.getOrElse { error ->
             HookRuntime.log("灭亮屏 hook 失败：$error")
-            runCatching {
-                context.contentResolver.call(
-                    MaskProvider.configUri(),
-                    MaskProvider.METHOD_NOTE,
-                    "灭亮屏 hook 失败：${error.javaClass.simpleName}: ${error.message}",
-                    null,
-                )
-            }
             false
         }
         if (ok) HookRuntime.log("灭亮屏 hook：已完成（请求 $token）")

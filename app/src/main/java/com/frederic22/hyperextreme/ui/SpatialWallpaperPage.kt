@@ -6,13 +6,11 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -31,7 +29,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
@@ -59,9 +56,6 @@ import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
-import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.ChevronForward
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.window.WindowDialog
@@ -122,6 +116,8 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     var shiftDir by remember { mutableFloatStateOf(0f) }
     var shiftFromPage by remember { mutableIntStateOf(-1) }
     var shiftToken by remember { mutableIntStateOf(0) }
+    // 「清除所有深度缓存」请求号（2026-11-07）：+1 交给卡片流播"全部缩小淡出 → 新建卡补位"。
+    var clearSeq by remember { mutableIntStateOf(0) }
 
     var shortSide by remember { mutableStateOf(prefs.spatialShortSide) }
     // 「空间壁纸生效范围」：0 锁屏（默认）/ 1 桌面 / 2 全局。**不影响层图生成**，只决定渲染器挂哪条 leash。
@@ -480,6 +476,25 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         }
     }
 
+    /**
+     * 「清除所有深度缓存」的动画收尾（2026-11-07）：卡片流让所有非新建卡播完 200ms
+     * 缩小淡出后回调这里。**必须在这一帧同步清空列表** —— 新建卡的补位进度就是按
+     * `candidates` 变空的那一帧创建的，先做 IO 再清会看到它先瞬移到中间、再滑回来。
+     *
+     * 删盘放 IO、toast 放最后：此时所有卡片已经淡出，删目录不会影响任何在显示的封面。
+     */
+    fun commitClearAll() {
+        activeKey = ""
+        candidates = emptyList()
+        focused = 0
+        serviceTargetKey = ""
+        prefs.setSpatialCandidateOrder(emptyList())
+        scope.launch {
+            val n = withContext(Dispatchers.IO) { SpatialDepth.clearAll(ctx) }
+            Toast.makeText(ctx, "已清除 $n 项深度缓存", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -520,6 +535,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                 shiftDir = shiftDir,
                 shiftFromPage = shiftFromPage,
                 shiftToken = shiftToken,
+                clearToken = clearSeq,
                 screen = screen,
                 onFocus = { focused = it },
                 onNew = {
@@ -554,6 +570,8 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                     }
                 },
                 onDeleteSettled = { commitDelete() },
+                // 「清除所有深度缓存」：卡片流负责让所有非新建卡缩小淡出、播完在这一帧回调。
+                onClearSettled = { commitClearAll() },
                 // 推理期间**收起所有删除钮**（用户 2026-11-04）：一次 7~10s，
                 // 中途把正在算的那张删掉，结果就没处可写了。
                 allowDelete = !busy,
@@ -890,8 +908,8 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         },
         onDismissRequest = { showClearConfirm = false },
         onConfirm = {
-            // 系统壁纸服务模式下**先恢复到系统默认壁纸**再删 —— 否则壁纸进程读不到层图，
-            // 会黑屏或崩。这条也是「功能提醒」弹窗里对用户的承诺（2026-10-30）。
+            // 停渲染要**立刻**做（不能等淡出播完）：服务模式先恢复到系统默认壁纸，
+            // 否则壁纸进程读不到层图会黑屏或崩（2026-10-30 的承诺）。
             if (mountMode == MaskPrefs.SPATIAL_MOUNT_SERVICE && serviceRunning) {
                 SpatialServiceMode.disable(ctx)
                 serviceRunning = SpatialServiceMode.isRunning(ctx)
@@ -899,20 +917,15 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
             // LSPosed 模式正在生效：**统一收口**到 SpatialControl.disable（2026-10-31 用户要求）——
             // 比原来手写的那三行多两件事：清壁纸基准 `spatialWallpaperFp`、400ms 后
             // `killall com.miui.miwallpaper` 复位残留层。`toastText = null` 是静默，
-            // 避免和下面的「已清除 N 项深度缓存」叠成两条排队播。
+            // 避免和「已清除 N 项深度缓存」叠成两条排队播。
+            // ⚠️ `activeKey` 先不动：现在置空会让中间那张卡在淡出前先冒出一个删除钮。
             if (activeKey.isNotEmpty()) {
                 SpatialControl.disable(ctx, toastText = null)
-                activeKey = ""
             }
-            // 删 `files/spatial/` 下所有子目录（逻辑原来在 SpatialDepth 里，这里直接走它）
-            val n = SpatialDepth.clearAll(ctx)
-            // 候选就是这些目录 ⇒ 列表、选中、顺序一起作废（生效态上面已经关掉了）。
-            candidates = emptyList()
-            focused = 0
-            serviceTargetKey = ""
-            prefs.setSpatialCandidateOrder(emptyList())
-            prefs.setSpatialSourceKey(null)
-            Toast.makeText(ctx, "已清除 $n 项深度缓存", Toast.LENGTH_SHORT).show()
+            // 删盘与清列表都交给卡片流：所有非新建卡 200ms 缩小淡出 → 播完回调
+            // [commitClearAll]。这样用户看到的是"卡片一张张消失、新建卡补到中间"，
+            // 而不是列表当场蒸发。
+            clearSeq++
             showClearConfirm = false
         },
     )

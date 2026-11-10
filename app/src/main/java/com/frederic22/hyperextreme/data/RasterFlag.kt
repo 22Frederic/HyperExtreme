@@ -44,9 +44,19 @@ object RasterFlag {
      * 「停顿时就近归位」：1 = 开（默认），0 = 关（2026-11-04）。
      *
      * 关掉后静止不再补完当前一擦，用户可以**停在两张之间**的过渡态。
-     * 与 [PROP_PAN_DEG] 同语义：渲染器启动时**只读一次**，读不到按开处理。
+     *
+     * 2026-11-07 起**运行中实时**：启动时读一次，之后 `HookEntry` 的轮询检测到变化
+     * 就调 `RasterRenderer.applyRealtime` 热更新（并硬切归位一次）。读不到按开处理。
      */
     const val PROP_SETTLE = "debug.hyperextreme.raster_settle"
+
+    /**
+     * 「过渡效果」：0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃（扭曲变形），2026-11-06。
+     *
+     * 2026-11-07 起**运行中实时**：生效中改直接走 [push]，轮询检测变化后热更新并硬切
+     * 归位一次；启动时也读一次做基线。读不到 / 非法按 0（= 加这个选项之前的行为）。
+     */
+    const val PROP_TRANSITION = "debug.hyperextreme.raster_transition"
 
     /** 渲染器是否**真的**在跑（1 = 已挂上并出过帧）。排查「点了应用但没反应」用。 */
     const val PROP_RENDERING = "debug.hyperextreme.raster_rendering"
@@ -58,6 +68,7 @@ object RasterFlag {
         scope: Int,
         lockDepth: Boolean = false,
         panDeg: Int = 25,
+        transition: Int = 0,
         settle: Boolean = true,
     ) {
         val script = "setprop $PROP_ACTIVE ${if (active) 1 else 0}; " +
@@ -65,6 +76,7 @@ object RasterFlag {
             "setprop $PROP_SCOPE $scope; " +
             "setprop $PROP_LOCKDEPTH ${if (lockDepth) 1 else 0}; " +
             "setprop $PROP_PAN_DEG $panDeg; " +
+            "setprop $PROP_TRANSITION ${transition.coerceIn(0, 3)}; " +
             "setprop $PROP_SETTLE ${if (settle) 1 else 0}"
         Thread {
             val r = runCatching { RootShell.run(script) }.getOrNull()

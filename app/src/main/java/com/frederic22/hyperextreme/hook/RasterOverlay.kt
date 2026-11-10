@@ -65,14 +65,17 @@ internal object RasterOverlay {
     private const val SYSTEMUI_PKG = "com.android.systemui"
 
     /**
-     * 擦除着色器 —— 与 [RasterGlCore.FRAG] **同一套公式**，只去掉 cover 参数
-     * （主体图已经按同一 cover 裁到屏幕尺寸，1:1 采样）。
+     * 擦除 + 玻璃着色器 —— 与 [RasterGlCore.FRAG] **同一套公式**（2026-11-06 v1.19.1）。
+     *
+     * 2026-11-06：主体层不再只做擦除，**选中哪档「过渡效果」就跟着做哪档**
+     * （条纹 / 磨砂 / 扭曲），否则背景有玻璃、主体是干净的，带内会露馅。
+     * 公式与 GL 那份逐字一致，只是采样从 `texture2D` 换成 `shader.eval`：
      *
      * ```
-     * e    = dir > 0 ? uv.x : 1 − uv.x
-     * edge = −B/2 + t × (1 + B)
-     * a    = clamp((edge − e)/B + 0.5, 0, 1)
-     * c    = mix(from, to, a)
+     * e     = dir > 0 ? uv.x : 1 − uv.x
+     * pa    = t × (1 + 2·TransWidth) − TransWidth
+     * pMask = smoothstep(pa − MaskTransWidth, pa, e) × smoothstep(pa + MaskTransWidth, pa, e)
+     * a     = smoothstep(pa − AlphaTransWidth, pa + AlphaTransWidth, e)
      * ```
      *
      * `uScale = 主体位图尺寸 / View 尺寸`：正常情况下是 1（两边都是屏幕尺寸），
@@ -86,19 +89,121 @@ internal object RasterOverlay {
         uniform float uT;
         uniform float uDir;
         uniform float uBand;
+        uniform float uTransWidth;
+        uniform float uMaskTransWidth;
         uniform float uDim;
+        uniform float uStyle;
+        uniform float uBumpScale;
+        uniform float uRefractionScale;
+        uniform float uDispersionFactor;
+        uniform float uShadowStrength;
+        uniform float uStripePeriodPx;
+        uniform float uFrostCellPx;
+        uniform float uScreenW;
+        uniform float uScreenH;
+        uniform float3 uLightDir;
+
+        float hash21(float2 p) {
+            p = fract(p * float2(123.34, 456.21));
+            p += dot(p, p + 45.32);
+            return fract(p.x * p.y);
+        }
+
+        float noise2(float2 p) {
+            float2 i = floor(p);
+            float2 f = fract(p);
+            float2 u = f * f * (3.0 - 2.0 * f);
+            float a = hash21(i);
+            float b = hash21(i + float2(1.0, 0.0));
+            float c = hash21(i + float2(0.0, 1.0));
+            float d = hash21(i + float2(1.0, 1.0));
+            return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+        }
+
+        float rasterHeight(float2 uv) {
+            float x = uv.x * uScreenW / max(uStripePeriodPx, 1.0);
+            if (uStyle < 1.5) {
+                return 0.5 + 0.5 * cos(6.2831853 * x);
+            } else if (uStyle < 2.5) {
+                float2 q = float2(uv.x * uScreenW, uv.y * uScreenH) / max(uFrostCellPx, 0.5);
+                return noise2(q);
+            }
+            float n = noise2(float2(x * 5.0, 7.3));
+            return clamp(0.5 + 0.46 * cos(6.2831853 * x) + 0.10 * (n - 0.5), 0.0, 1.0);
+        }
 
         half4 main(float2 coord) {
             float2 uv = coord / uViewSize;
             // dir > 0（向左转）= 新图从左边进来；与 GL 那份**逐字一致**。
             float e = (uDir > 0.0) ? uv.x : (1.0 - uv.x);
-            float edge = -uBand * 0.5 + uT * (1.0 + uBand);
-            float a = clamp((edge - e) / uBand + 0.5, 0.0, 1.0);
+            float pa = uT * (1.0 + 2.0 * uTransWidth) - uTransWidth;
+            float a = smoothstep(pa - uBand, pa + uBand, e);
 
-            float2 p = coord * uScale;
-            half4 cf = uFrom.eval(p);
-            half4 ct = uTo.eval(p);
-            half4 c = mix(cf, ct, half(a));
+            float pMask = smoothstep(pa - uMaskTransWidth, pa, e)
+                        * smoothstep(pa + uMaskTransWidth, pa, e);
+
+            float2 ruv = uv;
+            float3 normal = float3(0.0, 0.0, 1.0);
+            float h0 = 0.0;
+            if (uStyle > 0.5 && pMask > 0.001) {
+                float px = 1.0 / max(uScreenW, 1.0);
+                float l = rasterHeight(uv - float2(px, 0.0));
+                float r = rasterHeight(uv + float2(px, 0.0));
+                float dx = (r - l) * 0.5;
+                float dy = 0.0;
+                if (uStyle > 1.5 && uStyle < 2.5) {
+                    float tt = rasterHeight(uv + float2(0.0, px));
+                    float bb = rasterHeight(uv - float2(0.0, px));
+                    dy = (tt - bb) * 0.5 * (uScreenW / max(uScreenH, 1.0));
+                }
+                normal = normalize(float3(dx * uBumpScale, dy * uBumpScale, 1.0));
+                h0 = rasterHeight(uv);
+                ruv = clamp(uv + normal.xy * uRefractionScale * pMask, 0.0, 1.0);
+            }
+
+            // ⚠️ SkSL **不允许 `shader` 作函数参数**（"parameters of type 'shader' not allowed"）
+            // ⇒ 色散只能内联写两遍，不能抽成 sampleDisperse(shader, …)。
+            half4 cf;
+            half4 ct;
+            float disp = uDispersionFactor * 0.16 * pMask * 208.333;
+            if (uStyle > 0.5 && abs(ruv.x - uv.x) > 0.0005) {
+                float2 dxy = (ruv - uv) * disp;
+                half4 f0 = uFrom.eval(ruv * uViewSize * uScale);
+                half4 f1 = uFrom.eval((ruv + dxy * 0.2) * uViewSize * uScale);
+                half4 f2 = uFrom.eval((ruv + dxy * 0.4) * uViewSize * uScale);
+                cf = half4(
+                    f0.r * 0.9 + f1.r * 0.08 + f2.r * 0.02,
+                    f0.g * 0.1 + f1.g * 0.8  + f2.g * 0.1,
+                    f0.b * 0.02 + f1.b * 0.08 + f2.b * 0.9,
+                    f0.a
+                );
+                half4 t0 = uTo.eval(ruv * uViewSize * uScale);
+                half4 t1 = uTo.eval((ruv + dxy * 0.2) * uViewSize * uScale);
+                half4 t2 = uTo.eval((ruv + dxy * 0.4) * uViewSize * uScale);
+                ct = half4(
+                    t0.r * 0.9 + t1.r * 0.08 + t2.r * 0.02,
+                    t0.g * 0.1 + t1.g * 0.8  + t2.g * 0.1,
+                    t0.b * 0.02 + t1.b * 0.08 + t2.b * 0.9,
+                    t0.a
+                );
+            } else {
+                float2 p = ruv * uViewSize * uScale;
+                cf = uFrom.eval(p);
+                ct = uTo.eval(p);
+            }
+            // ⚠️ 顺序必须与背景层 [RasterGlCore.FRAG] 的 `mix(to, from, mixFactor)` **同构**：
+            // factor/a 小时显示的是**新图**。2026-11-06 真机「主体和图顺序错位（差一张）」
+            // 就是因为这里写成了 mix(cf, ct, a)（a 小时给旧图）—— 方向修好后彻底露出来。
+            half4 c = mix(ct, cf, half(a));
+
+            if (uStyle > 0.5 && pMask > 0.001) {
+                if (uStyle < 1.5) {
+                    c.rgb -= half3(h0 * pMask * uShadowStrength);
+                } else if (uStyle > 2.5) {
+                    float diffuse = max(dot(normal, normalize(uLightDir)), 0.0);
+                    c.rgb *= half(1.0 - (1.0 - diffuse) * uShadowStrength * pMask);
+                }
+            }
             // AOD 压暗：与 GL 同一个值（那边乘在片元里）；只乘 RGB，压暗 ≠ 变透明。
             return half4(c.rgb * half(uDim), c.a);
         }
@@ -138,6 +243,9 @@ internal object RasterOverlay {
     @Volatile private var sceneT = 0f
     @Volatile private var sceneDir = 1f
 
+    /** 当前「过渡效果」档位（0..3）—— 主体层跟着背景做同一档玻璃（2026-11-06）。 */
+    @Volatile private var sceneStyle = 0
+
     private fun resolveIds(ctx: Context) {
         if (fgLayerId != 0 && deductedId != 0) return
         runCatching {
@@ -158,10 +266,10 @@ internal object RasterOverlay {
      * `from/to/t/dir` 与背景 GL 是**同一组值** —— 各算一遍迟早漂移，主体就会和背景错位。
      * 这里只记录 + 合并投递一次 invalidate；位图按需异步加载。
      */
-    fun onSceneChanged(from: Int, to: Int, t: Float, dir: Float) {
+    fun onSceneChanged(from: Int, to: Int, t: Float, dir: Float, style: Int) {
         if (view == null) return
         if (sceneFrom == from && sceneTo == to &&
-            kotlin.math.abs(sceneT - t) < 1e-4f && sceneDir == dir
+            kotlin.math.abs(sceneT - t) < 1e-4f && sceneDir == dir && sceneStyle == style
         ) {
             return
         }
@@ -169,6 +277,7 @@ internal object RasterOverlay {
         sceneTo = to
         sceneT = t
         sceneDir = dir
+        sceneStyle = style
         if (invalidatePending) return
         invalidatePending = true
         mainHandler.post {
@@ -211,6 +320,9 @@ internal object RasterOverlay {
         val v = view ?: return
         unlockFadeStarted = false
         v.animate().cancel()
+        // 同一个坑的第三个入口（2026-11-07）：AOD 直接解锁不经 `onExitAod()`，
+        // 主体可能还留着一帧 `uDim=0` 的黑录制；这里复位 alpha 前先重录一次。
+        v.invalidate()
         if (v.alpha < 0.99f) {
             // 走 300ms 淡入，与系统壁纸的亮屏淡入同步；scale 一起走，避免单独跳一下。
             v.animate()
@@ -256,6 +368,10 @@ internal object RasterOverlay {
             .setDuration(AOD_FADE_MS)
             .setInterpolator(android.view.animation.DecelerateInterpolator())
             .start()
+        // **必须重录**（2026-11-07）：`uDim` 是在 `onDraw` 里写给 shader 的，
+        // 而 `RasterRenderer` 已经在调本方法之前把 dim 改成 AOD 目标值。
+        // 不 invalidate 就可能把「压暗前」的帧留到下一次显示（退出时正好反过来 ⇒ 主体全黑）。
+        v.invalidate()
     }
 
     /** 退出 AOD（回锁屏）：alpha 淡回 1。 */
@@ -275,6 +391,11 @@ internal object RasterOverlay {
             .setDuration(AOD_FADE_MS)
             .setInterpolator(android.view.animation.DecelerateInterpolator())
             .start()
+        // **必须重录**（2026-11-07 根因）：`uDim` 只在 `onDraw` 里写，而 `onSceneChanged`
+        // 的去重键不含 dim —— AOD 期间 `resetNow` 把场景抹回 #0→#0 后录了一帧 `uDim=0`，
+        // 退出时场景没变 ⇒ 那次调用直接早退、不 invalidate ⇒ 黑帧被 alpha=1 原样显示出来。
+        // 真机日志：55.097 退出、直到 58.028 用户转头改了场景才恢复。
+        v.invalidate()
     }
 
     // ───────────────── 装配 / 拆卸 ─────────────────
@@ -530,7 +651,32 @@ internal object RasterOverlay {
                 }
                 s.setFloatUniform("uT", sceneT)
                 s.setFloatUniform("uDir", sceneDir)
-                s.setFloatUniform("uBand", RasterGlCore.BAND)
+                // 2026-11-06：与背景层 [RasterGlCore.FRAG] 逐字一致 —— 擦除带 + 四档玻璃。
+                s.setFloatUniform("uBand", RasterGlCore.VIVO_ALPHA_TRANS_WIDTH)
+                s.setFloatUniform("uTransWidth", RasterGlCore.VIVO_TRANS_WIDTH)
+                s.setFloatUniform("uMaskTransWidth", RasterGlCore.VIVO_MASK_TRANS_WIDTH)
+                val sp = RasterGlCore.paramsOf(sceneStyle)
+                s.setFloatUniform("uStyle", sceneStyle.toFloat())
+                s.setFloatUniform("uBumpScale", sp.bump)
+                s.setFloatUniform("uRefractionScale", sp.refract)
+                s.setFloatUniform("uDispersionFactor", sp.dispersion)
+                s.setFloatUniform("uShadowStrength", sp.shadow)
+                s.setFloatUniform(
+                    "uStripePeriodPx",
+                    (w * RasterGlCore.STRIPE_PERIOD_PX_1200 / RasterGlCore.STRIPE_BASE_W)
+                        .coerceAtLeast(1f),
+                )
+                s.setFloatUniform(
+                    "uFrostCellPx",
+                    (w * RasterGlCore.FROST_CELL_PX_1200 / RasterGlCore.STRIPE_BASE_W)
+                        .coerceAtLeast(0.5f),
+                )
+                s.setFloatUniform("uScreenW", w)
+                s.setFloatUniform("uScreenH", h)
+                s.setFloatUniform(
+                    "uLightDir",
+                    sp.lightX, RasterGlCore.TWIST_LIGHT_Y, RasterGlCore.TWIST_LIGHT_Z,
+                )
                 s.setFloatUniform("uDim", RasterRenderer.aodDimValue())
                 paint.shader = s
                 canvas.drawRect(0f, 0f, w, h, paint)

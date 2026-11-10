@@ -58,9 +58,6 @@ internal object AicrVision {
 
     private const val TAG = "HX-AICR"
 
-    /** 展示给用户看的方案名。 */
-    const val ROUTE_APP = "免 Root（应用直连）"
-
     private const val PKG = "com.xiaomi.aicr"
     private const val ACTION = "com.xiaomi.aicr.access.AICR_ENGINE"
     private const val IFACE_CORE = "com.xiaomi.aicr.IAiCrCoreService"

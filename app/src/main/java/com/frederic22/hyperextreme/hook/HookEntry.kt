@@ -5,7 +5,6 @@ import android.os.Bundle
 import android.util.Log
 import android.view.View
 import com.frederic22.hyperextreme.data.MaskPrefs
-import com.frederic22.hyperextreme.data.MaskProvider
 import com.frederic22.hyperextreme.data.MaskRole
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
@@ -85,7 +84,6 @@ class HookEntry : XposedModule() {
         if (param.packageName == MODULE_PACKAGE) {
             // LSPosed 会把模块加载进它自己的进程：勾选即"已激活"，不必等目标应用先跑。
             HookRuntime.markSelfInjected()
-            HookRuntime.reportSelfActivationAsync()
             return
         }
         if (param.packageName == SYSTEM_UI_PACKAGE) {
@@ -105,9 +103,6 @@ class HookEntry : XposedModule() {
             // 空间壁纸：把系统壁纸的**真实 alpha** 桥给 SystemUI（解锁淡出不猜时长）。
             // 真值来源 = `UniversalWallpaper$UniversalEngine#h(float, SurfaceControl)` 里的 setAlpha。
             guard("空间壁纸-壁纸alpha") { SpatialWallpaperAlpha.install(this, param.classLoader) }
-            // 【已停用 2026-10-21】GL 帧追加绘制（WallpaperGlOverlay）：静态壁纸只出 1 帧，
-            // 外部驱动 refresh 会落到没有 EGL context 的线程（glError=0x501，壁纸全黑）。
-            // 改为 SystemUI 的 TYPE_WALLPAPER 窗口实现（见 ParallaxWallpaperWindow）。
             return
         }
         if (param.packageName == AICR_PACKAGE) {
@@ -175,9 +170,18 @@ class HookEntry : XposedModule() {
     private fun installSystemUiHooks(loader: ClassLoader) {
         if (systemUiHooksInstalled.get()) return
         HookRuntime.log("SystemUI 就绪：安装锁屏按钮层级 hook（loader=${loader.javaClass.simpleName}）")
+        // 「AOD 透出壁纸」（v1.22.80）：AOD 的 `AODView`/`DozeHost` 由 `com.miui.aod` 的
+        // **插件 classloader 加载在本进程**（logcat：`27090 D AODView : ...`，27090 就是 SystemUI），
+        // 所以 hook 必须装这里，且只能按类名认人。见 [AliveAodHost]。
+        runCatching { AliveAodHost.install(this, loader) }
         // 诊断（2026-10-22）：确认 SystemUI 进程里能否建 EGL / 跑 GL —— 空间壁纸架构的前提。
         // 只读探针，不接入任何逻辑；日志前缀 GPUPROBE。
         runCatching { GpuProbe.run("systemui") }
+        // **临时探针**（2026-11-08）：量 AOD 时钟的实际位置（日志前缀 AODCLOCK）。
+        // 挂在下面通用 `View#onAttachedToWindow` 里按类名前缀认人 ——
+        // 实测 `Class.forName("com.miui.aod.AODView", 宿主loader)` 找不到
+        // （AOD 的类由它自己的 classloader 加载，宿主 loader 看不见）。
+        // 只打日志、不改行为；验证完连同 AodClockProbe.kt 一起删。
         // GL 渲染探针（2026-10-22 验证完成）：已确认「自建 SurfaceControl + EGL + glClear + swapBuffers
         // + reparent 到壁纸层」全链路可用，屏幕上能看到半透明洋红块。
         // **平时保持关闭**，需要重验时把下面这行改成 true。
@@ -273,12 +277,18 @@ class HookEntry : XposedModule() {
             var lastKey: String? = null
             var lastScope = Int.MIN_VALUE
             var tick = 0
+            // 2026-11-07：「过渡效果 / 停顿归位」改成**运行中实时**。首轮只记基线，
+            // 不触发归位（startInternal 已经读过同一份快照）。属性读的是
+            // `android.os.SystemProperties.get` 反射，250ms 一次的成本可以忽略。
+            var lastStyle = 0
+            var lastSettle = true
+            var paramsInit = false
             HookRuntime.log(
                 "RASTER 轮询已启动（监听属性 ${com.frederic22.hyperextreme.data.RasterFlag.PROP_ACTIVE}）",
             )
             while (true) {
                 try {
-                    Thread.sleep(1000)
+                    Thread.sleep(250)
                     tick++
                     val active = HookRuntime.systemProperty(
                         com.frederic22.hyperextreme.data.RasterFlag.PROP_ACTIVE,
@@ -289,6 +299,25 @@ class HookEntry : XposedModule() {
                     val scope = HookRuntime.systemProperty(
                         com.frederic22.hyperextreme.data.RasterFlag.PROP_SCOPE,
                     ).trim().toIntOrNull()?.takeIf { it in 0..2 } ?: MaskPrefs.SPATIAL_SCOPE_LOCK
+                    // ⚠️ 只盯这两项；`PROP_PAN_DEG` 不进实时通道（改角度会跳图，用户定维持下一次生效）。
+                    val style = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.RasterFlag.PROP_TRANSITION,
+                    ).trim().toIntOrNull()?.coerceIn(0, 3) ?: 0
+                    val settle = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.RasterFlag.PROP_SETTLE,
+                    ).trim() != "0"
+                    if (!paramsInit) {
+                        lastStyle = style
+                        lastSettle = settle
+                        paramsInit = true
+                    } else if (style != lastStyle || settle != lastSettle) {
+                        lastStyle = style
+                        lastSettle = settle
+                        // `lastKey != null` = 渲染器已启动；没启动时 startInternal 自会读新值。
+                        if (active && key.isNotEmpty() && lastKey != null) {
+                            RasterRenderer.applyRealtime(style, settle)
+                        }
+                    }
                     if (tick <= 3 || tick % 60 == 0) {
                         HookRuntime.log(
                             "RASTER 轮询 tick=$tick active=$active key=$key scope=$scope " +
@@ -314,6 +343,114 @@ class HookEntry : XposedModule() {
                 } catch (t: Throwable) {
                     // 轮询线程不许死
                     HookRuntime.log("RASTER 轮询异常：${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
+        }.apply { isDaemon = true }.start()
+        // 「Alive 壁纸」渲染器开关轮询（2026-11-07）：与空间 / 光栅**完全独立**。
+        // Alive 只有 LSPosed 一条链（AOD 动画必须挂 SystemUI 的 lease），
+        // 所以判据就是 active + key；scope 固定全局，留着属性只为对齐另外两条链。
+        Thread {
+            var lastKey: String? = null
+            var lastScope = Int.MIN_VALUE
+            // 息屏样式（0 启航 / 1 留光）：渲染器只在 `startInternal` 里读一次，
+            // 样式一变必须重启，否则实机还画着上一种（2026-11-09 真机：
+            // 「aod 不显示相卡，缩放完还有启航晃一下」= 还在按 style=0 画球）。
+            var lastStyle = Int.MIN_VALUE
+            // 图片版本（2026-11-09）：换图不改 id，只靠 key/style 判不出变化 ⇒ 新图进不了 GL
+            var lastVer: String? = null
+            // 「息屏显示」总开关（2026-11-10）：关着就停渲染，开回来自动恢复。
+            // 跨进程读 Settings 有成本 ⇒ 2s 一次（tick 250ms ⇒ 每 8 个 tick）。
+            var aodOn = true
+            var aodOff = false
+            var tick = 0
+            HookRuntime.log(
+                "ALIVE 轮询已启动（监听属性 ${com.frederic22.hyperextreme.data.AliveFlag.PROP_ACTIVE}）",
+            )
+            while (true) {
+                try {
+                    Thread.sleep(250)
+                    tick++
+                    if (tick % 8 == 1) {
+                        val c = HookRuntime.appContext()
+                        if (c != null) {
+                            aodOn = runCatching {
+                                android.provider.Settings.Secure.getInt(
+                                    c.contentResolver,
+                                    com.frederic22.hyperextreme.data.AodState.KEY_ENABLED,
+                                    0,
+                                ) == 1
+                            }.getOrDefault(true)
+                        }
+                    }
+                    val active = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.AliveFlag.PROP_ACTIVE,
+                    ).trim() == "1"
+                    val key = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.AliveFlag.PROP_KEY,
+                    ).trim()
+                    val scope = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.AliveFlag.PROP_SCOPE,
+                    ).trim().toIntOrNull()?.takeIf { it in 0..2 }
+                        ?: MaskPrefs.SPATIAL_SCOPE_GLOBAL
+                    val style = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.AliveFlag.PROP_STYLE,
+                    ).trim().toIntOrNull() ?: 0
+                    val ver = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.AliveFlag.PROP_VER,
+                    ).trim()
+                    if (tick <= 3 || tick % 60 == 0) {
+                        HookRuntime.log(
+                            "ALIVE 轮询 tick=$tick active=$active key=$key scope=$scope " +
+                                "style=$style ver=$ver last=$lastKey/$lastScope/$lastStyle/$lastVer",
+                        )
+                    }
+                    if (!aodOn) {
+                        // 息屏显示被关掉 ⇒ Alive 壁纸没有意义了，直接停渲染（不再占 Surface）。
+                        // 模块侧 prefs 由 App 启动自检 / ContentObserver 收敛（跨进程改不了）。
+                        if (!aodOff) {
+                            aodOff = true
+                            if (lastKey != null) {
+                                HookRuntime.log("ALIVE 息屏显示已关闭 → 停止渲染器")
+                                AliveRenderer.stop()
+                                lastKey = null
+                                lastScope = Int.MIN_VALUE
+                                lastStyle = Int.MIN_VALUE
+                                lastVer = null
+                            }
+                        }
+                    } else {
+                        if (aodOff) {
+                            aodOff = false
+                            HookRuntime.log("ALIVE 息屏显示已开启 → 恢复（按属性重启渲染器）")
+                        }
+                        if (active && key.isNotEmpty()) {
+                            if (key != lastKey || scope != lastScope || style != lastStyle ||
+                                ver != lastVer
+                            ) {
+                                val ctx = HookRuntime.appContext()
+                                if (ctx != null) {
+                                    HookRuntime.log(
+                                        "ALIVE 开关=开 key=$key scope=$scope style=$style ver=$ver " +
+                                            "→ 启动渲染器",
+                                    )
+                                    AliveRenderer.start(ctx, key, scope)
+                                    lastKey = key
+                                    lastScope = scope
+                                    lastStyle = style
+                                    lastVer = ver
+                                }
+                            }
+                        } else if (lastKey != null) {
+                            HookRuntime.log("ALIVE 开关=关 → 停止渲染器")
+                            AliveRenderer.stop()
+                            lastKey = null
+                            lastScope = Int.MIN_VALUE
+                            lastStyle = Int.MIN_VALUE
+                            lastVer = null
+                        }
+                    }
+                } catch (t: Throwable) {
+                    HookRuntime.log("ALIVE 轮询异常：${t.javaClass.simpleName}: ${t.message}")
                 }
             }
         }.apply { isDaemon = true }.start()
@@ -347,6 +484,16 @@ class HookEntry : XposedModule() {
                         val view = chain.getThisObject() as? View
                         // 「替换后自动灭亮屏」的接收器：借高频的视图入窗顺手装一次（幂等）。
                         view?.let { runCatching { ScreenFlash.install(it.context) } }
+                        // 探针：AOD 的宿主 View（类名 com.miui.aod.* 且带 mAodClock 字段）。
+                        // 必须在下面 ready() 短路**之前**判，否则按钮一拿到就再也不进来了。
+                        if (view != null && AodClockProbe.isCandidate(view)) {
+                            val r = chain.proceed()
+                            AodClockProbe.onAodViewAttached(view)
+                            // 「AOD 透出壁纸」（v1.22.80）：AOD 的类由**插件 classloader** 加载在
+                            // 本进程（SystemUI）里，所以 hook 装这儿、按类名认人，见 [AliveAodHost]。
+                            runCatching { AliveAodHost.onAodViewAttached(view) }
+                            return r
+                        }
                         if (LockScreenButton.ready()) return chain.proceed()
                         val result = chain.proceed()
                         LockScreenButton.attachIfTarget(view)
@@ -493,6 +640,13 @@ class HookEntry : XposedModule() {
         // 前景主体在 AOD 里要"同步缩小 + 淡出"；进 AOD 先归位再冻结传感器。
         results["空间壁纸AOD"] = attempt("空间壁纸-AOD") {
             SpatialAod.install(this, loader)
+        }
+        // 「Alive 三态状态源」（2026-11-08）：`ScrimController#updateScrims` 的 `mState`
+        // 是 AOD / 锁屏 / 解锁的**唯一权威**。`doWallpaperBlackAnim` 太早（keyguard 还锁着），
+        // 靠它分不出「回锁屏」和「直接进桌面」⇒ AOD→桌面的 tr=2 永远跑不到。
+        // 只推状态给 `AliveRenderer.onScrimState`，不接管任何系统行为。
+        results["Alive三态状态源"] = attempt("Alive-scrim 状态") {
+            AliveScrim.install(this, loader)
         }
         // 「打开多任务时隐藏状态栏」（2026-10-16，需求：系统桌面 → 多任务）：hook 桌面发给 SystemUI 的
         // overview 通知（`LauncherProxyService$1#onTransact` 的 case 62/63），生效动作在 SystemUI 进程内
@@ -800,13 +954,15 @@ class HookEntry : XposedModule() {
                         // ⚠️ 不能假定参数下标：`call(method, arg, extras)` 在部分框架实现里
                         // `getArgs()` 会把接收者/别的参数也算进来。这里直接**扫所有 String 参数**：
                         // `apply=<号>` 是注入请求；`depth=<号>` 是"景深检查"请求；
-                        // 纯数字是"壁纸探测"请求号。其余（方法名等）不匹配。
+                        // `thumb=...` 是"只刷新当前壁纸缩略图"请求；纯数字是"壁纸探测"请求号。
+                        // 其余（方法名等）不匹配。
                         val arg = chain.getArgs()
                             .filterIsInstance<String>()
                             .map { it.trim() }
                             .firstOrNull {
                                 it.startsWith(APPLY_ARG_PREFIX) ||
                                     it.startsWith(DEPTH_ARG_PREFIX) ||
+                                    it.startsWith(THUMB_ARG_PREFIX) ||
                                     it.toLongOrNull() != null
                             }
                             .orEmpty()
@@ -828,6 +984,14 @@ class HookEntry : XposedModule() {
                             // 「点『选择图片』前的景深检查」：读 wallpaper_effect_type_2 回写。
                             depthToken != null -> HookRuntime.probeDepthState(context, depthToken)
                             context != null -> {
+                                // 顺带推一次「当前壁纸」缩略图（锁屏遮罩页左卡）。
+                                // 2026-11-07 第二轮：`thumb=force` = App 缓存丢了，无条件重推；
+                                // 其余（`thumb=1` / 探测请求 / 启动兜底）都按文件指纹去重 ——
+                                // 重推会让卡片重新渐显闪一下，换了壁纸才该推。
+                                HookRuntime.requestLockWallpaperThumb(
+                                    context,
+                                    force = arg == THUMB_ARG_FORCE,
+                                )
                                 val probeToken = arg.toLongOrNull()
                                 if (probeToken != null) {
                                     HookRuntime.probeWallpaperForToken(context, probeToken)
@@ -1450,8 +1614,7 @@ class HookEntry : XposedModule() {
          * 起因：排查时连续几轮都只能看到旧的「已挂」日志，无法区分"没装新包"和"新逻辑没跑到"。
          * **每次改动都更新它。**
          */
-        const val BUILD_TAG = "2026-11-06.19-40 v1.17.7 / v0.5 Beta2（新增 com.xiaomi.aicr 作用域：4.13.8 访问校验绕过改为「自实现 case 1 分发」—— 反射调父类 Stub 会因 Method.invoke 虚分派递归栈溢出，改成自己读 Parcel 调实现再按 AIDL 原格式写回；首次下载 Status=1 时最多等 45s 轮询。空间/光栅：AOD 归位/压暗 tick 加代际校验 + 亮屏兜底解冻，修传感器偶发不恢复；AOD 直接解锁不经过 onExitAod ⇒ 解锁无条件复位压暗与冻结；「仅桌面档」挂共用 leash 时不再丢掉唯一一份桌面层，锁屏态用 alpha 自隐。视差：主体位移加标记，只在实际动过之后复位，避免覆盖系统 AOD 的 0.95 缩放。光栅/空间组顺序持久化：应用 / 新建置顶、关闭不清，修「重开跳回原位」）"
-
+        const val BUILD_TAG = "2026-11-10.20-25 v1.22.81 / v1.0 Beta1（**壁纸重置弹窗**（用户 2026-11-10 要求；纯 UI，不动 hook）：① 现象 = Alive 的解锁动画（AOD→桌面 tr=2 球扩 / 锁屏→桌面内容交叉）在两种壁纸组合下丢失或露系统壁纸：(a) 系统锁屏壁纸走 `MiuiKeyguardPictorialWallpaper`（开景深），(b) 系统与锁屏是两张不同壁纸。② 根因（层树实证）= 动画画在**锁屏份**上，而锁屏份挂在「解锁即销毁」的锁屏壁纸窗口里：开景深时 `WallpaperWindowToken{...} flags:1`（eLayerHidden）、父层 `MiuiKeyguardPictorialWallpaper` 同为 hidden ⇒ 日志里 28~31 帧一帧不少但屏幕上看不见；两张壁纸时是两条独立 leash，换层瞬间桌面份 buffer 陈旧（实测 `swap=锁屏 2148 / 桌面 9`）⇒ 透出系统壁纸。③ 修法 = 应用 Alive 前无条件弹「壁纸重置提示」（新增 `ui/WallpaperResetDialog`，确认键 `danger` 警示色），确认后 `AliveControl.disable(静默)` → `clear(FLAG_SYSTEM or FLAG_LOCK)` 回系统默认壁纸 → 1200ms → `killall com.miui.miwallpaper` 重建壁纸层 → 1800ms → 原 apply 流程；期间 toast「正在应用请稍后」，末了仍是「Alive壁纸已生效」。失败只写 RunLog、照常继续。④ 实测结论（决定方案）：`clear(FLAG_LOCK)` 会保留系统壁纸（`mWhich` 1/2 → 3/3 共用），`clear(both)` 才回默认；检测侧 `getWallpaperInfo` 恒 null、`getWallpaperId` 在 `mWhich=3` 时仍不同（2887/2888）⇒ 公开 API 判不了「同一张」，只能无条件 clear 兜底。**APK 版本保持 code 101 / 1.0 Beta1**。上版 v1.22.80：**AOD 从桌面进入全黑修复**（用户 2026-11-10 要求；只动 aod/SystemUI，不碰 system_server）：① 反编译定位到「AOD 画面 = 一块全屏黑底 View + 上面的时钟」，黑底来自 `AODView.makeNormalPanel` / `DozeHost.disableShowWallpaper` 的 `setBackgroundColor(-16777216)`；`DozeHost.showSecurityIdentityViewAt` 里 `z = isLinkageState() && mNeedLinkageWallpaperAnim`，`z==false` 时早退并跳过收尾的 `setBackgroundColor(0)`。`z` 只在熄屏那一刻已站在锁屏时才为 true（`updateScreenOffNeedLinkageAnimStateInternal` 要求 `mKeyguardShowing && StatusBarState==KEYGUARD`，由 `MiuiDozeService#onDreamingStarted` 用 `aodView.setTag` 递给 aod 插件）⇒ 只有「锁屏进 AOD」透明，「桌面进 AOD」停在黑底。② **第一版踩坑**：hook 装到了 `com.miui.aod` 进程 —— 无效。AOD 的类其实由 `com.miui.aod` 的**插件 classloader 加载在 SystemUI 进程**（logcat `27090 D AODView : ...`，27090 = com.android.systemui；与 `AodClockProbe` 老结论一致），所以改到 SystemUI 里装、按类名认人。③ 新增 `hook/AliveAodHost`：`View#setBackgroundColor` 只认 AODView 实例且只把 `-16777216` 改判成 0、`setBackground/setBackgroundDrawable/setBackgroundResource` 跳过、AOD 宿主入窗时兜底置空并打诊断（`bg=ColorDrawable(#FF000000)`）；只在 `AliveFlag.PROP_ACTIVE=1` 时生效（1s 缓存）。**刻意不碰 `isUsingSuperWallpaperStyle`**（会把 mMode 改成 2 = 超壁纸定位，连带改时钟布局、破坏球心 0.2335 对齐）。上版 v1.22.79：AOD 总开关联动（`doze_always_on` 为唯一判据 + 应用拦截 + 自动关闭）。**版本元数据升级（2026-11-10 用户要求）：versionCode 5→101、versionName 「0.5 Beta2」→「1.0 Beta1」，无功能改动。**）"
         /** 第二个作用域（2026-09-28 起）：只为了锁屏那个「自定义锁屏」按钮的层级。 */
         const val SYSTEM_UI_PACKAGE = "com.android.systemui"
 
@@ -1503,6 +1666,17 @@ class HookEntry : XposedModule() {
 
         /** provider 调用的 `--arg` 前缀：「点选图前的景深检查」请求（`depth=<请求号>`）。 */
         const val DEPTH_ARG_PREFIX = "depth="
+
+        /**
+         * provider 调用的 `--arg` 前缀：「只刷新当前壁纸缩略图」（`thumb=1` / `thumb=force`）。
+         *
+         * 与模块 App 侧 `MaskUiState.THUMB_ARG_PREFIX` 必须一致 —— 两侧各自持一份字面量，
+         * 因为 hook 不引用 UI 类（会被 R8 连带拖进宿主进程的类加载范围）。
+         */
+        const val THUMB_ARG_PREFIX = "thumb="
+
+        /** `thumb=force`：App 侧的缩略图缓存不存在，必须无条件重推（不去重）。 */
+        const val THUMB_ARG_FORCE = "thumb=force"
         const val KEY_PARCEL_FILE_DESCRIPTOR = "parcelFileDescriptor"
 
         /** 「解除景深遮挡限制」的挂载点：**编辑器侧**避让判定的唯一出口。 */

@@ -8,9 +8,6 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import java.io.FileNotFoundException
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * 把替换图和配置以 ContentProvider 的形式暴露给被 hook 的进程。
@@ -86,6 +83,40 @@ class MaskProvider : ContentProvider() {
             } else {
                 java.io.File(dir, name)
             }
+            if (!f.isFile) throw FileNotFoundException("文件不存在: $uri")
+            return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+        }
+        // 「Alive 壁纸」的两张画面（2026-11-07 立项，2026-11-08 扩成三槽）：
+        //   content://…/alive/<卡id>/lock  —— 锁屏图（也是 AOD 层的源）
+        //   content://…/alive/<卡id>/desk  —— 桌面图
+        // 与光栅同一条理由 —— 渲染器在 SystemUI 进程里看不到模块的私有目录。
+        // 文件名从 meta.json 里取，同样过白名单正则（provider 是导出的）。
+        if (uri.pathSegments.firstOrNull() == ALIVE_SEGMENT) {
+            val id = uri.pathSegments.getOrNull(1).orEmpty()
+            if (!id.matches(RASTER_ID_RE)) throw FileNotFoundException("非法的 Alive 壁纸路径: $uri")
+            val dir = java.io.File(java.io.File(appContext.filesDir, "alive"), id)
+            val meta = java.io.File(dir, "meta.json")
+            if (!meta.isFile) throw FileNotFoundException("meta 不存在: $uri")
+            val o = runCatching { org.json.JSONObject(meta.readText()) }.getOrNull()
+            val slot = uri.pathSegments.getOrNull(2).orEmpty()
+            // depth = 锁屏景深主体：优先 AICR 抠像，没有就用用户导入的遮罩/主体
+            val name = when (slot) {
+                "desk" -> o?.optString("desktop").orEmpty()
+                "depth" -> o?.optString("lockSubject").orEmpty()
+                    .ifEmpty { o?.optString("lockMask").orEmpty() }
+                // aod = 用户自选的 AOD 图（2026-11-09）。**「AOD 与锁屏一致」开着时返回空**：
+                // 渲染器读到 null 就不加载、零额外显存，直接用锁屏图（= 一致语义）。
+                // 空串过不了下面的白名单正则 ⇒ 直接 404，正好是我们要的「没有」。
+                "aod" -> if (o?.optBoolean("aodFollowLock", true) == true) {
+                    ""
+                } else {
+                    o?.optString("aodSrc").orEmpty()
+                }
+                // 旧路径 `/photo` 与显式 `/lock` 都读锁屏（`photo` 是 2026-11-07 的兼容入口）
+                else -> o?.optString("lock").orEmpty()
+            }
+            if (!name.matches(ALIVE_FILE_RE)) throw FileNotFoundException("非法的图片名: $uri")
+            val f = java.io.File(dir, name)
             if (!f.isFile) throw FileNotFoundException("文件不存在: $uri")
             return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
         }
@@ -169,8 +200,20 @@ class MaskProvider : ContentProvider() {
                 putString(KEY_SPATIAL_FP, prefs.spatialWallpaperFp)
                 // 「光栅壁纸」的开启状态与**壁纸基准**（2026-11-05）—— 消费方同样是 aod 侧的
                 // 换壁纸检测（`HookRuntime` 的 raster 分支）。同样**没有开关**。
-                putBoolean(KEY_RASTER_ACTIVE, prefs.rasterActiveId.isNotEmpty())
+                //
+                // 2026-11-07：服务模式**不写 `rasterActiveId`**，且换壁纸由系统自己处理
+                //（服务模式不需要我们检测关闭），所以只有 LSPosed 链才算「生效中」。
+                // 以前直接看 id 非空 ⇒ 只点过「跳转系统页」也会被误判为生效。
+                putBoolean(
+                    KEY_RASTER_ACTIVE,
+                    prefs.rasterMountMode == MaskPrefs.RASTER_MOUNT_LSPOSED &&
+                        prefs.rasterActiveId.isNotEmpty(),
+                )
                 putString(KEY_RASTER_FP, prefs.rasterWallpaperFp)
+                // 「Alive 壁纸」的开启状态与**壁纸基准**（2026-11-07）—— 消费方同样是 aod 侧的
+                // 换壁纸检测。只有 LSPosed 一条链，判据就是 id 非空；没有开关。
+                putBoolean(KEY_ALIVE_ACTIVE, prefs.aliveActiveId.isNotEmpty())
+                putString(KEY_ALIVE_FP, prefs.aliveWallpaperFp)
                 // 「视差效果覆盖桌面」（2026-10-21）—— 消费方：miwallpaper / SystemUI 的解锁动画抑制。
                 putBoolean(KEY_PARALLAX_COVER_DESKTOP, prefs.parallaxCoverDesktop)
                 // 「强制锁屏元素深浅模式」—— 主开关 + 6 个元素的档位（消费方：SystemUI 侧的深浅注入）。
@@ -217,12 +260,6 @@ class MaskProvider : ContentProvider() {
                     } > 0
                     if (cleared) prefs.bumpRevision()
                 }
-                prefs.recordInjection(
-                    processName = arg ?: "unknown",
-                    at = System.currentTimeMillis(),
-                    revision = extras?.getLong(KEY_REVISION, -1L) ?: -1L,
-                    detail = extras?.getString(KEY_DETAIL).orEmpty(),
-                )
                 Bundle.EMPTY
             }
 
@@ -234,12 +271,6 @@ class MaskProvider : ContentProvider() {
                 prefs.setInjectedWallpaper("")
                 prefs.setProtecting(false)
                 prefs.bumpRevision()
-                prefs.recordInjection(
-                    processName = arg ?: DISARM_BY_USER,
-                    at = System.currentTimeMillis(),
-                    revision = prefs.revision,
-                    detail = "保护已解除：候选项与注入快照都已清空（$CLEAR_HINT）",
-                )
                 Bundle.EMPTY
             }
 
@@ -259,12 +290,6 @@ class MaskProvider : ContentProvider() {
                         MaskStore.clearInjected(appContext, role)
                     }
                     prefs.setInjectedWallpaper("")
-                    prefs.recordInjection(
-                        processName = arg ?: RELEASE_BY_SCREEN_ON,
-                        at = System.currentTimeMillis(),
-                        revision = prefs.revision,
-                        detail = "保护已结束：灭亮屏后景深层已重新解码，替换已生效；候选与注入快照已一并清除。",
-                    )
                     prefs.bumpRevision()
                 }
                 Bundle.EMPTY
@@ -309,6 +334,31 @@ class MaskProvider : ContentProvider() {
                 Bundle.EMPTY
             }
 
+            // 当前锁屏壁纸的**缩略图**（2026-11-07，锁屏遮罩页「当前壁纸」卡用）。
+            // arg = base64(JPEG)。hook 在 com.miui.aod 进程里读得到 `templates/current/wallpaper`，
+            // 模块 app 进程读不到 —— 而 `WallpaperManager` 的读接口在 Android 14 起对第三方
+            // 应用一律抛 SecurityException，所以只能借这条自家通道。
+            // 只落一张 cacheDir 里的小图，写失败不影响任何功能（卡片退化成纯底色）。
+            METHOD_LOCK_WALLPAPER -> {
+                if (!arg.isNullOrEmpty()) {
+                    // 失败就静默（卡片退化成纯底色，不影响任何功能）。
+                    // ⚠️ 先写临时文件再 rename：界面那边按 mtime 轮询、随即 decodeFile，
+                    //    直接 writeBytes 会有"读到半个 JPEG"的窗口（解出来是 null ⇒ 卡片空着）。
+                    //    rename 是原子的 ⇒ 读到的永远是完整文件。
+                    runCatching {
+                        val bytes = android.util.Base64.decode(arg, android.util.Base64.DEFAULT)
+                        val target = java.io.File(appContext.cacheDir, LOCK_THUMB_NAME)
+                        val tmp = java.io.File(appContext.cacheDir, "$LOCK_THUMB_NAME.tmp")
+                        tmp.writeBytes(bytes)
+                        if (!tmp.renameTo(target)) {
+                            target.writeBytes(bytes)
+                            tmp.delete()
+                        }
+                    }
+                }
+                Bundle.EMPTY
+            }
+
             // hook 完成一次「立即替换」的落盘后回执（arg = 请求号）。
             METHOD_APPLY_ACK -> {
                 arg?.trim()?.toLongOrNull()?.let { prefs.setApplyAck(it) }
@@ -348,10 +398,6 @@ class MaskProvider : ContentProvider() {
             // 区别只有文案。`disable` 内部会兜底切主线程（`call` 跑在 binder 线程）。
             METHOD_SPATIAL_AUTO_OFF -> {
                 SpatialControl.disable(appContext, "检测到壁纸变化，空间壁纸已自动关闭")
-                val at = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                prefs.setDiagNote(
-                    "空间壁纸自动关闭：$at → 检测到换壁纸${if (arg.isNullOrBlank()) "" else "（$arg）"}",
-                )
                 Bundle.EMPTY
             }
 
@@ -362,10 +408,6 @@ class MaskProvider : ContentProvider() {
             // 服务模式不额外 `WallpaperManager.clear()` —— 系统已经把壁纸换掉了。
             METHOD_RASTER_AUTO_OFF -> {
                 RasterControl.disable(appContext, "检测到壁纸变化，光栅壁纸已自动关闭")
-                val at = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                prefs.setDiagNote(
-                    "光栅壁纸自动关闭：$at → 检测到换壁纸${if (arg.isNullOrBlank()) "" else "（$arg）"}",
-                )
                 Bundle.EMPTY
             }
 
@@ -373,6 +415,19 @@ class MaskProvider : ContentProvider() {
             METHOD_RASTER_FP -> {
                 val value = extras?.getString(KEY_RASTER_FP).orEmpty()
                 if (value.isNotEmpty()) prefs.setRasterWallpaperFp(value)
+                Bundle.EMPTY
+            }
+
+            // **换壁纸 → 无条件关闭 Alive 壁纸**（2026-11-07，与光栅同语义）。
+            METHOD_ALIVE_AUTO_OFF -> {
+                AliveControl.disable(appContext, "检测到壁纸变化，Alive壁纸已自动关闭")
+                Bundle.EMPTY
+            }
+
+            // 只更新「Alive 壁纸基准」（惰性补记 / 判据升级用）。
+            METHOD_ALIVE_FP -> {
+                val value = extras?.getString(KEY_ALIVE_FP).orEmpty()
+                if (value.isNotEmpty()) prefs.setAliveWallpaperFp(value)
                 Bundle.EMPTY
             }
 
@@ -385,8 +440,6 @@ class MaskProvider : ContentProvider() {
                     prefs.setParallaxBgActive(false)
                     prefs.setParallaxWallpaperFp("")
                     val token = prefs.requestParallax()
-                    val at = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                    prefs.setDiagNote("视差自动关闭：$at → 检测到换壁纸${if (arg.isNullOrBlank()) "" else "（$arg）"}")
                     Bundle().apply { putLong(KEY_PARALLAX_TOKEN, token) }
                 } else {
                     Bundle.EMPTY
@@ -400,16 +453,6 @@ class MaskProvider : ContentProvider() {
                 val token = value.substringAfterLast('@', "").toLongOrNull() ?: 0L
                 val type = value.substringBefore('@').trim().toIntOrNull()
                 if (token > 0L && type != null) prefs.setDepthProbeResult(type, token)
-                Bundle.EMPTY
-            }
-
-            // 写一行诊断（`diagNote`）：给**另一个进程**（`com.android.systemui`）用。
-            //
-            // 锁屏按钮置顶那条链全在 SystemUI 里，"到底跑没跑、卡在哪一步"模块 app 这边看不到。
-            // 让它把结论回写到这里，用户在设置页「最近操作」就能看见（见 hook/LockScreenButton）。
-            METHOD_NOTE -> {
-                val value = arg.orEmpty()
-                if (value.isNotEmpty()) prefs.setDiagNote(value)
                 Bundle.EMPTY
             }
 
@@ -460,6 +503,17 @@ class MaskProvider : ContentProvider() {
         const val METHOD_FINGERPRINT = "fingerprint"
         const val METHOD_WALLPAPER_SIZE = "wallpaper_size"
 
+        /**
+         * 当前锁屏壁纸的**缩略图**（arg = base64 编码的 JPEG，2026-11-07）。
+         *
+         * 消费方：锁屏遮罩页的「当前壁纸」卡。发送方：hook（com.miui.aod 进程），
+         * 因为它读得到 `templates/current/wallpaper` 而模块 app 读不到。
+         */
+        const val METHOD_LOCK_WALLPAPER = "lock_wallpaper"
+
+        /** 缩略图落在 `cacheDir` 里的文件名（[METHOD_LOCK_WALLPAPER] 写入，界面读）。 */
+        const val LOCK_THUMB_NAME = "lock_wallpaper_thumb.jpg"
+
         /** hook 完成「立即替换」落盘后的回执（arg = 请求号）。 */
         const val METHOD_APPLY_ACK = "apply_ack"
 
@@ -476,14 +530,18 @@ class MaskProvider : ContentProvider() {
         /** 只更新「空间壁纸基准」（2026-10-29；惰性补记 / 判据升级用）。 */
         const val METHOD_SPATIAL_FP = "spatial_fp"
 
-        /** **换壁纸 → 无条件关闭空间壁纸**（2026-10-29）。arg = 判据详情，仅用于 diagNote。 */
+        /** **换壁纸 → 无条件关闭空间壁纸**（2026-10-29）。 */
         const val METHOD_SPATIAL_AUTO_OFF = "spatial_auto_off"
 
         /** 只更新「光栅壁纸基准」（2026-11-05；惰性补记 / 判据升级用）。 */
         const val METHOD_RASTER_FP = "raster_fp"
 
-        /** **换壁纸 → 无条件关闭光栅壁纸**（2026-11-05）。arg = 判据详情，仅用于 diagNote。 */
+        /** **换壁纸 → 无条件关闭光栅壁纸**（2026-11-05）。 */
         const val METHOD_RASTER_AUTO_OFF = "raster_auto_off"
+
+        /** Alive 壁纸：换壁纸自动关闭 + 更新基准（2026-11-07）。 */
+        const val METHOD_ALIVE_AUTO_OFF = "alive_auto_off"
+        const val METHOD_ALIVE_FP = "alive_fp"
 
         /** [METHOD_PARALLAX_AUTO_OFF] 回执 bundle 里的指令号键（与广播 extra 同名，hook 拿到后发广播用）。 */
         const val KEY_PARALLAX_TOKEN = "token"
@@ -491,8 +549,6 @@ class MaskProvider : ContentProvider() {
         /** aod 侧 hook 对「点选图前的景深检查」的回应（arg = `<值>@<请求号>`，值 -1 = 读取失败）。 */
         const val METHOD_DEPTH_STATE = "depth_state"
 
-        /** 写一行诊断进 `diagNote`（arg = 文本）。供 SystemUI 侧的锁屏按钮逻辑回写状态。 */
-        const val METHOD_NOTE = "note"
 
         /** [METHOD_WALLPAPER_SIZE] 的 arg 前缀：原图空间（可当锚点）。 */
         const val SIZE_PREFIX_SOURCE = "src:"
@@ -538,6 +594,10 @@ class MaskProvider : ContentProvider() {
         const val KEY_RASTER_ACTIVE = "raster_active"
         const val KEY_RASTER_FP = "raster_wallpaper_fp"
 
+        /** Alive 壁纸：是否生效 + 壁纸基准（2026-11-07）。 */
+        const val KEY_ALIVE_ACTIVE = "alive_active"
+        const val KEY_ALIVE_FP = "alive_wallpaper_fp"
+
         /** 「视差效果覆盖桌面」（2026-10-21 加，默认关）。 */
         const val KEY_PARALLAX_COVER_DESKTOP = "parallax_cover_desktop"
 
@@ -562,6 +622,9 @@ class MaskProvider : ContentProvider() {
 
         /** 「光栅壁纸」：`raster/<组id>/meta`、`raster/<组id>/<序号>`、`raster/<组id>/subject/<序号>`。 */
         const val RASTER_SEGMENT = "raster"
+
+        /** 「Alive 壁纸」：`alive/<卡id>/photo`（2026-11-07）。 */
+        const val ALIVE_SEGMENT = "alive"
         private val RASTER_ID_RE = Regex("^[0-9]{6,20}$")
         private val RASTER_INDEX_RE = Regex("^[0-9]$")
 
@@ -575,11 +638,32 @@ class MaskProvider : ContentProvider() {
          */
         private val RASTER_FILE_RE =
             Regex("^img_[0-9]+_([0-9a-f]{16}|[0-9a-f]{32})\\.[a-z0-9]{2,5}$")
+
+        /**
+         * Alive 的文件名白名单（**不能复用 [RASTER_FILE_RE]** —— 那个只认 `img_` 前缀，
+         * 而 Alive 三槽用的是 `lock_` / `desk_` 前缀，2026-11-08 真机「点应用不生效」
+         * 就是踩了这个：provider 直接抛 `FileNotFoundException`，渲染器报「锁屏图读不出来」）。
+         *
+         * 合法名：
+         * * `lock_<时间戳>_<16hex>.<ext>` / `desk_<时间戳>_<16hex>.<ext>`（三槽原图）
+         * * 上面两个再拼 `.subject.png` / `.mask.png`（景深主体 / 用户遮罩）
+         * * `aod.png`（生成的预览）
+         */
+        /**
+         * Alive 三槽的图片名白名单。
+         *
+         * ⚠️ 最后一段必须是 `{2,8}` 而不是 `{2,5}`（2026-11-08「景深开了没生效」）：
+         * 景深主体/遮罩是**双扩展名** —— `lock_….png.subject.png` / `lock_….png.mask.png`，
+         * 中间那段 `subject` 有 7 个字符。原来卡在 `{2,5}` ⇒ 正则不匹配 ⇒ provider 抛
+         * `FileNotFoundException("非法的图片名")` ⇒ `AliveOverlay` 读不到图、静默什么都不做，
+         * 界面上完全看不出原因（开关是开的、属性是 1、日志只说"景深开"）。
+         */
+        private val ALIVE_FILE_RE =
+            Regex("^(aod\\.png|(lock|desk|aod)_[0-9]+_[0-9a-f]{16}(\\.[a-z0-9]{2,8}){1,3})$")
         private val SPATIAL_KEY_RE = Regex("^[0-9a-f]{16}$")
         private val SPATIAL_LAYER_RE = Regex("^(layer[0-9]\\.png|depth\\.png|meta\\.json)$")
 
         /** [METHOD_CLEAR] 的 arg 缺省值 —— 当前调用方（hook 换壁纸检测）恒传原因串，此为兜底。 */
-        const val DISARM_BY_USER = "本应用"
 
         /** [METHOD_CLEAR] 的 arg：hook 检测到用户换了壁纸。 */
         const val DISARM_BY_WALLPAPER_CHANGE = "hook（换壁纸）"
@@ -588,7 +672,6 @@ class MaskProvider : ContentProvider() {
         const val RELEASE_BY_SCREEN_ON = "自动（灭亮屏完成）"
 
         /** 解除保护后系统里的文件不会被改动（哪里用到就在文案里说清楚）。 */
-        const val CLEAR_HINT = "系统里的文件未改动"
 
         fun configUri(): Uri = Uri.parse("content://$AUTHORITY")
 

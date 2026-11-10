@@ -183,17 +183,6 @@ internal object SpatialDepth {
     /** 图片内容哈希（缓存键）。UI 用它判断「这张图有没有缓存」。 */
     fun cacheKey(ctx: Context, uri: Uri): String = sha16(ctx, uri)
 
-    /**
-     * 该图是否已有深度缓存：有则返回缓存键，没有返回 null。
-     *
-     * ⚠️ 会**完整读一遍图片算 sha256**（几十到几百毫秒），调用方放 IO 线程。
-     */
-    fun hasCache(ctx: Context, uri: Uri): String? {
-        val key = sha16(ctx, uri)
-        val dir = File(cacheRoot(ctx), key)
-        return if (File(dir, "depth.png").isFile && File(dir, "meta.json").isFile) key else null
-    }
-
     /** 缓存目录里的原图文件（可能不存在）。 */
     fun sourceFile(depthDir: File): File = File(depthDir, SOURCE_NAME)
 

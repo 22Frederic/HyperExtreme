@@ -67,7 +67,6 @@ import top.yukonga.miuix.kmp.blur.textureBlur
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ChevronBackward
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.theme.ThemeController
 import java.io.File
 import androidx.compose.foundation.layout.size
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -126,9 +125,7 @@ internal class SpatialCropActivity : ComponentActivity() {
         setContent {
             val prefs = remember { MaskPrefs(this) }
             val themeMode = remember { ThemeMode.of(prefs.themeMode) }
-            val controller = remember(themeMode) {
-                ThemeController(colorSchemeMode = themeMode.toColorSchemeMode())
-            }
+            val controller = rememberThemeController(themeMode, remember { prefs.monetColor })
             MiuixTheme(controller = controller, textStyles = HyperTextStyles) {
                 CropScreen(key = key, onClose = { finish() })
             }

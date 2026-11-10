@@ -103,15 +103,6 @@ import java.lang.ref.WeakReference
  * | `KeyguardTouchHandlingInteractor#hideMenu` | 真机上可能一次都不触发，只作兜底，另配 8 秒定时还原 |
  *
  * 都是**延迟 `EXIT_ANIMATION_MS` 再复原**：等菜单淡出动画走完再搬回去，观感上不闪。
- *
- * ## 诊断：为什么 Context 要从 View 上取
- *
- * 这一步跑在 SystemUI 进程里，模块 app 看不到过程，所以关键结论要通过 provider 写进
- * `diagNote`（设置页「最近操作」）。而**写它需要 Context** —— 千万**别用**
- * `HookRuntime.appContext()`：那个走的是反射 hidden API（`ActivityThread#currentApplication`），
- * 在 SystemUI 进程里拿不到就整条链静默死掉，真机表现就是"作用域勾了、重启多轮、
- * 连一条诊断都写不出来"（2026-09-28 踩过）。
- * hook 的参数里就有 View，`view.context` 一定拿得到，所以诊断在 [attach] / [attachKeyguardRoot] 里写。
  */
 internal object LockScreenButton {
 
@@ -155,12 +146,6 @@ internal object LockScreenButton {
     /** 锁屏根视图（`keyguard_root_view`），拿不到按钮时靠它重新搜。 */
     private var keyguardRoot = WeakReference<View>(null)
 
-    /** 写诊断用的 Context —— **从 hook 到的 View 上取**，见类文档最后一段。 */
-    private var hostContext = WeakReference<Context>(null)
-
-    /** 四处 hook 的安装结果，由 `HookEntry` 写进来，随诊断一起回写。 */
-    private var installSummary = "尚未安装"
-
     // ------------------------------------------------------------------ 搬迁用的状态
 
     /** 全屏宿主：插在通知容器之上，按钮临时住在里面。 */
@@ -200,12 +185,8 @@ internal object LockScreenButton {
      */
     private var cachedVerbose = false
 
-    /** 上一次回写过的诊断文本（内容没变就不重复写，免得覆盖掉别的诊断）。 */
-    private var lastReport = ""
-
     /** `HookEntry` 装完 hook 后把结果记进来。 */
     fun recordInstall(summary: String) {
-        installSummary = summary
         HookRuntime.log("锁屏按钮置顶：安装结果已记录（$summary）")
     }
 
@@ -288,7 +269,6 @@ internal object LockScreenButton {
     fun attach(view: View?, source: String) {
         if (view == null) return
         if (moving) return
-        hostContext = WeakReference(view.context)
         button = WeakReference(view)
         // 顺手记下根视图：它是后面兜底搜索的起点（`rootView` 本身就是 View，不用再转）。
         val root = view.rootView
@@ -297,7 +277,6 @@ internal object LockScreenButton {
             "锁屏按钮置顶：已拿到「自定义锁屏」按钮（${view.javaClass.simpleName}，" +
                 "来源=$source，visibility=${view.visibility}，attached=${view.isAttachedToWindow}）",
         )
-        report("已拿到按钮（$source）")
         // 延迟一帧：等这一轮 addView / 布局走完。
         main.post { applyLift("按钮出现（$source）") }
     }
@@ -305,7 +284,6 @@ internal object LockScreenButton {
     /** `DefaultSettingsPopupMenuSection#addViews` 的参数就是锁屏根视图，进来按 id 名搜一次按钮。 */
     fun attachKeyguardRoot(root: View?) {
         if (root == null) return
-        hostContext = WeakReference(root.context)
         keyguardRoot = WeakReference(root)
         val found = searchCustomizeButton(root)
         if (found != null) {
@@ -317,7 +295,6 @@ internal object LockScreenButton {
         // （`KeyguardBlueprintViewBinder` 也是 `repeatWhenAttached`，晚于 attach），
         // 按钮还没被 addViews 加进来。真正的入口是 `View#onAttachedToWindow` 按 id 名认人。
         HookRuntime.log("锁屏按钮置顶：已拿到锁屏根视图（${root.javaClass.simpleName}），此刻按钮还没建出来")
-        report("已拿到锁屏根视图")
     }
 
     /** 长按菜单出现。 */
@@ -325,7 +302,6 @@ internal object LockScreenButton {
         // 这条是"长按 hook 真的被回调了"的铁证。若它始终不出现、而按钮却出现了，
         // 就说明这个 hook 没被触发（见 [attach] 的注释），功能靠 [attach] 那条路兜住。
         HookRuntime.log("锁屏按钮置顶：onLongPress hook 命中（菜单出现）")
-        report("已收到长按")
         main.removeCallbacks(restoreTask)
         main.post {
             ensureButtonFound()
@@ -391,14 +367,12 @@ internal object LockScreenButton {
                 "（锁屏根视图里有，但按 id 名 / 文本没搜到）"
             }
             HookRuntime.log("锁屏按钮置顶：没找到「自定义锁屏」按钮 $hint")
-            note("锁屏按钮置顶：未找到按钮$hint")
             return
         }
         if (!switchEnabled(start.context)) {
-            // 开关默认是关的 —— 这里必须**写到诊断里**，不然用户只会看到"没反应"，
+            // 开关默认是关的 —— 日志里必须留一条，不然排查时只会看到"没反应"，
             // 完全想不到是自己没打开开关。
             HookRuntime.log("锁屏按钮置顶：功能开关未开启，不处理")
-            note("锁屏按钮置顶：已收到长按，但功能开关没打开（设置 → 系统界面 → 锁屏修改）")
             return
         }
         // 只有"按钮真的显示出来"（= 菜单已弹出）才搬 —— 见类文档「什么时候搬」：
@@ -421,7 +395,6 @@ internal object LockScreenButton {
     /** 抬高过程整体兜异常：这一步以前是裸的，万一某个 View 的父级状态异常，会直接崩到 SystemUI 的主线程。 */
     private fun onLiftFailed(error: Throwable) {
         HookRuntime.log("锁屏按钮置顶：抬高过程出错 $error")
-        note("锁屏按钮置顶：抬高过程出错（$error）")
     }
 
     /**
@@ -447,7 +420,6 @@ internal object LockScreenButton {
         val notif = searchByIdName(window, NOTIFICATION_CONTAINER_ID)
         if (notif == null) {
             HookRuntime.log("锁屏按钮置顶：窗口里没有通知容器，放弃（不知道该压在哪一层之上）")
-            note("锁屏按钮置顶：没找到通知容器，未处理")
             return
         }
         val container = notif.parent as? ViewGroup
@@ -537,7 +509,6 @@ internal object LockScreenButton {
 
         dumpStructure(target, newHost, notif)
         HookRuntime.log("锁屏按钮置顶：已把按钮搬到通知之上（原因=$reason）")
-        note("锁屏按钮置顶：已搬到通知之上（$reason）")
     }
 
     /** 把"按钮原来在哪、搬到哪、动了几层"摊成日志 —— 一次问清楚，省得再来回猜。 */
@@ -731,13 +702,11 @@ internal object LockScreenButton {
             searchCustomizeButton(root)?.let {
                 button = WeakReference(it)
                 HookRuntime.log("锁屏按钮置顶：兜底搜寻找到了按钮（${it.javaClass.simpleName}）")
-                note("锁屏按钮置顶：已找到「自定义锁屏」按钮（${it.javaClass.simpleName}）")
                 return
             }
         }
         // 还没找到：把现场情况写出来，下次一眼知道是"按钮还没建"还是"压根不在这棵树上"。
         HookRuntime.log("锁屏按钮置顶：兜底也没找到按钮（窗口 ${roots.size} 个，含'锁屏'字样的文本节点 $lockscreenTexts 个）")
-        note("锁屏按钮置顶：长按了但没找到按钮（窗口 ${roots.size} 个，含'锁屏'字样的文本 $lockscreenTexts 个）")
     }
 
     /** 纯诊断用：数一数这棵树里有多少个含「锁屏」字样的文本节点。 */
@@ -801,25 +770,6 @@ internal object LockScreenButton {
         cachedVerbose = bundle?.getBoolean(MaskProvider.KEY_VERBOSE, false) ?: false
         cachedSwitch = bundle?.getBoolean(MaskProvider.KEY_LOCKSCREEN_BUTTON_TOP, false) ?: false
         return cachedSwitch
-    }
-
-    /** 把关键结论回写到模块 app 的 `diagNote`（设置页「最近操作」能看到）。 */
-    private fun report(stage: String) {
-        val text = "锁屏按钮置顶：$stage；hook 安装：$installSummary"
-        if (text == lastReport) return
-        lastReport = text
-        note(text)
-    }
-
-    private fun note(text: String) {
-        val context = hostContext.get() ?: HookRuntime.appContext()
-        if (context == null) {
-            HookRuntime.log("锁屏按钮置顶：没有 Context，诊断写不出去（$text）")
-            return
-        }
-        runCatching {
-            context.contentResolver.call(MaskProvider.configUri(), MaskProvider.METHOD_NOTE, text, null)
-        }.onFailure { HookRuntime.log("锁屏按钮置顶：诊断回写失败（$it）") }
     }
 
     private fun vlog(message: String) {

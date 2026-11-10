@@ -605,12 +605,6 @@ internal object RecentsStatusBar {
         return HookRuntime.remoteBoolean(MaskPrefs.KEY_HIDE_STATUSBAR_IN_RECENTS) ?: false
     }
 
-    /**
-     * 供 [StatusBarIconHide] 的「刷新轮」复用 —— **必须走这里**，才能保证设位/清位用的是
-     * 同一个 `StatusBarManager` 实例（token 稳定是 disable 位能成对清退的前提，见 [manager] 注释）。
-     */
-    internal fun setDisabledShared(what: Int): Boolean = setDisabled(HookRuntime.appContext(), what)
-
     // ---------------------------------------------------------------- 设位
 
     /**

@@ -1,25 +1,12 @@
 package com.frederic22.hyperextreme.ui
 
-import android.graphics.Bitmap
-import android.util.Size
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.FlingBehavior
-import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -32,45 +19,25 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawWithCache
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size as GeomSize
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.translate
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.zIndex
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.frederic22.hyperextreme.data.MaskPrefs
@@ -83,8 +50,6 @@ import com.frederic22.hyperextreme.wallpaper.RasterServiceTarget
 import com.frederic22.hyperextreme.wallpaper.RasterWallpaperService
 import com.frederic22.hyperextreme.wallpaper.SpatialServiceMode
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.BasicComponent
@@ -92,21 +57,11 @@ import top.yukonga.miuix.kmp.basic.BasicComponentColors
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
-import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.Add
-import top.yukonga.miuix.kmp.squircle.SquircleDefaults
-import top.yukonga.miuix.kmp.squircle.addSquircleRect
 import top.yukonga.miuix.kmp.squircle.squircleClip
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.window.WindowDialog
-import java.io.File
-import kotlin.math.abs
-import kotlin.math.ceil
-import kotlin.math.floor
 import kotlin.math.roundToInt
 
 /**
@@ -218,6 +173,8 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     var shiftFromPage by remember { mutableIntStateOf(-1) }
     // 每次补位 +1：卡片流用它在**创建时**就把进度建成 0，避免晚一帧才归零（那一帧会闪）。
     var shiftToken by remember { mutableIntStateOf(0) }
+    // 「清除所有搭配」请求号（2026-11-07）：+1 交给卡片流播"全部缩小淡出 → 新建卡补位"。
+    var clearSeq by remember { mutableIntStateOf(0) }
 
     val prefs = remember { MaskPrefs(ctx) }
     // 「当前使用中的组」——空串 = 一套都没应用。
@@ -278,6 +235,8 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     var maxAngle by remember { mutableIntStateOf(prefs.rasterMaxAngle) }
     // 「停顿时就近归位」（默认开）：关掉后可以停在两张之间不动。
     var settle by remember { mutableStateOf(prefs.rasterSettle) }
+    // 「过渡效果」四档（0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃·扭曲）：擦除带里叠哪种玻璃。
+    var transitionChoice by remember { mutableIntStateOf(prefs.rasterTransition) }
 
     // ───────────── 系统壁纸服务模式（2026-11-04）─────────────
     //
@@ -289,6 +248,16 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     //    只比包名会让两条链互相误判「我的服务正在跑」。
     var serviceRunning by remember {
         mutableStateOf(SpatialServiceMode.isRunning(ctx, RasterWallpaperService::class.java))
+    }
+    /**
+     * 服务模式的「当前目标组」—— 真值在 [RasterServiceTarget] 文件里（主进程写、壁纸进程读）。
+     *
+     * 2026-11-07 修（照空间壁纸页定案）：服务模式**不再写 `prefs.rasterActiveId`**。
+     * 点「跳转系统页」只是写 target + 拉起系统页，用户可能直接返回什么都没设；把那一刻
+     * 当成"已启用"会让改选项误弹「下次生效」、AOD 换壁纸检测误判、卡片误高亮。
+     */
+    var serviceTargetId by remember {
+        mutableStateOf(RasterServiceTarget.readKey(ctx).orEmpty())
     }
     var showMountWarn by remember { mutableStateOf(false) }
     var noMoreWarn by remember { mutableStateOf(false) }
@@ -305,11 +274,12 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
      * 其余组**随便删**（用户 2026-11-04 纠正：原来用 `locked` 把所有组都拦了，
      * 没在用的配套也弹「请先取消应用」）。
      *
-     * 服务模式额外要求 `serviceRunning`：用户可能已经从系统壁纸页换回默认壁纸，
-     * 这时 `activeId` 还指着旧组，但那组已经不在渲染，删掉没有任何影响。
+     * 服务模式取 `serviceTargetId`（target 文件里的真值）且额外要求 `serviceRunning`：
+     * 用户可能只是点过「跳转系统页」、或已经从系统壁纸页换回默认壁纸，
+     * 这时那组并不在渲染，删掉没有任何影响。2026-11-07 起服务模式不再写 `activeId`。
      */
     val inUseId = when {
-        mountMode == RASTER_MOUNT_SERVICE -> if (serviceRunning) activeId else ""
+        mountMode == RASTER_MOUNT_SERVICE -> if (serviceRunning) serviceTargetId else ""
         else -> activeId
     }
 
@@ -322,6 +292,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
             if (event == Lifecycle.Event.ON_RESUME) {
                 // 用户可能在系统壁纸页里换了图 / 换了范围，回来必须重新对一次。
                 serviceRunning = SpatialServiceMode.isRunning(ctx, RasterWallpaperService::class.java)
+                serviceTargetId = RasterServiceTarget.readKey(ctx).orEmpty()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -358,8 +329,15 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
             return
         }
         haptic()
-        prefs.setRasterActiveId(g.id)
-        activeId = g.id
+        if (mountMode == RASTER_MOUNT_SERVICE) {
+            // **服务模式只写 target 文件**（真值在壁纸进程），不落 `prefs.rasterActiveId`。
+            // 2026-11-07：以前无条件写 prefs ⇒ 点过「跳转系统页」就算"已启用"，
+            // 哪怕用户在系统页什么都没设。现在启用态一律以 `SpatialServiceMode.isRunning` 为准。
+            serviceTargetId = g.id
+        } else {
+            prefs.setRasterActiveId(g.id)
+            activeId = g.id
+        }
         // 应用即置顶，但**只写顺序、不动当前列表**（2026-11-05 用户明确）：
         // 点应用的这一刻卡片留在原位，退出页面重进时才刷新到第一个；
         // 关闭应用也不清顺序 ⇒ 重进仍在第一个。
@@ -373,14 +351,16 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                 DynamicWallpaperPermission.openSettings(ctx)
                 return
             }
-            RasterServiceTarget.write(ctx, g.id, prefs.rasterMaxAngle, prefs.rasterSettle)
+            RasterServiceTarget.write(
+                ctx, g.id, prefs.rasterMaxAngle, prefs.rasterTransition, prefs.rasterSettle,
+            )
             SpatialServiceMode.openPicker(ctx, RasterWallpaperService::class.java)
             Toast.makeText(ctx, "请在系统服务页设置生效范围", Toast.LENGTH_LONG).show()
         } else {
             // 景深开关随「应用」一起下发（生效中改它只写 prefs，下一次应用才生效 —— 与空间壁纸同语义）。
             RasterFlag.push(
                 true, g.id, prefs.rasterScope, prefs.rasterLockDepth,
-                prefs.rasterMaxAngle, prefs.rasterSettle,
+                prefs.rasterMaxAngle, prefs.rasterTransition, prefs.rasterSettle,
             )
             // 记「壁纸基准」（2026-11-05）：aod 侧的换壁纸检测拿它当比对值，判据一变就无条件关闭
             // 光栅壁纸。判据要读模板文件 ⇒ 放后台、不阻塞点按；算不出来就留空 —— hook 侧会
@@ -403,13 +383,40 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     }
 
     /**
+     * 「过渡效果 / 停顿时就近归位」**生效中实时下发**（2026-11-07 用户定）。
+     *
+     * 两项都是纯渲染参数：不动 active / key / 图，不重建渲染器，也不重载纹理。
+     * * LSPosed：整批推属性，轮询线程读到变化后热更新 + 立刻归位；
+     * * 服务：重写 target 文件，壁纸进程的 `FileObserver` 收到后热更新 + 立刻归位。
+     *
+     * ⚠️ 角度 `rasterMaxAngle` **故意不进这条通道**：分母变了会让当前画面跳图，
+     * 按用户决定仍维持「下一次替换 / 下一次可见」才生效。这里只是把当前值原样带上，
+     * 渲染侧实时通道不读它。
+     */
+    fun pushRealtime(transition: Int, settleOn: Boolean) {
+        if (mountMode == RASTER_MOUNT_SERVICE) {
+            if (serviceRunning && serviceTargetId.isNotEmpty()) {
+                RasterServiceTarget.write(
+                    ctx, serviceTargetId, prefs.rasterMaxAngle, transition, settleOn,
+                )
+            }
+        } else if (inUseId.isNotEmpty()) {
+            RasterFlag.push(
+                true, inUseId, prefs.rasterScope, prefs.rasterLockDepth,
+                prefs.rasterMaxAngle, transition, settleOn,
+            )
+        }
+    }
+
+    /**
      * 取消应用 / 恢复默认。
      *
      * 服务模式下必须走 `WallpaperManager.clear()`（同步 binder，几百 ms ⇒ 丢 IO 线程），
      * 否则系统壁纸还是我们的 service，只是 target 被清空 ⇒ 壁纸进程画不出东西 = 黑屏。
      */
     fun clearActive() {
-        if (activeId.isEmpty() && !serviceRunning) return
+        // 判据用真实运行态：服务模式 `activeId` 恒空，只看它会误早退。
+        if (inUseId.isEmpty() && activeId.isEmpty() && !serviceRunning) return
         haptic()
         if (mountMode == RASTER_MOUNT_SERVICE) {
             scope.launch {
@@ -421,6 +428,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                 // 壁纸基准随关闭一起清 —— 下次应用时重记（与空间同语义）。
                 prefs.setRasterWallpaperFp("")
                 activeId = ""
+                serviceTargetId = ""
                 Toast.makeText(ctx, "已恢复到系统默认壁纸", Toast.LENGTH_LONG).show()
             }
             return
@@ -487,6 +495,28 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
         }
     }
 
+    /**
+     * 「清除所有搭配」的动画收尾（2026-11-07）：卡片流播完 200ms 缩小淡出后回调这里。
+     *
+     * **这一帧同步清空列表** —— 新建卡的补位进度就是按 `groups` 变空的那一帧创建的，
+     * 先删盘再清会看到它先瞬移到中间、再滑回来。
+     *
+     * ⚠️ `reload++` 必须等删盘完成：重扫是"磁盘即真相"，盘上还有组时扫回来会把卡片又填上。
+     */
+    fun commitClearAll() {
+        activeId = ""
+        serviceTargetId = ""
+        focused = 0
+        groups = emptyList()
+        prefs.setRasterGroupOrder(emptyList())
+        prefs.setRasterActiveId(null)
+        scope.launch {
+            val n = withContext(Dispatchers.IO) { RasterStore.deleteAll(ctx) }
+            reload++
+            Toast.makeText(ctx, "已清除 $n 项搭配", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     val screen = rememberScreenSizePx()
     val density = LocalDensity.current
     // 卡宽（dp）—— 主按钮的宽度按它的 5/6 算（用户 2026-11-03 定）。
@@ -516,11 +546,13 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
             CoverCarousel(
                 items = groups.map { CoverItem(it.id, it.coverFile) },
                 initialPage = if (groups.isEmpty()) 0 else 1,
-                activeId = activeId,
+                // 高亮「正在渲染的那一组」：服务模式看 target 真值，不再看"点过跳转"的指针。
+                activeId = inUseId,
                 deletingId = deletingId,
                 shiftDir = shiftDir,
                 shiftFromPage = shiftFromPage,
                 shiftToken = shiftToken,
+                clearToken = clearSeq,
                 screen = screen,
                 onFocus = { focused = it },
                 onNew = { openSheet(null) },
@@ -550,6 +582,8 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                     }
                 },
                 onDeleteSettled = { commitDelete() },
+                // 「清除所有搭配」：卡片流负责让所有非新建卡缩小淡出、播完在这一帧回调。
+                onClearSettled = { commitClearAll() },
             )
         } else {
             Spacer(Modifier.height(carouselHeight))
@@ -567,7 +601,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
         // 2026-11-03 晚：「老老实实圆角矩形」—— 宽 = 中间卡片的 5/6，
         // 圆角 / 高度 / 内边距 / 字号全部用 miuix 默认值（不再自己拧）。
         Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-            val isActive = selected != null && selected.id == activeId
+            val isActive = selected != null && selected.id == inUseId
             val serviceMode = mountMode == RASTER_MOUNT_SERVICE
             // 「取消 / 恢复」这类**次要动作**的配色判据：服务模式看的是"服务真在跑"，
             // 不能只看 id 指针 —— 用户可能从系统壁纸页把壁纸换回去了。
@@ -683,7 +717,8 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                     // **不立刻 push**（2026-11-04 用户要求与空间壁纸逐字一致）：
                     // 生效中改范围只记下来，下次点「应用 / 取消应用」时按新值一起推 ——
                     // 避免正在跑的时候拆掉渲染器重建挂载点。
-                    if (activeId.isNotEmpty()) {
+                    // 判据 2026-11-07 换成真实运行态（服务模式不再写 activeId）。
+                    if (inUseId.isNotEmpty()) {
                         Toast.makeText(
                             ctx,
                             "应用范围将在下一次替换时生效",
@@ -700,7 +735,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                     lockDepth = on
                     prefs.setRasterLockDepth(on)
                     // 同一条提示（照抄空间壁纸）：生效中改开关要等下一次替换才下发。
-                    if (activeId.isNotEmpty()) {
+                    if (inUseId.isNotEmpty()) {
                         Toast.makeText(
                             ctx,
                             "应用范围将在下一次替换时生效",
@@ -718,18 +753,24 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                 onCheckedChange = { on ->
                     settle = on
                     prefs.setRasterSettle(on)
-                    // 同一条提示：生效中改要等下一次替换才下发。
-                    if (activeId.isNotEmpty()) {
-                        Toast.makeText(
-                            ctx,
-                            "应用范围将在下一次替换时生效",
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    }
-                    // 服务模式正在跑：顺手写进 target（壁纸进程下次可见时重读）。
-                    if (serviceRunning && activeId.isNotEmpty()) {
-                        RasterServiceTarget.write(ctx, activeId, maxAngle, on)
-                    }
+                    // 2026-11-07：纯渲染参数 ⇒ **立即生效**，不再弹「下一次替换」。
+                    // 渲染侧热更新后会立刻硬切归位一次（用户明确：此时画面在模块，硬切也行）。
+                    pushRealtime(transitionChoice, on)
+                },
+            )
+            // 「过渡效果」（2026-11-06 用户要求，位置夹在「就近归位」和「最大幅度角度」中间）：
+            // 0 = 默认（纯擦除）/ 1 = 条纹玻璃（擦除带内一维条纹折射 + 色散 + 棱线明暗）。
+            // 两种挂载模式都有效 ⇒ 不灰；**无 summary**（用户明确）。
+            DropdownRow(
+                title = "过渡效果",
+                options = RASTER_TRANSITION_LABELS,
+                selectedIndex = transitionChoice.coerceIn(0, RASTER_TRANSITION_LABELS.lastIndex),
+                onSelect = { index ->
+                    transitionChoice = index
+                    prefs.setRasterTransition(index)
+                    // 2026-11-07：纯渲染参数 ⇒ **立即生效**，不再弹「下一次替换」。
+                    // 渲染侧热更新后会立刻硬切归位一次（用户明确：此时画面在模块，硬切也行）。
+                    pushRealtime(index, settle)
                 },
             )
             // 「最大幅度角度」（2026-11-04 用户要求，排在「锁屏景深」下面）：
@@ -748,16 +789,20 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                 onFinished = {
                     // 拖动过程只改内存；松手才落盘（与视差页的 persist 时机一致）。
                     prefs.setRasterMaxAngle(maxAngle)
-                    if (activeId.isNotEmpty()) {
+                    // 2026-11-07 用户定：角度**维持「下一次生效」**——实时改会让
+                    // `t = pan / panMaxRad` 当场跳图，这个副作用不要。判据换成真实运行态。
+                    if (inUseId.isNotEmpty()) {
                         Toast.makeText(
                             ctx,
                             "应用范围将在下一次替换时生效",
                             Toast.LENGTH_SHORT,
                         ).show()
                     }
-                    // 服务模式正在跑：把新角度写进 target —— 壁纸进程下次可见时重读。
-                    if (serviceRunning && activeId.isNotEmpty()) {
-                        RasterServiceTarget.write(ctx, activeId, maxAngle, settle)
+                    // 服务模式正在跑：把新角度写进 target —— 壁纸进程**下次可见**时重读。
+                    // ⚠️ 重写 target 会触发 FileObserver，但实时通道只比 transition/settle，
+                    //    值没变就不会归位、也不会把 panDeg 应用上去。
+                    if (serviceRunning && serviceTargetId.isNotEmpty()) {
+                        RasterServiceTarget.write(ctx, serviceTargetId, maxAngle, transitionChoice, settle)
                     }
                 },
             )
@@ -814,7 +859,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
         summary = when {
             serviceRunning -> "所有搭配内的图片缓存将被删除。当前光栅壁纸正在运行，" +
                 "点击“清除”后将自动恢复到系统默认壁纸。"
-            activeId.isNotEmpty() -> "所有搭配内的图片缓存将被删除。当前光栅壁纸正在运行，" +
+            inUseId.isNotEmpty() -> "所有搭配内的图片缓存将被删除。当前光栅壁纸正在运行，" +
                 "点击“清除”后将自动关闭替换。"
             else -> "所有搭配内的图片缓存将被删除。"
         },
@@ -833,19 +878,13 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                 // LSPosed 运行中：先关属性（幂等），再删。
                 // ⚠️ 服务模式下**不再多推一次 false**：两条链互斥，属性本来就该是关着的；
                 //    上面那档文案也只承诺「恢复到系统默认壁纸」，不承诺「关闭替换」。
-                if (mountMode != RASTER_MOUNT_SERVICE && activeId.isNotEmpty()) {
+                if (mountMode != RASTER_MOUNT_SERVICE && inUseId.isNotEmpty()) {
                     RasterFlag.push(false, null, prefs.rasterScope)
                 }
-                val n = withContext(Dispatchers.IO) {
-                    val count = RasterStore.deleteAll(ctx)
-                    prefs.setRasterActiveId(null)
-                    // 组全没了，顺序表一起清空（与空间「清除所有深度缓存」同一口径）。
-                    prefs.setRasterGroupOrder(emptyList())
-                    count
-                }
-                activeId = ""
-                reload++
-                Toast.makeText(ctx, "已清除 $n 项搭配", Toast.LENGTH_SHORT).show()
+                // ⚠️ `activeId` 先不动：现在置空会让中间那张卡在淡出前先冒出一个删除钮。
+                // 剩下的（清列表 + 删盘 + toast）交给卡片流：所有非新建卡 200ms 缩小淡出
+                // → 播完回调 [commitClearAll]。
+                clearSeq++
             }
         },
     )
@@ -999,6 +1038,9 @@ private const val RASTER_MOUNT_SERVICE = MaskPrefs.RASTER_MOUNT_SERVICE
 
 /** 「光栅壁纸生效范围」的选项（锁屏 / 桌面 / 全局）。 */
 private val RASTER_SCOPE_LABELS = listOf("锁屏", "桌面", "全局")
+
+/** 「过渡效果」四档：0 默认 / 1 条纹 / 2 磨砂 / 3 条纹（扭曲变形）。 */
+private val RASTER_TRANSITION_LABELS = listOf("默认", "条纹玻璃", "磨砂玻璃", "条纹玻璃（扭曲变形）")
 
 /** 取值 → 文案；越界时回退到默认档（锁屏），绝不抛。与空间壁纸页同名同语义。 */
 private fun scopeLabel(v: Int): String =

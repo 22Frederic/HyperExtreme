@@ -25,7 +25,6 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.abs
-import kotlin.math.tan
 
 /**
  * **系统壁纸服务模式**（2026-10-30，v1.5.82）—— 免 root 的降级方案。

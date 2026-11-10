@@ -88,7 +88,6 @@ internal object StatusBarIconHide {
 
     private val installed = java.util.concurrent.atomic.AtomicBoolean(false)
     private val diagnosed = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val guardStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** 只打一次"命中 0 个叶子"的告警（说明白名单 / 遍历起点又失效了）。 */
     private val emptyRunLogged = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -101,8 +100,6 @@ internal object StatusBarIconHide {
     private var iconHits = 0
 
     private const val CLS_MIUI_CLOCK = "com.android.systemui.statusbar.views.MiuiClock"
-    private const val CLS_ICON_CONTAINER = "com.android.systemui.statusbar.views.MiuiStatusIconContainer"
-    private const val CLS_STATUS_BAR_VIEW = "com.android.systemui.statusbar.phone.PhoneStatusBarView"
 
     /**
      * 需要强制隐藏的图标容器类名片段（大小写不敏感的包含匹配）。
@@ -207,15 +204,7 @@ internal object StatusBarIconHide {
             })
             HookRuntime.log("多任务隐藏状态栏：已挂 $CLS_MIUI_CLOCK#updateClockVisibility（图标直控）")
 
-// ❌ 已尝试并放弃：钩 `PhoneStatusBarView#onMeasure`（状态栏根视图，每次布局后重新隐藏）。
-//   实测**无效**：shade 收起时状态栏布局根本不重跑，钩子压根不触发。
-//   保留结论以免将来重走——**时机机关用 `MiuiClock#updateClockVisibility` 就够了**
-//   （shade 收起必然触发它，见类注释）。
-installed.set(true)
-            // ⚠ 「刷新轮守护」（[refreshRound] / [startGuard]）**保留但不启用**：
-            //   它靠伪造「假退出→假进入」强制重应用，而 shade 收起时桌面同样会发
-            //   T3 edge=0 —— 两者交织会让状态栏**彻底不隐藏**（比不启用更糟）。
-            //   v1.2.12 修好图标直控后已不需要它，故保持关闭。
+            installed.set(true)
             HookRuntime.log("多任务隐藏状态栏：图标直控已装（起点=状态栏根，白名单按真机 dump 类名）")
             true
         }.getOrElse {
@@ -223,59 +212,6 @@ installed.set(true)
             false
         }
     }
-
-/**
- * 「刷新轮」= 人为造一轮 **退出 → 进入**，让隐藏状态被完整地重新应用一遍。
-     *
-     * 起因（用户提议，2026-10-17）：shade 展开再收起后，disable 位仍是 `0x920000`（位对、画面错），
-     * 而**系统图标的可见性已被 shade 侧重设**、不再由 disable 位决定。此前尝试的「单纯重放 disable」
-     * 只改了位、并没有让图标直控一起重来，所以画面依旧错。
-     *
-     * 本轮把**两边都走一遍**：清位 + 图标恢复 → （间隔）→ 重新设位 + 重新隐藏，
-     * 相当于伪造一次完整的「退出多任务 → 进入多任务」，让系统与我们自己的可见性控制都重新生效。
-     *
-     * @param gapMs 清位与重新设位之间的间隔，太短两次 binder 通知会乱序（实测无间隔会更糟）
-     */
-    fun refreshRound(gapMs: Long) {
-        if (!hiding) return
-        // 假退出
-        restore()
-        runCatching { HookRuntime.log("多任务隐藏状态栏：刷新轮 · 假退出") }
-        RecentsStatusBar.setDisabledShared(0)
-        runCatching { Thread.sleep(gapMs) }
-        if (!hiding) return   // 期间可能已真退出
-        // 假进入
-        RecentsStatusBar.setDisabledShared(HIDE_BITS)
-        hide()
-    }
-
-    /**
-     * 周期性「刷新轮」守护：**只在已隐藏态**才动作。
-     *
-     * 不去检测 shade 收起时机（实测 `instantCollapse` / `collapse` / `flingToHeight` / 布局钩子
-     * 全都不可靠：手势收起走的不是这些路径），改用"低频重放"覆盖 —— 每次刷新都是一次
-     * 真实的状态位翻转 + 图标重应用，shade 收起后最多一个周期内被压回隐藏。
-     */
-    fun startGuard(intervalMs: Long) {
-        if (guardStarted.getAndSet(true)) return
-        Thread({
-            while (true) {
-                Thread.sleep(intervalMs)
-                if (!hiding) continue
-                runCatching { refreshRound(REFRESH_GAP_MS) }
-                    .onFailure { HookRuntime.log("多任务隐藏状态栏：刷新轮异常：$it") }
-            }
-        }, "HyperExtreme-SBRefresh").apply {
-            isDaemon = true
-            start()
-        }
-        HookRuntime.log("多任务隐藏状态栏：已启动刷新轮守护（${intervalMs}ms 周期）")
-    }
-
-    /** 隐藏位的副本（避免与 RecentsStatusBar 的常量耦合）。 */
-    private const val HIDE_BITS = 0x00800000 or 0x00100000 or 0x00020000
-    private const val REFRESH_GAP_MS = 60L
-    private const val GUARD_INTERVAL_MS = 1500L
 
     /** 沿类层次找方法（`onMeasure` 常由父类 `StatusBarView` 声明）。 */
     private fun findDeclaredUp(root: Class<*>, name: String, vararg params: Class<*>): java.lang.reflect.Method? {
