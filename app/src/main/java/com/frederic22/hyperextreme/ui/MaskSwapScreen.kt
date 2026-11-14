@@ -851,7 +851,7 @@ internal fun BigStatusCard(
                     Column {
                         Text(text = statusText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(1.dp))
-                        // `versionName` 是 "1.0 Beta1"（不带 v），界面统一拼一个 "v" 显示。
+                        // `versionName` 是 "1.0 Beta3"（不带 v），界面统一拼一个 "v" 显示。
                         Text(text = "v$version", fontSize = 15.sp)
                     }
                 }

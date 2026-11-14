@@ -11,6 +11,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.animation.core.animateFloatAsState
@@ -33,11 +34,15 @@ import androidx.compose.ui.geometry.Size as GeomSize
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -48,6 +53,11 @@ import com.frederic22.hyperextreme.data.RasterStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.blur.Backdrop
+import top.yukonga.miuix.kmp.blur.BlendColorEntry
+import top.yukonga.miuix.kmp.blur.BlurDefaults
+import top.yukonga.miuix.kmp.blur.textureBlur
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Add
 import top.yukonga.miuix.kmp.squircle.SquircleDefaults
@@ -413,6 +423,80 @@ internal fun CardImage(bitmap: Bitmap?, modifier: Modifier = Modifier) {
             // alpha 用 graphicsLayer 施加在**画出来的结果**上，不动布局与裁切。
             modifier = modifier.graphicsLayer { alpha = a },
             contentScale = ContentScale.Crop,
+        )
+    }
+}
+
+/**
+ * **平滑圆角（squircle）Shape** —— 给 miuix `textureBlur` / 投影层用（2026-11-13）。
+ *
+ * 从 `SpatialCropActivity` 的私有 `CropSquircleShape` 提上来：光栅二级页的状态胶囊也要
+ * 同一颗玻璃，两处必须**几何完全相同**，否则连圆角口径都会漂。
+ *
+ * 为什么不能用 `RoundedCornerShape`：miuix 的 `Button` 本体是 `squircleSurface`（SDF 平滑圆角）
+ * 画的，而 `textureBlur(shape = …)` 收普通 Compose `Shape` —— 普通圆角会让玻璃在四角
+ * **鼓出来一点**（2026-11-04 用户指出）。`extension = 0f` 与 miuix 内部调用一致。
+ */
+internal class SquircleShape(private val corner: Dp) : Shape {
+    override fun createOutline(
+        size: GeomSize,
+        layoutDirection: LayoutDirection,
+        density: Density,
+    ): Outline {
+        val path = Path()
+        path.addSquircleRect(
+            width = size.width,
+            height = size.height,
+            cornerRadius = with(density) { corner.toPx() },
+            extension = 0f,
+            squircleEnabled = true,
+        )
+        return Outline.Generic(path)
+    }
+}
+
+/**
+ * 封面卡内底部的**状态胶囊**（2026-11-13）：光栅 `16张 镜像开`、空间 `已计算缓存`、
+ * Alive `启航` / `留光` —— 文案由各页在 `CoverItem.badge` 里算好传进来，这里只管画。
+ *
+ * 放在**每张卡自己**的底部（不是页面级浮动层）⇒ 随卡片移动、一直显示。
+ * 纯展示：没有 `clickable`、没有 ripple（用户明确「不是拿来点的」）。
+ *
+ * 玻璃 = miuix `textureBlur`，`backdrop` 是**这张卡自己的封面**（`CoverCarousel` 里
+ * 每张卡各建一个，胶囊在 backdrop 层外）。叠色与文字按主题反色（用户 2026-11-13 定）：
+ * * 浅色主题：黑 **35%** 底 + **白字**
+ * * 深色主题：白 **35%** 底 + **黑字**
+ * AGSL 不可用时退回同一叠色的纯半透明底。
+ */
+@Composable
+internal fun CoverBadge(
+    text: String,
+    backdrop: Backdrop?,
+    modifier: Modifier = Modifier,
+) {
+    val dark = MiuixTheme.colorScheme.surface.luminance() < 0.5f
+    val tint = if (dark) Color.White.copy(alpha = 0.35f) else Color.Black.copy(alpha = 0.35f)
+    val content = if (dark) Color.Black else Color.White
+    val shape = remember { SquircleShape(16.dp) }
+    val glass = if (backdrop != null) {
+        val colors = BlurDefaults.blurColors(
+            blendColors = listOf(BlendColorEntry(color = tint)),
+        )
+        modifier.textureBlur(
+            backdrop = backdrop,
+            shape = shape,
+            blurRadius = 18f,
+            colors = colors,
+        )
+    } else {
+        modifier.background(tint, shape)
+    }
+    Box(modifier = glass, contentAlignment = Alignment.Center) {
+        Text(
+            text = text,
+            style = MiuixTheme.textStyles.body2,
+            color = content,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
         )
     }
 }

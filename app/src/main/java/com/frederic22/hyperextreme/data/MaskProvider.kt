@@ -51,7 +51,7 @@ class MaskProvider : ContentProvider() {
         // 「光栅壁纸」的图与 meta（2026-11-04）：`content://…/raster/<组id>/meta`、
         // `content://…/raster/<组id>/<序号>`、`content://…/raster/<组id>/subject/<序号>`。
         // 渲染器在 SystemUI 进程里读不到模块私有目录，只能走 provider 流式拿（与空间壁纸同一套路）。
-        // ⚠️ provider 是导出的，路径必须严格白名单（组 id 是纯数字时间戳、序号是 0~9 的小整数），
+        // ⚠️ provider 是导出的，路径必须严格白名单（组 id 是纯数字时间戳、序号是 **1~2 位**的小整数），
         //    否则能被拼成 `../../shared_prefs/…` 读走别的文件。
         if (uri.pathSegments.firstOrNull() == RASTER_SEGMENT) {
             val id = uri.pathSegments.getOrNull(1).orEmpty()
@@ -626,7 +626,14 @@ class MaskProvider : ContentProvider() {
         /** 「Alive 壁纸」：`alive/<卡id>/photo`（2026-11-07）。 */
         const val ALIVE_SEGMENT = "alive"
         private val RASTER_ID_RE = Regex("^[0-9]{6,20}$")
-        private val RASTER_INDEX_RE = Regex("^[0-9]$")
+        /**
+         * 光栅序号白名单：**1~2 位数字**（0~99）。
+         *
+         * ⚠️ 2026-11-13（v1.22.83）：原来是 `^[0-9]$`（只放行 0~9），单组上限升到 16 后
+         * 第 11 张起全部 404 → 渲染器 `loadBitmap` 拿到 null → 绑纹理 0 = 黑屏。
+         * 放宽到两位仍白名单；越界由下面 `names.getOrNull` 继续拦。
+         */
+        private val RASTER_INDEX_RE = Regex("^[0-9]{1,2}$")
 
         /**
          * 图片文件名白名单。

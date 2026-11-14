@@ -66,6 +66,12 @@ internal object SpatialForegroundHider {
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
+    /** 最近一次 hook 到的 KeyguardPanelViewController，供音乐屏状态变化时重算。 */
+    @Volatile private var lastSelf: Any? = null
+
+    /** `Coexist` 订阅只装一次。 */
+    private var coexistHookInstalled = false
+
     // ── 开关读取（300ms 缓存：方法调用频繁，属性反射不宜每次付） ──
     @Volatile private var cacheAt = 0L
     @Volatile private var cacheValue = false
@@ -150,8 +156,58 @@ internal object SpatialForegroundHider {
             log("挂 $METHOD 失败：$it")
             false
         }
-        if (ok) log("已挂上（锁屏/全局档时接管 keyguard_foreground_layer）")
+        if (ok) {
+            log("已挂上（锁屏/全局档时接管 keyguard_foreground_layer）")
+            // MC 共存：音乐屏状态一变就重算一次（不能等下一次 hook 触发）
+            if (!coexistHookInstalled) {
+                coexistHookInstalled = true
+                Coexist.addListener {
+                    mainHandler.post { lastSelf?.let { runCatching { handle(it) } } }
+                }
+            }
+        }
         return ok
+    }
+
+    /**
+     * **主动重算一次前景层**（v1.22.101）。
+     *
+     * 什么时候必须调 —— **MC 让路后恢复**：`musicCoverOn` 翻 false 的那一瞬间，
+     * `Coexist.dispatchChanged` 会先调到这里，而**渲染器还没被 tick 拉起来**
+     * ⇒ `SpatialOverlay.active()` / `RasterOverlay.active()` 都是 false、
+     * `AliveOverlay.ensure()` 因 `!isRunning()` 直接 `onDisabled()`
+     * ⇒ 走「旧链」把整层压成 INVISIBLE（或把系统主体摘掉却没插回我们的）。
+     *
+     * 之后 tick 重新 `start()`，但 `updateKeyguardElementsVisibility()` 不会因此被系统调用
+     * ⇒ **景深主体永远回不来**（用户 2026-11-14：「三者恢复时我们的景深都没恢复」）。
+     * 所以三条链的 `startInternal` 末尾各调一次。
+     */
+    fun refresh() {
+        // 从没 hook 过（`lastSelf` 为空）= 系统还没算过可见性，此时层本来就是系统默认态
+        val self = lastSelf ?: return
+        mainHandler.post {
+            runCatching {
+                // `aliveDepthOn` 只在 `enabled()` 里算，且带 300ms 缓存 ⇒ 先清掉缓存重算，
+                // 否则拿着让路期间的旧值去判断「该接管还是该压掉」。
+                cacheAt = 0L
+                if (!enabled()) {
+                    SpatialOverlay.onDisabled()
+                    RasterOverlay.onDisabled()
+                    AliveOverlay.onDisabled()
+                    return@runCatching
+                }
+                // ⚠️ **先把层抬回 VISIBLE**：让路退出那一刻 `handle()` 已经走过「旧链」把它
+                // 压成 INVISIBLE 了，而 `handle()` 开头就有「不是 VISIBLE 就早退」的闸门
+                // ⇒ 不抬的话这里也是空转。抬完让 `handle()` 自己判断该接管还是该压掉。
+                val f = self.javaClass.getDeclaredField(FIELD_FOREGROUND)
+                    .apply { isAccessible = true }
+                (f.get(self) as? View)?.let {
+                    if (it.visibility != View.VISIBLE) it.visibility = View.VISIBLE
+                }
+                log("渲染器启动后主动重算前景层（MC 让路恢复）")
+                handle(self)
+            }
+        }
     }
 
     /**
@@ -172,6 +228,25 @@ internal object SpatialForegroundHider {
         runCatching { syncLeashScale(self) }
         val field = self.javaClass.getDeclaredField(FIELD_FOREGROUND).apply { isAccessible = true }
         val layer = field.get(self) as? android.view.ViewGroup ?: return
+        lastSelf = self
+        // ⚠️ 顺序很关键（2026-11-14）：这一层平时被我们压成 INVISIBLE，
+        // 若把 MC 封面判断放在下面的 visibility 闸门之后，封面出现时闸门直接 return
+        // ⇒ 永远走不到放行分支，MC 的歌词 / 封面也就永远被压着。**先判封面，再判可见性**。
+        //
+        // 判据是 `Coexist.musicCoverOn` = **MC 真的把封面推上了锁屏壁纸**
+        // （`Main.sCoverMode && !keepsWallpaper()`），不是"有音乐屏的 View"——
+        // 后者只要媒体卡 / 岛在就成立，会把整条链白关掉（2026-11-14 用户指出）。
+        if (Coexist.musicCoverOn) {
+            SpatialOverlay.onDisabled()
+            RasterOverlay.onDisabled()
+            AliveOverlay.onDisabled()
+            AliveOverlay.detachSystemSubject(layer)
+            if (layer.visibility != View.VISIBLE) layer.visibility = View.VISIBLE
+            if (logged.putIfAbsent("music", true) == null) {
+                log("MC 封面在锁屏上：前景层保持 VISIBLE（不压封面 / 歌词）")
+            }
+            return
+        }
         if (layer.visibility != View.VISIBLE) return
 
         if (SpatialOverlay.active() || RasterOverlay.active()) {

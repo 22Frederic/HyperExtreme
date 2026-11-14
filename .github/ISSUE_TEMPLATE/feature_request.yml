@@ -1,0 +1,33 @@
+name: "💡需求"
+description: 功能需求
+title: "💡[需求]"
+labels: 
+  - enhancement
+
+body:
+  - type: textarea
+    id: requirement
+    attributes:
+      label: "需求说明"
+      description: |
+        请尽量简短且完整的说明你的需求。
+    validations:
+      required: true
+
+  - type: textarea
+    id: theory
+    attributes:
+      label: "实现原理"
+      description: |
+        如果你了解该功能的实现原理，请尽可能详细地说明，也可以附带原理图、参考资料或相关链接。
+    validations:
+      required: false
+
+  - type: textarea
+    id: scene
+    attributes:
+      label: "场景"
+      description: |
+        请说明你希望在什么情况下使用该功能，以及它能解决什么问题。
+    validations:
+      required: true

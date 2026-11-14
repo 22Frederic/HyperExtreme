@@ -1,8 +1,5 @@
 package com.frederic22.hyperextreme.ui
 
-import android.app.WallpaperManager
-import android.os.Handler
-import android.os.Looper
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -30,6 +27,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,8 +42,6 @@ import com.frederic22.hyperextreme.data.AliveFlag
 import com.frederic22.hyperextreme.data.AliveItem
 import com.frederic22.hyperextreme.data.AliveStore
 import com.frederic22.hyperextreme.data.MaskPrefs
-import com.frederic22.hyperextreme.data.RootShell
-import com.frederic22.hyperextreme.data.RunLog
 import com.frederic22.hyperextreme.data.WallpaperVersion
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -89,8 +85,9 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
     var items by remember { mutableStateOf<List<AliveItem>>(emptyList()) }
     var reload by remember { mutableIntStateOf(0) }
     var loaded by remember { mutableStateOf(false) }
-    var located by remember { mutableStateOf(false) }
-    var focused by remember { mutableIntStateOf(0) }
+    // saveable：Activity 重建时不能重新定位第一张（= 用户看到的“关闭浮页跳回第一个”）。
+    var located by rememberSaveable { mutableStateOf(false) }
+    var focused by rememberSaveable { mutableIntStateOf(0) }
 
     var pendingDelete by remember { mutableStateOf<AliveItem?>(null) }
     var deletingId by remember { mutableStateOf<String?>(null) }
@@ -98,16 +95,18 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
     var shiftFromPage by remember { mutableIntStateOf(-1) }
     var shiftToken by remember { mutableIntStateOf(0) }
     var clearSeq by remember { mutableIntStateOf(0) }
+    // 关闭编辑浮页后「回到原卡」（2026-11-13）：reload 会按顺序重排（应用 / 新建置顶），
+    // 只靠 `focused` 会把画面换掉。按 id 找回新下标，让卡片流滚回去。
+    // 关闭编辑浮页时「保持当前列表顺序」（2026-11-13）：编辑不改 order，
+    // 但用户可能刚应用过某张（order 已置顶、列表还没动），按 order 重排会换掉视野内容。
+    var keepOrderOnReload by rememberSaveable { mutableStateOf(false) }
 
     var showClearAll by remember { mutableStateOf(false) }
     var showConflict by remember { mutableStateOf(false) }
     var conflictOther by remember { mutableStateOf<RunningWallpaper?>(null) }
     var busy by remember { mutableStateOf(false) }
-    // 「壁纸重置提示」（2026-11-10）：pendingApply = 等确认的那张卡；
-    // resetting = 重置流程在跑（挡住重复点击）。
-    var showWallpaperReset by remember { mutableStateOf(false) }
-    var pendingApply by remember { mutableStateOf<AliveItem?>(null) }
-    var resetting by remember { mutableStateOf(false) }
+    // （2026-11-14 删掉「壁纸重置提示」的三个状态：showWallpaperReset / pendingApply / resetting。
+    //   该功能属误诊，已在 [apply] 的注释里说明。）
 
     val prefs = remember { MaskPrefs(ctx) }
     var activeId by remember { mutableStateOf(prefs.aliveActiveId) }
@@ -119,7 +118,16 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
     var creating by remember { mutableStateOf(false) }
 
     LaunchedEffect(reload) {
-        val list = withContext(Dispatchers.IO) { AliveStore.list(ctx, prefs.aliveGroupOrder) }
+        // ⚠️ 2026-11-13（v1.22.86）：**编辑浮页关闭时不能按持久化 order 重排** ——
+        // 用户可能刚应用过某张（order 已提到最前、页面列表还没动），一关浮页就重排
+        // ⇒ 视口页号对应的卡换了，观感就是「跳到第一个」。编辑流程用当前列表顺序。
+        val order = if (keepOrderOnReload) {
+            keepOrderOnReload = false
+            items.map { it.id }
+        } else {
+            prefs.aliveGroupOrder
+        }
+        val list = withContext(Dispatchers.IO) { AliveStore.list(ctx, order) }
         // 指向的卡已经不在了（被删 / 目录损坏）⇒ 清指针并关渲染器，不留幽灵状态
         var active = prefs.aliveActiveId
         if (active.isNotEmpty() && list.none { it.id == active }) {
@@ -131,6 +139,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         }
         items = list
         if (!located) {
+            // 首次组合（= 进页面 / Activity 重建）：有卡停第一张。
             located = true
             focused = if (list.isEmpty()) 0 else 1
         }
@@ -190,19 +199,12 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             showConflict = true
             return
         }
-        // **壁纸重置提示**（2026-11-10 用户要求）：无条件弹，确认并把壁纸重置成
-        // 系统默认之后才真正应用。原因见 [WallpaperResetDialog] 的类注释 ——
-        // 不干净的壁纸组合会让解锁动画寄生在「解锁即销毁」的锁屏壁纸窗口上，
-        // 或者让两条 leash 换层时露出系统壁纸。
-        pendingApply = item
-        showWallpaperReset = true
-    }
-
-    /**
-     * 真正应用（原 [apply] 的主体）—— 由 [WallpaperResetDialog] 的「继续」在
-     * 壁纸重置完成之后调用。
-     */
-    fun applyNow(item: AliveItem) {
+        // **直接应用**（2026-11-14 撤掉「壁纸重置弹窗 + clear(both)」）。
+        // 真机层树实验证明那套是误诊：锁屏份本来就可见
+        // （`he-alive-lock` / `he-raster-lock` 在锁屏态 `flags:0`、`alpha=1`；
+        //   两个 WallpaperWindowToken 是 `Leaf:1:1` 的兄弟，系统自己切可见性），
+        // 而 `clear` 只会把用户壁纸换成系统默认。
+        // 依据见 `analyse/HyperExtreme-fork-改动分析.md` §7。
         haptic()
         prefs.setAliveActiveId(item.id)
         activeId = item.id
@@ -298,7 +300,15 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
 
         if (loaded) {
             CoverCarousel(
-                items = items.map { CoverItem(it.id, it.coverFile) },
+                items = items.map {
+                    CoverItem(
+                        id = it.id,
+                        cover = it.coverFile,
+                        // 状态胶囊（2026-11-13 用户要求）：息屏样式 = 启航（自转圆球）/ 留光（相纸）。
+                        // 判据就是组里存的 `style`，默认 `STYLE_QIHANG`。
+                        badge = if (it.style == AliveStore.STYLE_LIUGUANG) "留光" else "启航",
+                    )
+                },
                 initialPage = if (items.isEmpty()) 0 else 1,
                 activeId = activeId,
                 deletingId = deletingId,
@@ -534,6 +544,9 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             //    都把这张卡置顶。光栅的 `onDismiss` 只做「关浮页 + 重扫」，**不重排**
             //    （置顶只发生在「应用」那一步）。而新建组本来就排在前面：
             //    `AliveStore.list` 无显式顺序时按 `createdAt` 倒序。
+            // 关闭浮页（2026-11-13）：编辑 ⇒ 保持当前列表顺序；新建 ⇒ 仍用持久化 order（新卡第一）。
+            // ⚠️ 必须在 `creating = false` **之前**读它。
+            keepOrderOnReload = !creating
             sheetOpen = false
             editing = null
             creating = false
@@ -557,51 +570,8 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         },
     )
 
-    // 壁纸重置提示（2026-11-10，用户要求）：无条件弹，确认后先把壁纸重置成系统默认，
-    // 等壁纸服务把壁纸层重建完，再走 [applyNow] 的原流程。
-    WallpaperResetDialog(
-        show = showWallpaperReset,
-        onDismissRequest = {
-            showWallpaperReset = false
-            pendingApply = null
-        },
-        onConfirm = {
-            showWallpaperReset = false
-            val target = pendingApply
-            pendingApply = null
-            if (target != null && !resetting) {
-                resetting = true
-                // 重置壁纸 + 重建壁纸层要好几秒，先给个反馈（2026-11-10 用户要求）
-                Toast.makeText(ctx, "正在应用请稍后", Toast.LENGTH_LONG).show()
-                Thread {
-                    val ok = runCatching {
-                        // 1) 先停渲染器：它正攥着即将被销毁的壁纸 leash
-                        if (prefs.aliveActiveId.isNotEmpty()) AliveControl.disable(ctx, null)
-                        // 2) 回到**系统默认**壁纸 —— 与服务模式「恢复默认」同一条路。
-                        //    只清 FLAG_LOCK 会保留当前系统壁纸，与「重置到系统默认」不符
-                        //    （2026-11-10 用户确认用 both）。
-                        WallpaperManager.getInstance(ctx).clear(
-                            WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK,
-                        )
-                        // 3) 等壁纸服务重建壁纸层：不重建的话旧 `he-alive-*` 会残留
-                        Thread.sleep(1200L)
-                        RootShell.run("killall com.miui.miwallpaper")
-                        Thread.sleep(1800L)
-                    }.isSuccess
-                    if (!ok) {
-                        RunLog.append(
-                            ctx,
-                            "壁纸重置",
-                            listOf("clear 或 killall 失败，照常继续应用"),
-                            ok = false,
-                        )
-                    }
-                    Handler(Looper.getMainLooper()).post {
-                        resetting = false
-                        applyNow(target)
-                    }
-                }.apply { isDaemon = true }.start()
-            }
-        },
-    )
+    // 壁纸重置提示（2026-11-10）已于 2026-11-14 撤除：真机层树实验证明
+    // 「锁屏份不可见」的前提不成立（锁屏态我们两份层都 flags:0 / alpha=1），
+    // 那套 clear(both) 只会把用户壁纸换成系统默认。
+    // 历史实现见 git 提交 `946b8da` 之前的 `ui/WallpaperResetDialog.kt`。
 }

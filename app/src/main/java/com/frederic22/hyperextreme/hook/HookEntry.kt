@@ -170,10 +170,94 @@ class HookEntry : XposedModule() {
     private fun installSystemUiHooks(loader: ClassLoader) {
         if (systemUiHooksInstalled.get()) return
         HookRuntime.log("SystemUI 就绪：安装锁屏按钮层级 hook（loader=${loader.javaClass.simpleName}）")
+        // **宿主 loader 必须先记下来**（2026-11-14 真机）：`HookRuntime.appContext()` 原来用
+        // `Class.forName("android.app.ActivityThread")`，那条走的是模块自己的 classLoader，
+        // 看不见 framework 类 ⇒ SystemUI 一重启就恒返回 null ⇒ 三条链的渲染器再也起不来
+        // （真机症状：属性=1、日志 tick 里 active=true，但永远没有「启动渲染器」）。
+        HookRuntime.noteHostLoader(loader)
+        HookRuntime.log(
+            "ALIVE 宿主 loader=${loader.javaClass.name} " +
+                "能看到 Instrumentation=" +
+                runCatching {
+                    Class.forName("android.app.Instrumentation", false, loader) != null
+                }.getOrDefault(false),
+        )
+        // 一手来源：Application 建好的一刻就把它缓存下来（`currentApplication` 那时可能还是 null）。
+        runCatching {
+            hookAll(
+                "android.app.Instrumentation",
+                loader,
+                "callApplicationOnCreate",
+                object : XposedInterface.Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        val r = chain.proceed()
+                        runCatching {
+                            HookRuntime.noteApplication(
+                                chain.getArg(0) as? android.app.Application,
+                            )
+                        }
+                        return r
+                    }
+                },
+            )
+        }
+        runCatching { HookRuntime.appContext() }
         // 「AOD 透出壁纸」（v1.22.80）：AOD 的 `AODView`/`DozeHost` 由 `com.miui.aod` 的
         // **插件 classloader 加载在本进程**（logcat：`27090 D AODView : ...`，27090 就是 SystemUI），
         // 所以 hook 必须装这里，且只能按类名认人。见 [AliveAodHost]。
         runCatching { AliveAodHost.install(this, loader) }
+        // **HyperMusicCover 共存**（2026-11-14，判据重做见 [Coexist]）。
+        //
+        // MC 的封面**就是锁屏壁纸纹理**（它 hook 壁纸进程的 `ImageEngineImpl` 换掉要上传的
+        // bitmap），而我们的 `he-*` 是壁纸 leash 的子层 ⇒ 必然盖住它，只能让开。
+        // 让开的判据要读 MC 的源头状态（`Main.sCoverMode` + `keepsWallpaper()`），
+        // 而它的类只能从下面这两个 hook 里拿到 —— 不猜类名，见 [Coexist.noteReceiver]。
+        runCatching {
+            // 绑定模块：`Coexist` 拿到 MC 的类之后要装 `enter/exitCoverMode` 的 hook
+            // （0 延迟信号，见 `Coexist.installModeHooks`）
+            Coexist.bindModule(this)
+            Coexist.start()
+        }
+        // ① 认 classloader：MC 的 ProbeReceiver 自己已被 R8 混淆，所以不看名字，
+        //    只拿注册时那个实例的 classLoader 去加载 `com.os4.musiccover.Main`，成功即认到人。
+        runCatching {
+            hookAll(
+                "android.app.ContextImpl",
+                loader,
+                "registerReceiver",
+                object : XposedInterface.Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        val r = chain.proceed()
+                        runCatching { Coexist.noteReceiver(chain.getArg(0)) }
+                        return r
+                    }
+                },
+            )
+        }
+        // ② 兜底：MC 推 / 收封面的唯一开关是 `op=art` 的 `off` 位
+        //    （`CoverPush#pushArtToWallpaper`）。主判据读不到时才用它。
+        runCatching {
+            hookAll(
+                "android.app.ContextImpl",
+                loader,
+                "sendBroadcast",
+                object : XposedInterface.Hooker {
+                    override fun intercept(chain: XposedInterface.Chain): Any? {
+                        val intent = chain.getArg(0) as? android.content.Intent
+                        if (intent != null && intent.action == Coexist.ACTION) {
+                            runCatching {
+                                Coexist.noteBroadcast(
+                                    intent.action,
+                                    intent.getStringExtra("op"),
+                                    intent.getBooleanExtra("off", false),
+                                )
+                            }
+                        }
+                        return chain.proceed()
+                    }
+                },
+            )
+        }
         // 诊断（2026-10-22）：确认 SystemUI 进程里能否建 EGL / 跑 GL —— 空间壁纸架构的前提。
         // 只读探针，不接入任何逻辑；日志前缀 GPUPROBE。
         runCatching { GpuProbe.run("systemui") }
@@ -213,10 +297,18 @@ class HookEntry : XposedModule() {
             var lastScope = Int.MIN_VALUE
             var ctxWarn = 0
             var tick = 0
+            // 上次尝试启动的时刻（2026-11-14 自愈 + 3s 退避）
+            var lastStartAt = 0L
             HookRuntime.log("SPATIAL 轮询已启动（监听属性 ${com.frederic22.hyperextreme.data.SpatialFlag.PROP_ACTIVE}）")
             while (true) {
                 try {
-                    Thread.sleep(1000)
+                    // **250ms 节拍 + 可被唤醒**（v1.22.102）：原来是 `sleep(1000)` ——
+                    // 三条链里只有空间是 1 秒，MC 让路 / 退出封面时白等最久 1 秒。
+                    // 现在与光栅 / Alive 对齐，并且 `Coexist.setState` 会 `notifyAll`
+                    // 立刻叫醒（`wait` 而不是 `sleep`）。
+                    synchronized(Coexist.tickLock) {
+                        runCatching { Coexist.tickLock.wait(250L) }
+                    }
                     tick++
                     // **主通道 = 系统属性**（2026-10-23）：SystemUI 里读模块 prefs 不可靠 ——
                     // 实测 `getRemotePreferences` 是陈旧快照（prefs 里 true，读出来 false），
@@ -245,7 +337,27 @@ class HookEntry : XposedModule() {
                                 "active=$active key=$key scope=$scope last=$lastKey/$lastScope",
                         )
                     }
-                    if (active && key.length == 16) {
+                    // ⚠️ **MC 让路必须排在最前**（v1.22.100）：从前这一支写在
+                    // `active && key` 之后，壁纸只要开着第一支就永远命中 ⇒ 让路分支
+                    // 一次都进不去（真机日志：`SPATIAL MC 全屏封面` 0 次）。
+                    if (Coexist.musicCoverOn) {
+                        // **MC 全屏封面 → 150ms 淡出后关闭**（用户 2026-11-14 定）。
+                        // 空间壁纸同样挂在壁纸 leash 上，会盖住 MC 的封面。
+                        if (lastKey != null) {
+                            HookRuntime.log("SPATIAL MC 全屏封面 → 淡出后关闭（退出再拉起）")
+                            SpatialRenderer.fadeOutAndStop()
+                            lastKey = null
+                            lastScope = Int.MIN_VALUE
+                        }
+                    } else if (active && key.length == 16) {
+                        // **自愈**（2026-11-14）：启动失败会 stopInternal，但 lastKey 留着 ⇒ 不再重启。
+                        if (lastKey != null && !SpatialRenderer.isRunning() &&
+                            System.currentTimeMillis() - lastStartAt > 3000L
+                        ) {
+                            HookRuntime.log("SPATIAL 渲染器已不在运行 → 重置记录，重新拉起")
+                            lastKey = null
+                            lastScope = Int.MIN_VALUE
+                        }
                         // scope 变了也要重建：挂载点（锁屏 / 桌面 leash）不一样
                         if (key != lastKey || scope != lastScope) {
                             val ctx = HookRuntime.appContext()
@@ -254,6 +366,7 @@ class HookEntry : XposedModule() {
                                 SpatialRenderer.start(ctx, key, scope)
                                 lastKey = key
                                 lastScope = scope
+                                lastStartAt = System.currentTimeMillis()
                             } else if (ctxWarn++ % 30 == 0) {
                                 HookRuntime.log("SPATIAL 开关=开 key=$key，但拿不到 Context（第 ${ctxWarn} 次）")
                             }
@@ -277,6 +390,8 @@ class HookEntry : XposedModule() {
             var lastKey: String? = null
             var lastScope = Int.MIN_VALUE
             var tick = 0
+            // 上次尝试启动的时刻（2026-11-14 自愈 + 3s 退避）
+            var lastStartAt = 0L
             // 2026-11-07：「过渡效果 / 停顿归位」改成**运行中实时**。首轮只记基线，
             // 不触发归位（startInternal 已经读过同一份快照）。属性读的是
             // `android.os.SystemProperties.get` 反射，250ms 一次的成本可以忽略。
@@ -288,7 +403,10 @@ class HookEntry : XposedModule() {
             )
             while (true) {
                 try {
-                    Thread.sleep(250)
+                    // 可被 `Coexist.setState` 的 `notifyAll` 立刻唤醒（v1.22.102）
+                    synchronized(Coexist.tickLock) {
+                        runCatching { Coexist.tickLock.wait(250L) }
+                    }
                     tick++
                     val active = HookRuntime.systemProperty(
                         com.frederic22.hyperextreme.data.RasterFlag.PROP_ACTIVE,
@@ -324,7 +442,24 @@ class HookEntry : XposedModule() {
                                 "last=$lastKey/$lastScope",
                         )
                     }
-                    if (active && key.isNotEmpty()) {
+                    // ⚠️ **MC 让路必须排在最前**（v1.22.100，同上面空间那条）
+                    if (Coexist.musicCoverOn) {
+                        // **MC 全屏封面 → 150ms 淡出后关闭**（用户 2026-11-14 定）
+                        if (lastKey != null) {
+                            HookRuntime.log("RASTER MC 全屏封面 → 淡出后关闭（退出再拉起）")
+                            RasterRenderer.fadeOutAndStop()
+                            lastKey = null
+                            lastScope = Int.MIN_VALUE
+                        }
+                    } else if (active && key.isNotEmpty()) {
+                        // **自愈**（2026-11-14）：启动失败会 stopInternal，但 lastKey 留着 ⇒ 不再重启。
+                        if (lastKey != null && !RasterRenderer.isRunning() &&
+                            System.currentTimeMillis() - lastStartAt > 3000L
+                        ) {
+                            HookRuntime.log("RASTER 渲染器已不在运行 → 重置记录，重新拉起")
+                            lastKey = null
+                            lastScope = Int.MIN_VALUE
+                        }
                         if (key != lastKey || scope != lastScope) {
                             val ctx = HookRuntime.appContext()
                             if (ctx != null) {
@@ -332,6 +467,7 @@ class HookEntry : XposedModule() {
                                 RasterRenderer.start(ctx, key, scope)
                                 lastKey = key
                                 lastScope = scope
+                                lastStartAt = System.currentTimeMillis()
                             }
                         }
                     } else if (lastKey != null) {
@@ -358,20 +494,34 @@ class HookEntry : XposedModule() {
             var lastStyle = Int.MIN_VALUE
             // 图片版本（2026-11-09）：换图不改 id，只靠 key/style 判不出变化 ⇒ 新图进不了 GL
             var lastVer: String? = null
+            // 上次「尝试启动」的时刻（2026-11-14 自愈用）：`start()` 只是 post，真正执行与
+            // 挂载可能延后；用它做 3s 退避，避免把「还没跑起来」误判成「挂了」而疯狂重启。
+            var lastStartAt = 0L
             // 「息屏显示」总开关（2026-11-10）：关着就停渲染，开回来自动恢复。
             // 跨进程读 Settings 有成本 ⇒ 2s 一次（tick 250ms ⇒ 每 8 个 tick）。
             var aodOn = true
             var aodOff = false
             var tick = 0
+            // 诊断（v1.22.97）：「拿不到 Application」只打前 3 次
+            var ctxWarn = 0
             HookRuntime.log(
                 "ALIVE 轮询已启动（监听属性 ${com.frederic22.hyperextreme.data.AliveFlag.PROP_ACTIVE}）",
             )
             while (true) {
                 try {
-                    Thread.sleep(250)
+                    // 可被 `Coexist.setState` 的 `notifyAll` 立刻唤醒（v1.22.102）
+                    synchronized(Coexist.tickLock) {
+                        runCatching { Coexist.tickLock.wait(250L) }
+                    }
                     tick++
                     if (tick % 8 == 1) {
                         val c = HookRuntime.appContext()
+                        if (c == null && ctxWarn < 3) {
+                            ctxWarn++
+                            HookRuntime.log(
+                                "ALIVE 拿不到 Application（第 $ctxWarn 次）→ 渲染器无法启动",
+                            )
+                        }
                         if (c != null) {
                             aodOn = runCatching {
                                 android.provider.Settings.Secure.getInt(
@@ -423,7 +573,36 @@ class HookEntry : XposedModule() {
                             aodOff = false
                             HookRuntime.log("ALIVE 息屏显示已开启 → 恢复（按属性重启渲染器）")
                         }
-                        if (active && key.isNotEmpty()) {
+                        if (Coexist.musicCoverOn) {
+                            // **MC 全屏封面 → 直接关闭应用**（用户 2026-11-14 定）。
+                            //
+                            // 不做 alpha 级别的"只压锁屏份"：MC 的封面就是壁纸纹理，
+                            // 我们的层 / 景深主体只要还在就一定会盖住它（细节见《02》§3.18）。
+                            // 整份 stop 最干净：层 remove、主体还给系统、`alive_rendering=0`；
+                            // 退出封面后本 tick 会按 `active + key` 重新拉起来（属性一直没变）。
+                            if (lastKey != null) {
+                                HookRuntime.log("ALIVE MC 全屏封面 → 淡出后关闭（退出后恢复）")
+                                AliveRenderer.fadeOutAndStop()
+                                lastKey = null
+                                lastScope = Int.MIN_VALUE
+                                lastStyle = Int.MIN_VALUE
+                                lastVer = null
+                            }
+                        } else if (active && key.isNotEmpty()) {
+                            // **自愈**（2026-11-14）：壁纸层没就绪时 `startInternal` 会抛异常，
+                            // `start()` 的 onFailure 会 `stopInternal("启动失败")`，但 `lastKey` 还留在这里
+                            // ⇒ 属性不变就再也不会重启，表现是「锁屏 / AOD 偶发没有 Alive」。
+                            // 发现「记录里在跑、实际没在跑」就清掉记录，让本 tick 重新拉起；
+                            // 3s 退避（`lastStartAt`）保证反复失败时不会每 250ms 重试一次。
+                            if (lastKey != null && !AliveRenderer.isRunning() &&
+                                System.currentTimeMillis() - lastStartAt > 3000L
+                            ) {
+                                HookRuntime.log("ALIVE 渲染器已不在运行 → 重置记录，重新拉起")
+                                lastKey = null
+                                lastScope = Int.MIN_VALUE
+                                lastStyle = Int.MIN_VALUE
+                                lastVer = null
+                            }
                             if (key != lastKey || scope != lastScope || style != lastStyle ||
                                 ver != lastVer
                             ) {
@@ -438,6 +617,7 @@ class HookEntry : XposedModule() {
                                     lastScope = scope
                                     lastStyle = style
                                     lastVer = ver
+                                    lastStartAt = System.currentTimeMillis()
                                 }
                             }
                         } else if (lastKey != null) {
@@ -1614,7 +1794,7 @@ class HookEntry : XposedModule() {
          * 起因：排查时连续几轮都只能看到旧的「已挂」日志，无法区分"没装新包"和"新逻辑没跑到"。
          * **每次改动都更新它。**
          */
-        const val BUILD_TAG = "2026-11-10.20-25 v1.22.81 / v1.0 Beta1（**壁纸重置弹窗**（用户 2026-11-10 要求；纯 UI，不动 hook）：① 现象 = Alive 的解锁动画（AOD→桌面 tr=2 球扩 / 锁屏→桌面内容交叉）在两种壁纸组合下丢失或露系统壁纸：(a) 系统锁屏壁纸走 `MiuiKeyguardPictorialWallpaper`（开景深），(b) 系统与锁屏是两张不同壁纸。② 根因（层树实证）= 动画画在**锁屏份**上，而锁屏份挂在「解锁即销毁」的锁屏壁纸窗口里：开景深时 `WallpaperWindowToken{...} flags:1`（eLayerHidden）、父层 `MiuiKeyguardPictorialWallpaper` 同为 hidden ⇒ 日志里 28~31 帧一帧不少但屏幕上看不见；两张壁纸时是两条独立 leash，换层瞬间桌面份 buffer 陈旧（实测 `swap=锁屏 2148 / 桌面 9`）⇒ 透出系统壁纸。③ 修法 = 应用 Alive 前无条件弹「壁纸重置提示」（新增 `ui/WallpaperResetDialog`，确认键 `danger` 警示色），确认后 `AliveControl.disable(静默)` → `clear(FLAG_SYSTEM or FLAG_LOCK)` 回系统默认壁纸 → 1200ms → `killall com.miui.miwallpaper` 重建壁纸层 → 1800ms → 原 apply 流程；期间 toast「正在应用请稍后」，末了仍是「Alive壁纸已生效」。失败只写 RunLog、照常继续。④ 实测结论（决定方案）：`clear(FLAG_LOCK)` 会保留系统壁纸（`mWhich` 1/2 → 3/3 共用），`clear(both)` 才回默认；检测侧 `getWallpaperInfo` 恒 null、`getWallpaperId` 在 `mWhich=3` 时仍不同（2887/2888）⇒ 公开 API 判不了「同一张」，只能无条件 clear 兜底。**APK 版本保持 code 101 / 1.0 Beta1**。上版 v1.22.80：**AOD 从桌面进入全黑修复**（用户 2026-11-10 要求；只动 aod/SystemUI，不碰 system_server）：① 反编译定位到「AOD 画面 = 一块全屏黑底 View + 上面的时钟」，黑底来自 `AODView.makeNormalPanel` / `DozeHost.disableShowWallpaper` 的 `setBackgroundColor(-16777216)`；`DozeHost.showSecurityIdentityViewAt` 里 `z = isLinkageState() && mNeedLinkageWallpaperAnim`，`z==false` 时早退并跳过收尾的 `setBackgroundColor(0)`。`z` 只在熄屏那一刻已站在锁屏时才为 true（`updateScreenOffNeedLinkageAnimStateInternal` 要求 `mKeyguardShowing && StatusBarState==KEYGUARD`，由 `MiuiDozeService#onDreamingStarted` 用 `aodView.setTag` 递给 aod 插件）⇒ 只有「锁屏进 AOD」透明，「桌面进 AOD」停在黑底。② **第一版踩坑**：hook 装到了 `com.miui.aod` 进程 —— 无效。AOD 的类其实由 `com.miui.aod` 的**插件 classloader 加载在 SystemUI 进程**（logcat `27090 D AODView : ...`，27090 = com.android.systemui；与 `AodClockProbe` 老结论一致），所以改到 SystemUI 里装、按类名认人。③ 新增 `hook/AliveAodHost`：`View#setBackgroundColor` 只认 AODView 实例且只把 `-16777216` 改判成 0、`setBackground/setBackgroundDrawable/setBackgroundResource` 跳过、AOD 宿主入窗时兜底置空并打诊断（`bg=ColorDrawable(#FF000000)`）；只在 `AliveFlag.PROP_ACTIVE=1` 时生效（1s 缓存）。**刻意不碰 `isUsingSuperWallpaperStyle`**（会把 mMode 改成 2 = 超壁纸定位，连带改时钟布局、破坏球心 0.2335 对齐）。上版 v1.22.79：AOD 总开关联动（`doze_always_on` 为唯一判据 + 应用拦截 + 自动关闭）。**版本元数据升级（2026-11-10 用户要求）：versionCode 5→101、versionName 「0.5 Beta2」→「1.0 Beta1」，无功能改动。**）"
+        const val BUILD_TAG = "2026-11-14.19-38 v1.22.102 / v1.0 Beta3（**发布前版本号收尾**：APK `versionCode` 101 → **103**、`versionName` 1.0 Beta2 → **1.0 Beta3**（用户 2026-11-14 要求）。功能同 v1.22.102，本轮自 v1.22.99 起的净变化三件事：① **回退「挂载 alpha=0 + 启动淡入」**（v1.22.100）—— 那套淡入只覆盖 `lockScs`，桌面份设 0 后再无人抬，全局 / 桌面档在桌面上永远是空的；Alive 侧 `fadeBothTo` 的 `deskFrom` 用 `showingDesktop` 推算，桌面态启动时推算值=目标 ⇒ 早退。② **修 MC 让路恢复后景深不回来**（v1.22.101）：`SpatialForegroundHider.refresh()` 清 `enabled()` 缓存、把层抬回 VISIBLE、再 `handle()`，三条链 `startInternal` 末尾各调一次。③ **MC 让路的 0 延迟信号**（v1.22.102）：hook `Main.enterCoverMode(Z)V` / `exitCoverMode(Z)V`（发行版未混淆，dexdump 核过），`LEAVE_DELAY` 450→120、空间 tick 1000→250、三条 tick 改 `wait` + `notifyAll` 唤醒，最坏 2.1s → ~0.55s。APK 版本 **103 / 1.0 Beta3**。上版 v1.22.101：修景深恢复。）"
         /** 第二个作用域（2026-09-28 起）：只为了锁屏那个「自定义锁屏」按钮的层级。 */
         const val SYSTEM_UI_PACKAGE = "com.android.systemui"
 

@@ -1135,6 +1135,57 @@ internal object SpatialRenderer {
         }.onFailure { HookRuntime.log("SPATIAL 设 alpha 失败：${it.javaClass.simpleName}: ${it.message}") }
     }
 
+    // ─────────────── MC 让路 / 恢复的 0.15s 过渡（2026-11-14 用户定）───────────────
+
+    private val MUSIC_FADE_MS = 150L
+    private var musicFadeTick: Runnable? = null
+
+    /**
+     * **MC 全屏封面**：150ms 淡出后停渲染器（由 `HookEntry` 的 spatial tick 调）。
+     *
+     * 空间壁纸和我们一样挂在壁纸 leash 上 ⇒ 同样会盖住 MC 的封面，处理方式也相同。
+     */
+    fun fadeOutAndStop() {
+        ensureHandler().post {
+            if (runningKey == null) return@post
+            fadeAlphaTo(0f) {
+                if (Coexist.musicCoverOn) {
+                    HookRuntime.log("SPATIAL MC 全屏封面 → 淡出完成，关闭渲染器")
+                    stopInternal("MC 全屏封面")
+                } else {
+                    fadeAlphaTo(1f, null)
+                }
+            }
+        }
+    }
+
+    /** 150ms 线性渐变到 [target]，结束后回调。 */
+    private fun fadeAlphaTo(target: Float, then: (() -> Unit)?) {
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
+        val from = currentAlpha
+        if (kotlin.math.abs(from - target) < 0.001f) {
+            then?.invoke()
+            return
+        }
+        val t0 = SystemClock.elapsedRealtime()
+        val r = object : Runnable {
+            override fun run() {
+                val p = ((SystemClock.elapsedRealtime() - t0).toFloat() / MUSIC_FADE_MS)
+                    .coerceIn(0f, 1f)
+                applyAlphaTo(lockScs, from + (target - from) * p)
+                if (p < 1f) {
+                    handler?.postDelayed(this, 16L)
+                } else {
+                    musicFadeTick = null
+                    then?.invoke()
+                }
+            }
+        }
+        musicFadeTick = r
+        handler?.post(r)
+    }
+
     /**
      * **仅桌面档在共用 leash 上的可见性**（2026-11-05，问题一）。
      *
@@ -1388,6 +1439,9 @@ internal object SpatialRenderer {
             "reparent", android.view.SurfaceControl::class.java, android.view.SurfaceControl::class.java,
         )
         val show = txClass.getMethod("show", android.view.SurfaceControl::class.java)
+        // ⚠️ **挂载时不设 alpha**（v1.22.100 回退 v1.22.97 的「先全透再淡入」）：
+        // 那套淡入只对 `lockScs` 生效，桌面份（`locked=false`）设成 0 之后再没人抬
+        // ⇒ 全局 / 桌面档在桌面上永远是空的。新建 SC 默认 alpha=1，正是 v1.22.95 的行为。
 
         /** 某条 leash（拿不到就 null，**不抛**）。 */
         fun leashOf(locked: Boolean): Any? {
@@ -1492,6 +1546,17 @@ internal object SpatialRenderer {
                 "锁屏景深=${if (runningLockDepth) 1 else 0}，" +
                 "挂载=${mounts.joinToString { "${if (it.locked) "锁屏" else "桌面"}/${if (it.kind == KIND_SUBJECT) "主体" else "背景"}" }}",
         )
+        // **不再从 0 淡入**（v1.22.100）：挂载时 alpha 就是 1，桌面份与锁屏份都在。
+        // MC 让路恢复时的过渡改由 `fadeAlphaTo(1f)` 在**重新挂载之后**显式调用（见 HookEntry）。
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
+        currentAlpha = 1f
+        pendingRaise = false
+        // **景深主体必须在启动后主动重算**（v1.22.101）：MC 让路那一下
+        // `Coexist.musicCoverOn` 先翻 false、渲染器还没起来 ⇒ `SpatialForegroundHider.handle()`
+        // 走「旧链」把 `keyguard_foreground_layer` 压成 INVISIBLE / 摘掉系统主体；
+        // 这里不补一刀，景深就一直不回来（用户：「三者恢复时我们的景深都没恢复」）。
+        runCatching { SpatialForegroundHider.refresh() }
     }
 
     /**
@@ -1755,6 +1820,8 @@ internal object SpatialRenderer {
 
     private fun stopInternal(reason: String) {
         val id = runningKey
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
         // 渲染器重建 ⇒ AOD 状态一起归零（否则下次启动会带着上一轮的 true，主体永不复位）。
         aodActive = false
         // 传感器先摘（否则回调还会往已销毁的 GL 上 post）

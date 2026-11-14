@@ -189,10 +189,37 @@ internal object HookRuntime {
         return current.protecting
     }
 
+    /**
+     * 宿主的 classLoader（`PackageReadyParam.classLoader`），由 `HookEntry` 装 hook 时记下来。
+     *
+     * ⚠️ 必须用它去解析 **framework 类**：`Class.forName("android.app.ActivityThread")`
+     * 用的是**模块自己的** classLoader，它看不见 `framework.jar` 里的类
+     * （2026-11-14 真机实测：Alive 在 SystemUI 重启后 `appContext()` 恒为 null ⇒
+     * 渲染器永远起不来，属性=1 也没用；v1.22.95 的 `Class.forName("android.app.ActivityManager")`
+     * 是同一个坑）。
+     */
+    @Volatile
+    private var hostLoader: ClassLoader? = null
+
+    /** 由 `HookEntry` 在拿到宿主 loader 时调用。 */
+    fun noteHostLoader(loader: ClassLoader?) {
+        if (loader != null) hostLoader = loader
+    }
+
+    /** 由 `Instrumentation#callApplicationOnCreate` 的 hook 喂进来（最可靠的一手来源）。 */
+    fun noteApplication(app: Application?) {
+        if (app != null) application = app
+    }
+
     fun appContext(): Context? {
         application?.let { return it }
         val resolved = runCatching {
-            val activityThread = Class.forName("android.app.ActivityThread")
+            val ldr = hostLoader
+            val activityThread = if (ldr != null) {
+                Class.forName("android.app.ActivityThread", false, ldr)
+            } else {
+                Class.forName("android.app.ActivityThread")
+            }
             activityThread.getMethod("currentApplication").invoke(null) as? Application
         }.getOrNull()
         if (resolved != null) {

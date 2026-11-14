@@ -38,8 +38,9 @@ import kotlin.math.roundToInt
  *
  * ## 它画什么
  *
- * 组里第 0 张是**基点图**；用户左右转手机时，按角度在两两之间做**擦除**过渡
- * （公式见 [RasterGlCore]）。没有景深、没有位移场，只有两张贴图 + 一条带。
+ * **归位点**那张是起点：默认（左右镜像展示 = 开）是第 0 张；关掉时是中点（`n / 2`）。
+ * 用户左右转手机时，按角度在两两之间做**擦除**过渡（公式见 [RasterGlCore]）。
+ * 没有景深、没有位移场，只有两张贴图 + 一条带。
  *
  * ## 与空间壁纸的关系
  *
@@ -102,6 +103,25 @@ internal object RasterRenderer {
      * 2026-11-07 起运行中可由 [applyRealtime] 热更新（启动时仍读一次做基线）。
      */
     private var settleOnIdle = true
+
+    /**
+     * 本次运行的「左右镜像展示」（`RasterFlag.PROP_MIRROR`，2026-11-13）。
+     *
+     * 开（默认）= 归位点第 1 张，左右两侧沿同一序列（= 加这个选项之前的行为）；
+     * 关 = 归位点取中点（`n / 2`），两侧各走半边。
+     *
+     * **只读一次**：组级属性，而「正在应用的组合无法编辑」⇒ 运行期不可能变，
+     * 不需要实时通道；下一次「应用」重启渲染器时自然读到新值。
+     */
+    private var mirror = true
+
+    /**
+     * 本次运行的归位点下标（0 基）—— 由 [mirror] 与张数算出（`RasterGlCore.baseOf`）。
+     *
+     * 开镜像 / 不足 3 张 ⇒ 0；关且 ≥3 张 ⇒ `n / 2`。`pan = 0` 就落在它上面
+     * （`posOf(0…) = base`），所以所有「归零」的地方都不用改。
+     */
+    private var baseIndex = 0
 
     /**
      * 本次运行的「过渡效果」（`RasterFlag.PROP_TRANSITION`）：0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲 ——
@@ -214,7 +234,8 @@ internal object RasterRenderer {
      *
      * 实测（2026-11-04）一张 2000×3555 现解现裁要 **528ms**，而纹理是按需加载的 ——
      * 转到第二张时会卡半秒。这里在 GL 线程之外把它们先备好，`textureFor` 只做 upload。
-     * 最多留 2 张（各 12.8MB），避免 SystemUI 堆内存被撑爆。
+     * 2026-11-13 起预取 ±2、最多留 [PRELOAD_KEEP] 张（各 12.8MB）—— 单组上限 16 张，
+     * 只备 ±1 的时候甩快一点仍会现解。
      */
     private val preloaded = java.util.concurrent.ConcurrentHashMap<Int, Bitmap>()
     private val preloading = java.util.Collections.synchronizedSet(HashSet<Int>())
@@ -255,7 +276,7 @@ internal object RasterRenderer {
     private var snapStartAt = 0L
     private var snapRun: Runnable? = null
 
-    // AOD / 解锁后「擦回第一张」
+    // AOD / 解锁后「擦回归位点」
     private var homeArmed = false
     private var homeRunning = false
     private var homeProg = 0f
@@ -314,6 +335,9 @@ internal object RasterRenderer {
     private var currentAlpha = 1f
 
     private const val FADE_MS = 380f
+
+    /** 预取缓存最多留几张（2026-11-13：与 ±2 的预取半径配套，4 张 ≈ 51MB）。 */
+    private const val PRELOAD_KEEP = 4
 
     /** 正在跑的淡出（null = 未在淡出）。只在 GL 线程读写。 */
     private var fadeTick: Runnable? = null
@@ -543,9 +567,24 @@ internal object RasterRenderer {
         // 「最大幅度角度」：同样**只读一次**（生效中改只写 prefs，下一次「应用」才下发）。
         val panDeg = HookRuntime.systemProperty(
             com.frederic22.hyperextreme.data.RasterFlag.PROP_PAN_DEG,
-        ).trim().toIntOrNull()?.coerceIn(15, 45) ?: 25
+        ).trim().toIntOrNull()?.coerceIn(
+            MaskPrefs.RASTER_ANGLE_MIN,
+            MaskPrefs.RASTER_ANGLE_MAX,
+        ) ?: MaskPrefs.RASTER_ANGLE_DEFAULT
         panMaxRad = RasterGlCore.radOf(panDeg)
         HookRuntime.log("RASTER 最大幅度角度=${panDeg}°（满量程 ${"%.4f".format(panMaxRad)} rad）")
+
+        // 「左右镜像展示」（2026-11-13）：属性没写按**开**（= 加这个选项之前的行为）。
+        // 不足 3 张时 baseOf 自己会回落成 0（中点没有意义）。
+        mirror = HookRuntime.systemProperty(
+            com.frederic22.hyperextreme.data.RasterFlag.PROP_MIRROR,
+        ).trim() != "0"
+        baseIndex = RasterGlCore.baseOf(images.size, mirror)
+        HookRuntime.log(
+            "RASTER 左右镜像展示=${if (mirror) 1 else 0}" +
+                "（归位点 #$baseIndex / 共 ${images.size} 张，" +
+                "每张 ${"%.2f".format(Math.toDegrees(RasterGlCore.stepOf(panMaxRad, images.size).toDouble()))}°）",
+        )
 
         // 「停顿时就近归位」：属性没写也按**开**（= 加这个选项之前的行为）。
         settleOnIdle = HookRuntime.systemProperty(
@@ -577,7 +616,7 @@ internal object RasterRenderer {
         )
 
         // 五、挂到壁纸 leash
-        attachToLeash(scope)
+        attachToLeashWithRetry(scope)
 
         startSensor(ctx)
         watchScreen(ctx)
@@ -586,6 +625,17 @@ internal object RasterRenderer {
             "RASTER 渲染器已启动：key=$key scope=$scope 图 ${images.size} 张，" +
                 "屏幕 ${screenW}×$screenH",
         )
+        // **不再从 0 淡入**（v1.22.100）：挂载时 alpha 就是 1，桌面份与锁屏份都在。
+        // MC 让路恢复的过渡由 `fadeAlphaTo(1f)` 在重新挂载后显式调用（见 HookEntry）。
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
+        currentAlpha = 1f
+        pendingRaise = false
+        // **景深主体必须在启动后主动重算**（v1.22.101）：MC 让路那一下
+        // `Coexist.musicCoverOn` 先翻 false、渲染器还没起来 ⇒ `SpatialForegroundHider.handle()`
+        // 走「旧链」把 `keyguard_foreground_layer` 压成 INVISIBLE / 摘掉系统主体；
+        // 这里不补一刀，景深就一直不回来（用户：「三者恢复时我们的景深都没恢复」）。
+        runCatching { SpatialForegroundHider.refresh() }
     }
 
     /** 把每个挂载目标 reparent 到系统的壁纸 leash（逐条容错，挂不上的丢弃）。 */
@@ -605,6 +655,9 @@ internal object RasterRenderer {
             "reparent", android.view.SurfaceControl::class.java, android.view.SurfaceControl::class.java,
         )
         val show = txClass.getMethod("show", android.view.SurfaceControl::class.java)
+        // ⚠️ **挂载时不设 alpha**（v1.22.100 回退 v1.22.97 的「先全透再淡入」）：
+        // 那套淡入只对 `lockScs` 生效，桌面份（`locked=false`）设成 0 之后再没人抬
+        // ⇒ 全局 / 桌面档在桌面上永远是空的。新建 SC 默认 alpha=1，正是 v1.22.95 的行为。
 
         fun leashOf(locked: Boolean): Any? {
             val token = runCatching { gw.invoke(inst, 0, locked) }.getOrNull() ?: return null
@@ -656,7 +709,7 @@ internal object RasterRenderer {
             )
             setDeskOnlyAlpha(if (showingDesktop) 1f else 0f, force = true)
         }
-        if (kept.size != mounts.size) {
+        if (kept.size != mounts.size && kept.isNotEmpty()) {
             val drop = mounts.filter { it !in kept }
             runCatching {
                 val tx2 = txClass.getConstructor().newInstance()
@@ -674,7 +727,41 @@ internal object RasterRenderer {
             mounts.clear()
             mounts.addAll(kept)
         }
-        check(mounts.isNotEmpty()) { "全部目标挂载失败（scope=$scope）" }
+        check(kept.isNotEmpty()) { "全部目标挂载失败（scope=$scope）" }
+    }
+
+    /**
+     * **挂载重试**（2026-11-14）。
+     *
+     * 壁纸层重建期间（`killall miwallpaper` 之后最长约 5s）`getWallpaperByShowWhenLocked`
+     * 拿不到 token，一次性挂载会直接判失败、渲染器停掉 ⇒ 用户看到的就是「点应用没反应，得再点一次」。
+     * 这里每 250ms 重试，最多 8 次；失败期间 `mounts` 保留（见上面的 `kept.isNotEmpty()`），
+     * 否则下一次从空列表起手永远挂不上。
+     */
+    private fun attachToLeashWithRetry(scope: Int) {
+        var attempt = 0
+        while (true) {
+            try {
+                attachToLeash(scope)
+                if (attempt > 0) HookRuntime.log("RASTER 挂载重试成功（第 ${attempt + 1} 次）")
+                return
+            } catch (e: IllegalStateException) {
+                attempt++
+                if (attempt >= 8) {
+                    HookRuntime.log("RASTER 挂载重试耗尽（8 次），判启动失败：${e.message}")
+                    throw e
+                }
+                if (attempt == 1 || attempt % 2 == 0) {
+                    HookRuntime.log("RASTER 壁纸层未就绪（$attempt/8），250ms 后重试：${e.message}")
+                }
+                try {
+                    Thread.sleep(250L)
+                } catch (ie: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+        }
     }
 
     // ───────────────────────────── 停止 ─────────────────────────────
@@ -694,6 +781,8 @@ internal object RasterRenderer {
         cancelHome()
         resetRun?.let { handler?.removeCallbacks(it) }
         resetRun = null
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
 
         runCatching {
             if (mounts.isNotEmpty()) {
@@ -863,7 +952,7 @@ internal object RasterRenderer {
         // 静止门限：低于它不积分 ⇒ 噪声不会累积成漂移。
         if (abs(gyroRate) < RasterGlCore.GYRO_GATE) return
 
-        // 等"恢复后第一个运动方向"：等到了就直接开始擦回第一张。
+        // 等"恢复后第一个运动方向"：等到了就直接开始擦回归位点。
         if (homeArmed && !homeRunning) {
             startHomeWipe(if (gyroRate > 0f) 1f else -1f)
             return
@@ -871,7 +960,8 @@ internal object RasterRenderer {
         if (homeRunning) return
 
         val before = pan
-        pan = (pan + gyroRate * dt).coerceIn(-panMaxRad, panMaxRad)
+        val range = RasterGlCore.panRangeOf(images.size, baseIndex, panMaxRad)
+        pan = (pan + gyroRate * dt).coerceIn(range.start, range.endInclusive)
         val delta = pan - before
         if (abs(delta) < 1e-9f) return
 
@@ -894,13 +984,13 @@ internal object RasterRenderer {
         }
     }
 
-    /** 当前连续图号（0 .. N−1）。 */
-    private fun fValue(): Float {
-        val n = images.size
-        if (n < 2) return 0f
-        val step = panMaxRad / (n - 1)
-        return (abs(pan) / step).coerceIn(0f, (n - 1).toFloat())
-    }
+    /**
+     * 当前连续图号（0 .. N−1）。
+     *
+     * 开镜像 = `|pan| / step`；关镜像 = `base + pan / step` —— 统一走
+     * `RasterGlCore.posOf`，**不要在这里自己算**（两条链口径一漂，两种挂载模式看到的图就不同）。
+     */
+    private fun fValue(): Float = RasterGlCore.posOf(pan, images.size, baseIndex, panMaxRad)
 
     // ───────────────────────────── 收尾（补完这一擦） ─────────────────────────────
 
@@ -925,8 +1015,13 @@ internal object RasterRenderer {
         } else {
             idx.toFloat()
         }
-        val step = panMaxRad / (images.size - 1)
-        startSnap(target * step * (if (pan >= 0f) 1f else -1f))
+        // 图号 → 累计角：开镜像要带符号（两侧共用同一序列），关镜像由 pos−base 决定方向。
+        startSnap(
+            RasterGlCore.panOf(
+                target, images.size, baseIndex, panMaxRad,
+                if (pan >= 0f) 1f else -1f,
+            ),
+        )
     }
 
     private fun startSnap(targetPan: Float) {
@@ -969,10 +1064,12 @@ internal object RasterRenderer {
     // ───────────────────────────── 基点重置 ─────────────────────────────
 
     /**
-     * 「擦回第一张」：AOD 与锁屏一致 / 解锁回锁屏时用（用户 2026-11-04）。
+     * 「擦回归位点」：AOD 与锁屏一致 / 解锁回锁屏时用（用户 2026-11-04）。
      *
      * 方向取**恢复后第一个运动方向**（`onYaw` 里等），超时用上一次的方向；
-     * 跨多张也只擦**一次**（把当前这张整体擦到图 0），否则从第 4 张回第 1 张要擦三遍。
+     * 跨多张也只擦**一次**（把当前这张整体擦到归位点），否则从第 16 张回第 8 张要擦八遍。
+     *
+     * 2026-11-13：目标从固定的第 0 张改成 [baseIndex]（开镜像时仍是第 0 张）。
      */
     private fun armHomeWipe() {
         if (images.size < 2) {
@@ -988,7 +1085,7 @@ internal object RasterRenderer {
         }
         homeArmRun = r
         handler?.postDelayed(r, RasterGlCore.HOME_WAIT_MS)
-        HookRuntime.log("RASTER 已待命：等恢复后的第一个运动方向再擦回第一张")
+        HookRuntime.log("RASTER 已待命：等恢复后的第一个运动方向再擦回归位点")
     }
 
     private fun startHomeWipe(dir: Float) {
@@ -997,7 +1094,8 @@ internal object RasterRenderer {
         homeArmRun = null
         val f = fValue()
         homeFrom = f.roundToInt().coerceIn(0, images.size - 1)
-        if (homeFrom == 0 && f < 0.5f) {
+        // 已经在归位点上（关镜像时是中点，不是第 0 张）⇒ 不用擦。
+        if (homeFrom == baseIndex && abs(f - baseIndex) < 0.5f) {
             pan = 0f
             dirty = true
             renderIfNeeded(force = true)
@@ -1007,7 +1105,10 @@ internal object RasterRenderer {
         homeRunning = true
         homeProg = 0f
         homeStartAt = SystemClock.elapsedRealtime()
-        HookRuntime.log("RASTER 擦回第一张：从 #$homeFrom，方向=${if (dir > 0) "右→左" else "左→右"}")
+        HookRuntime.log(
+            "RASTER 擦回归位点：从 #$homeFrom 到 #$baseIndex，" +
+                "方向=${if (dir > 0) "右→左" else "左→右"}",
+        )
         handler?.post(homeTick)
     }
 
@@ -1029,7 +1130,7 @@ internal object RasterRenderer {
                 gyroRate = 0f
                 dirty = true
                 renderIfNeeded(force = true)
-                HookRuntime.log("RASTER 已回到基点（第 1 张）")
+                HookRuntime.log("RASTER 已回到归位点（第 ${baseIndex + 1} 张）")
             } else {
                 handler?.postDelayed(this, 16)
             }
@@ -1166,7 +1267,8 @@ internal object RasterRenderer {
      * * **0.5** = 与锁屏一致的全屏 AOD ⇒ **先归位（750ms）再冻结**（2026-11-06 用户要求）。
      *
      * 全屏 AOD 的归位**不受「停顿时就近归位」开关影响**：那个开关管的是"停在两张之间"，
-     * 这里必须回到第 1 张 —— 与退出 AOD 后的基准一致，否则 AOD 里就停在半擦状态。
+     * 这里必须回到**归位点**（开镜像 = 第 1 张，关镜像 = 中点）—— 与退出 AOD 后的基准一致，
+     * 否则 AOD 里就停在半擦状态。
      */
     fun onEnterAod(black: Float) {
         handler?.post {
@@ -1205,7 +1307,7 @@ internal object RasterRenderer {
     }
 
     /**
-     * AOD 归位：用 handler 节拍把 `pan` 抹回 0（第 1 张），**不依赖陀螺仪**
+     * AOD 归位：用 handler 节拍把 `pan` 抹回 0（= 归位点那张），**不依赖陀螺仪**
      * （灭屏时系统会停掉这个非 wake-up 传感器 —— 空间壁纸 2026-10-29 实证）。
      *
      * 曲线与 `SpatialRenderer.startAodHomingLocked` 逐字一致：ease-out quartic / 750ms。
@@ -1215,14 +1317,14 @@ internal object RasterRenderer {
         // **幂等早退**：AOD 期间系统会反复调 `doWallpaperBlackAnim`（真机日志：0.1~1.8s 一次），
         // 每次重开 750ms 动画会让归位永远走不到终点。已经在跑就不再重启。
         if (aodHomeTick != null) return
-        // 已经在第 1 张：不用动画，直接冻结。
+        // 已经在归位点：不用动画，直接冻结。
         if (abs(pan) < 1e-4f) {
             pan = 0f
             aodFrozen = true
-            HookRuntime.log("RASTER AOD 归位：本来就在第 1 张 ⇒ 直接冻结")
+            HookRuntime.log("RASTER AOD 归位：本来就在归位点 ⇒ 直接冻结")
             return
         }
-        // 归位的目标就是第 1 张 ⇒ 正在跑的收尾 / 擦回都作废，否则会和归位抢 pan。
+        // 归位的目标就是归位点 ⇒ 正在跑的收尾 / 擦回都作废，否则会和归位抢 pan。
         cancelSnap()
         cancelHome()
         val from = pan
@@ -1270,7 +1372,7 @@ internal object RasterRenderer {
     /**
      * 退出 AOD（回锁屏）：解冻 + 压暗复位 + **重注册传感器** + 补一帧。
      *
-     * **不再「带过渡擦回第一张」**（2026-11-06）：进入 AOD 时已经归位到第 1 张，
+     * **不再「带过渡擦回归位点」**（2026-11-06）：进入 AOD 时已经归位到归位点，
      * 这里再 `armHomeWipe()` 会挂一个"等第一个运动方向"的待命，把退出后的**第一次转头吞掉**。
      */
     fun onExitAod() {
@@ -1654,6 +1756,62 @@ internal object RasterRenderer {
         }
     }
 
+    // ─────────────── MC 让路 / 恢复的 0.15s 过渡（2026-11-14 用户定）───────────────
+
+    /** 过渡时长。 */
+    private val MUSIC_FADE_MS = 150L
+
+    /** 正在跑的过渡（中途反向要取消）。 */
+    private var musicFadeTick: Runnable? = null
+
+    /**
+     * **MC 全屏封面**：150ms 淡出后停渲染器（由 `HookEntry` 的 raster tick 调）。
+     *
+     * 用户 2026-11-14 定：MC 在锁屏全屏封面时整份关掉我们的层，退出封面再拉起；
+     * 关/开都走 150ms 过渡，别硬切。
+     */
+    fun fadeOutAndStop() {
+        ensureHandler().post {
+            if (runningKey == null) return@post
+            fadeAlphaTo(0f) {
+                if (Coexist.musicCoverOn) {
+                    HookRuntime.log("RASTER MC 全屏封面 → 淡出完成，关闭渲染器")
+                    stopInternal("MC 全屏封面")
+                } else {
+                    // 淡出期间封面撤了：淡回来，别停
+                    fadeAlphaTo(1f, null)
+                }
+            }
+        }
+    }
+
+    /** 150ms 线性渐变到 [target]，结束后回调。 */
+    private fun fadeAlphaTo(target: Float, then: (() -> Unit)?) {
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
+        val from = currentAlpha
+        if (abs(from - target) < 0.001f) {
+            then?.invoke()
+            return
+        }
+        val t0 = SystemClock.elapsedRealtime()
+        val r = object : Runnable {
+            override fun run() {
+                val p = ((SystemClock.elapsedRealtime() - t0).toFloat() / MUSIC_FADE_MS)
+                    .coerceIn(0f, 1f)
+                applyAlphaTo(lockScs, from + (target - from) * p)
+                if (p < 1f) {
+                    handler?.postDelayed(this, 16L)
+                } else {
+                    musicFadeTick = null
+                    then?.invoke()
+                }
+            }
+        }
+        musicFadeTick = r
+        handler?.post(r)
+    }
+
     /**
      * **仅桌面档在共用 leash 上的可见性**（2026-11-05，问题一）。
      *
@@ -1836,7 +1994,7 @@ internal object RasterRenderer {
         var dir: Float
         if (homeRunning) {
             fromIdx = homeFrom.coerceIn(0, n - 1)
-            toIdx = 0
+            toIdx = baseIndex.coerceIn(0, n - 1)
             t = homeProg
             dir = homeDir
         } else {
@@ -1844,17 +2002,31 @@ internal object RasterRenderer {
             var idx = f.toInt()
             if (idx > n - 1) idx = n - 1
             var frac = f - idx
-            if (idx >= n - 1) frac = 0f
-            fromIdx = idx
-            toIdx = (idx + 1).coerceAtMost(n - 1)
-            if (toIdx == fromIdx) frac = 0f
-            t = frac
+            // **递增 = 图号变大的方向**：开镜像恒递增；关镜像看 pan 符号。
+            // 关镜像往回翻时 f 是**递减**的，from/to 必须跟着换，否则会变成
+            // "从下一张擦回当前张"（起止图与方向都反 —— 2026-11-13 真机报的"出场不对"）。
+            val asc = baseIndex <= 0 || pan >= 0f
+            if (asc) {
+                if (idx >= n - 1) frac = 0f
+                fromIdx = idx
+                toIdx = (idx + 1).coerceAtMost(n - 1)
+                if (toIdx == fromIdx) frac = 0f
+                t = frac
+            } else {
+                // pos 从 idx+1 走向 idx ⇒ from = idx+1（旧图）、to = idx（新图），t 由 1→0。
+                fromIdx = (idx + 1).coerceAtMost(n - 1)
+                toIdx = idx
+                if (fromIdx == toIdx) frac = 0f
+                t = 1f - frac
+            }
             // 方向 = **累计角的符号**（参考项目同款），不是瞬时运动方向。
             // 同一侧活动时方向恒定；只有转过基点、到另一侧才翻 —— 而那时 t≈0、
             // 两边显示的是同一张整图 ⇒ 翻转无感知。之前的"段起点锁存 + 中途反向不翻"
             // 会让人往回推时擦除还按原方向跑（用户 2026-11-04 报的"和手反着来"）。
             dir = if (pan >= 0f) 1f else -1f
         }
+        // t=0 显示 from、t=1 显示 to（见 `RasterGlCore.FRAG` 的 mixFactor）。
+        // 极小时收成一张：两种配对都是"收 from"，所以不用分支。
         if (t <= 0.0005f) {
             toIdx = fromIdx
             t = 0f
@@ -1882,8 +2054,15 @@ internal object RasterRenderer {
         // ⚠️ 顺序不能反：先确保纹理在位（首次会现传并算出 cover 参数），再读 uv ——
         //    否则第一帧拿到的是恒等 uv，图会以拉伸的样子闪一下。
         // 顺手把邻居备好（已在缓存/在途是空操作）—— 下次转过去就不用现解。
-        preload(key, fromIdx + 1)
-        preload(key, fromIdx - 1)
+        // 2026-11-13：从 ±1 扩到 ±2（单组上限 16 张，甩快一点就会跨两张；
+        // 一张现解现裁 528ms，卡一下很明显）。内存代价见 [putPreloaded]。
+        // 中心取 from/to 里**较小**的那个：关镜像往回翻时 from = idx+1、to = idx，
+        // 用 from 当中心会漏掉 idx−2 那一侧。
+        val near = minOf(fromIdx, toIdx)
+        preload(key, near + 1)
+        preload(key, near + 2)
+        preload(key, near - 1)
+        preload(key, near - 2)
         val texF = textureFor(key, fromIdx, toIdx)
         val texT = if (toIdx == fromIdx) texF else textureFor(key, toIdx, fromIdx)
         val uvF = uvOf(fromIdx)
@@ -2042,12 +2221,17 @@ internal object RasterRenderer {
         }.apply { isDaemon = true }.start()
     }
 
-    /** 只保留最近两张，多的立刻回收。 */
+    /**
+     * 只保留最近 **4** 张（2026-11-13 从 2 扩上来：预取 ±2），多的立刻回收。
+     *
+     * 每张 = 屏幕尺寸的 ARGB_8888，本机 1200×2670 ≈ 12.8MB ⇒ 上限约 51MB。
+     * 只在 SystemUI 里短暂持有，转过去就 upload 完回收。
+     */
     private fun putPreloaded(index: Int, bmp: Bitmap) {
         preloaded[index] = bmp
-        if (preloaded.size > 2) {
+        if (preloaded.size > PRELOAD_KEEP) {
             for (k in preloaded.keys.toList()) {
-                if (preloaded.size <= 2) break
+                if (preloaded.size <= PRELOAD_KEEP) break
                 if (k != index) preloaded.remove(k)?.recycle()
             }
         }

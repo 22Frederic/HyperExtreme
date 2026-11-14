@@ -2,7 +2,7 @@
   <img
     src="app/src/main/res/drawable-nodpi/cover.png"
     alt="COVER"
-    width="100%"
+    width="95%"
     style="height: auto;"
   >
 </p>
@@ -14,6 +14,10 @@
   <img src="https://img.shields.io/badge/targetSdk-37-green?style=flat" alt="targetSdk">
   <img src="https://img.shields.io/badge/License-AGPL--3.0-yellow?style=flat" alt="license">
 </p>
+
+## 请注意
+
+请勿在未经许可的情况下私自分发模块安装包，分享时，请引导至官方Github或网盘链接。对于使用非官方Github或网盘链接途径下载以及非官方签名的模块安装包造成的任何问题均不受理。
 
 ## 介绍
 
@@ -32,6 +36,8 @@ HyperExtreme是一款LSPosed美化模块，支持空间壁纸、光栅壁纸、A
 本模块可能对修改较多的HyperOS ROM或修改过的推荐作用域应用不生效甚至导致其他问题。
 
 本模块可能与其他修改相同作用域的LSPosed模块产生冲突，在使用模块出现问题时，请先排查模块冲突。
+
+**目前对HyperMusicCover进行了适配**
 
 ## 开源代码许可
 

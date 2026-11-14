@@ -14,20 +14,32 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * 一个「光栅组」= 一组按顺序排列的图。**第一张就是封面**（用户 2026-11-03 定）。
+ * 一个「光栅组」= 一组按顺序排列的图。**封面 = 归位点那张**（2026-11-13 改）。
  *
  * `items` 里存的是**文件名**（不是绝对路径），顺序 = 排序结果的顺序。
  * 用文件名而不是完整路径，是为了整个 `files/raster` 目录可以被整体挪走 / 备份而不失效。
+ *
+ * [mirror] = 「左右镜像展示」（2026-11-13 用户定）：默认开 = 归位点第 1 张、两侧沿同一序列；
+ * 关 = 归位点取中点（奇数取中、偶数**索引 n/2**，即 4 张取第 3 张），两侧各走半边。
  */
 internal data class RasterGroup(
     val id: String,
     val dir: File,
     val items: List<String>,
     val createdAt: Long,
+    val mirror: Boolean = true,
 ) {
-    /** 封面 = 排序里的第一张；空组返回 null。 */
+    /**
+     * 归位点在 `items` 里的下标 —— 与 `RasterGlCore.midOf` / `baseOf` **同一口径**。
+     *
+     * 不足 3 张时中点没有意义（也关不掉开关），一律按第 0 张。
+     */
+    val baseIndex: Int
+        get() = if (!mirror && items.size >= 3) items.size / 2 else 0
+
+    /** 封面 = 归位点那张（关镜像时是中点）；空组返回 null。 */
     val coverFile: File?
-        get() = items.firstOrNull()?.let { File(dir, it) }
+        get() = items.getOrNull(baseIndex)?.let { File(dir, it) }
 
     fun fileOf(name: String): File = File(dir, name)
 
@@ -51,7 +63,7 @@ internal data class RasterGroup(
  *
  * ```
  * files/raster/<groupId>/
- *   meta.json      {"version":1,"id":"…","createdAt":…,"items":["img_…jpg",…]}
+ *   meta.json      {"version":2,"id":"…","createdAt":…,"items":["img_…jpg",…],"mirror":true}
  *   img_….jpg      原图副本（**未压缩**，导入时按字节原样拷进来）
  *   img_….subject.png   可选，算过的**主体抠像**（RGBA，alpha = 轮廓）
  * ```
@@ -81,8 +93,13 @@ internal object RasterStore {
     /** 组元数据文件名。 */
     private const val META = "meta.json"
 
-    /** 元数据格式版本（以后改结构时用来判新旧）。 */
-    private const val META_VERSION = 1
+    /**
+     * 元数据格式版本（以后改结构时用来判新旧）。
+     *
+     * 2（2026-11-13）：加 `mirror` 字段。旧文件缺这个字段 ⇒ 读成 true（= 加开关之前的行为），
+     * **零迁移**。
+     */
+    private const val META_VERSION = 2
 
     /** 卡片封面解码时的**短边**目标（卡片宽 45% × 屏宽 ≈ 540px，短边给 540 足够）。 */
     const val CARD_SHORT_SIDE = 540
@@ -147,6 +164,8 @@ internal object RasterStore {
             dir = dir,
             items = names,
             createdAt = o.optLong("createdAt", dir.name.toLongOrNull() ?: 0L),
+            // 旧 meta 没有这一项 ⇒ 开（2026-11-13：= 加开关之前的行为）。
+            mirror = o.optBoolean("mirror", true),
         )
     }.onFailure {
         Log.w(TAG, "读 ${dir.name} 失败：${it.message}")
@@ -176,6 +195,7 @@ internal object RasterStore {
                 .put("id", group.id)
                 .put("createdAt", group.createdAt)
                 .put("items", org.json.JSONArray(arr))
+                .put("mirror", group.mirror)
             File(group.dir, META).writeText(o.toString())
         }.onFailure {
             Log.w(TAG, "写 meta 失败：${it.message}")

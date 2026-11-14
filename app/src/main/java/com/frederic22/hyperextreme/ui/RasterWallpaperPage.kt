@@ -29,6 +29,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -151,9 +152,12 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     // 首次扫描是否完成。**完成前不组合卡片流** —— 否则第一帧会先露出「新建」卡，
     // 扫描回来再跳到第一套，进页面能看到明显的一闪。
     var loaded by remember { mutableStateOf(false) }
-    var located by remember { mutableStateOf(false) }
+    // ⚠️ `located` 必须 **saveable**：Activity 重建（浮页在某些机型上会走一次）时
+    // remember 全丢 ⇒ 会重新定位第一套，就是用户看到的"关闭浮页跳到第一个"。
+    var located by rememberSaveable { mutableStateOf(false) }
     // 当前聚焦的 item 下标：0 = 新建卡，i+1 = groups[i]
-    var focused by remember { mutableIntStateOf(0) }
+    // saveable：Activity 重建时别丢定位（否则会重新定位第一套）。
+    var focused by rememberSaveable { mutableIntStateOf(0) }
     // 浮页：null = 新建；非 null = 编辑该组
     var sheetOpen by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<RasterGroup?>(null) }
@@ -175,6 +179,10 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     var shiftToken by remember { mutableIntStateOf(0) }
     // 「清除所有搭配」请求号（2026-11-07）：+1 交给卡片流播"全部缩小淡出 → 新建卡补位"。
     var clearSeq by remember { mutableIntStateOf(0) }
+    // 关闭编辑浮页时「保持当前列表顺序」（2026-11-13）：
+    // 编辑不改 `rasterGroupOrder`，但用户可能刚应用过某组（order 已置顶、页面列表还没动）。
+    // 若 reload 按持久化 order 重排，视口页号对应的组就换了 ⇒ 观感「跳到第一个」。
+    var keepOrderOnReload by rememberSaveable { mutableStateOf(false) }
 
     val prefs = remember { MaskPrefs(ctx) }
     // 「当前使用中的组」——空串 = 一套都没应用。
@@ -182,8 +190,20 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
 
     LaunchedEffect(reload) {
         // 顺序**持久化**在 `rasterGroupOrder` 里（2026-11-05）：应用 / 新建时把 id 提到最前，
-        // 关闭应用**不动它** —— 以前是加载时按 activeId 临时排序，一关就跳回原来的位置。
-        val list = withContext(Dispatchers.IO) { RasterStore.list(ctx, prefs.rasterGroupOrder) }
+        // 关闭应用**不动它**。
+        //
+        // ⚠️ 2026-11-13（v1.22.86）：**编辑浮页关闭时不能按持久化 order 重排** ——
+        // 用户可能刚应用过某组（order 已把它提到最前、但页面列表还没动），
+        // 一关浮页就重排 ⇒ 视口页号对应的组换了，观感就是「跳到第一个」。
+        // 编辑流程改用**当前列表顺序**（等价于"顺序不变"）；只有新建流程仍用持久化 order
+        //（新组要出现在第一位），首次进页面也用持久化 order。
+        val order = if (keepOrderOnReload) {
+            keepOrderOnReload = false
+            groups.map { it.id }
+        } else {
+            prefs.rasterGroupOrder
+        }
+        val list = withContext(Dispatchers.IO) { RasterStore.list(ctx, order) }
         // 指向的组已经不存在（被删 / 目录损坏）⇒ 清掉指针并关渲染器，不留幽灵状态：
         // 否则 SystemUI 里那条链会抱着一个读不到图的 key 一直画黑屏。
         var active = prefs.rasterActiveId
@@ -196,11 +216,11 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
             activeId = ""
         }
         groups = list
-        // 进页面定位（2026-11-03 用户要求）：有组就停在**第一套**，一套都没有才停在「新建」卡。
-        // 配合上面的排序，第一套 = 正在应用的那套（没有应用的组时 = 最新建的那套）。
-        // ⚠️ 必须和 `loaded` 在同一个快照里写完：`GroupCarousel` 是在 `loaded` 之后才组合的，
-        // 它用 `initialFirstVisibleItemIndex` 建 LazyListState —— 晚一帧就会出现「新建卡滑走」。
         if (!located) {
+            // 首次组合（= 进页面 / Activity 重建）：有组就停在**第一套**。
+            // 配合持久化 order，第一套 = 正在应用的那套（没有应用的组时 = 最新建的那套）。
+            // ⚠️ 必须和 `loaded` 在同一个快照里写完：卡片流是在 `loaded` 之后才组合的，
+            // 它用 `initialFirstVisibleItemIndex` 建 LazyListState —— 晚一帧就会出现「新建卡滑走」。
             located = true
             focused = if (groups.isEmpty()) 0 else 1
         }
@@ -353,14 +373,17 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
             }
             RasterServiceTarget.write(
                 ctx, g.id, prefs.rasterMaxAngle, prefs.rasterTransition, prefs.rasterSettle,
+                g.mirror,
             )
             SpatialServiceMode.openPicker(ctx, RasterWallpaperService::class.java)
             Toast.makeText(ctx, "请在系统服务页设置生效范围", Toast.LENGTH_LONG).show()
         } else {
             // 景深开关随「应用」一起下发（生效中改它只写 prefs，下一次应用才生效 —— 与空间壁纸同语义）。
+            // 「左右镜像展示」是组级属性 ⇒ 跟着这一组一起推（2026-11-13）。
             RasterFlag.push(
                 true, g.id, prefs.rasterScope, prefs.rasterLockDepth,
                 prefs.rasterMaxAngle, prefs.rasterTransition, prefs.rasterSettle,
+                g.mirror,
             )
             // 记「壁纸基准」（2026-11-05）：aod 侧的换壁纸检测拿它当比对值，判据一变就无条件关闭
             // 光栅壁纸。判据要读模板文件 ⇒ 放后台、不阻塞点按；算不出来就留空 —— hook 侧会
@@ -394,16 +417,19 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
      * 渲染侧实时通道不读它。
      */
     fun pushRealtime(transition: Int, settleOn: Boolean) {
+        // 「左右镜像展示」是组级属性、实时通道不读它，但推属性/target 时必须**带上当前在跑那一组的值**，
+        // 否则会被默认值（开）覆盖，下次重启渲染器时归位点就漂了（2026-11-13）。
+        val runningMirror = groups.firstOrNull { it.id == inUseId }?.mirror ?: true
         if (mountMode == RASTER_MOUNT_SERVICE) {
             if (serviceRunning && serviceTargetId.isNotEmpty()) {
                 RasterServiceTarget.write(
-                    ctx, serviceTargetId, prefs.rasterMaxAngle, transition, settleOn,
+                    ctx, serviceTargetId, prefs.rasterMaxAngle, transition, settleOn, runningMirror,
                 )
             }
         } else if (inUseId.isNotEmpty()) {
             RasterFlag.push(
                 true, inUseId, prefs.rasterScope, prefs.rasterLockDepth,
-                prefs.rasterMaxAngle, transition, settleOn,
+                prefs.rasterMaxAngle, transition, settleOn, runningMirror,
             )
         }
     }
@@ -543,8 +569,18 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
         Spacer(Modifier.height(BLOCK_GAP))
 
         if (loaded) {
+            // 状态胶囊在**每张卡内部**（`CoverItem.badge`，2026-11-13）：随卡片移动、一直显示。
+            // 每张卡自己一个 backdrop（磨自己的封面），页面不再建共用的 —— 否则胶囊会被画进 backdrop。
             CoverCarousel(
-                items = groups.map { CoverItem(it.id, it.coverFile) },
+                items = groups.map { g ->
+                    // 不足 3 张时渲染层强制镜像 ⇒ 胶囊按**实际生效值**显示。
+                    val mirrorOn = g.items.size < 3 || g.mirror
+                    CoverItem(
+                        id = g.id,
+                        cover = g.coverFile,
+                        badge = "${g.items.size}张 镜像${if (mirrorOn) "开" else "关"}",
+                    )
+                },
                 initialPage = if (groups.isEmpty()) 0 else 1,
                 // 高亮「正在渲染的那一组」：服务模式看 target 真值，不再看"点过跳转"的指针。
                 activeId = inUseId,
@@ -802,7 +838,12 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                     // ⚠️ 重写 target 会触发 FileObserver，但实时通道只比 transition/settle，
                     //    值没变就不会归位、也不会把 panDeg 应用上去。
                     if (serviceRunning && serviceTargetId.isNotEmpty()) {
-                        RasterServiceTarget.write(ctx, serviceTargetId, maxAngle, transitionChoice, settle)
+                        // 角度与「左右镜像展示」一起重写：target 是整份配置快照，不能只写角度
+                        // 把 mirror 冲成默认值。
+                        val runningMirror = groups.firstOrNull { it.id == serviceTargetId }?.mirror ?: true
+                        RasterServiceTarget.write(
+                            ctx, serviceTargetId, maxAngle, transitionChoice, settle, runningMirror,
+                        )
                     }
                 },
             )
@@ -837,6 +878,10 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
         group = editing,
         autoPick = autoPick,
         onDismiss = {
+            // 关闭浮页（2026-11-13）：
+            // * **编辑**（editing != null）⇒ reload **保持当前列表顺序**，列表不重排、视野不动；
+            // * **新建**（editing == null）⇒ 仍用持久化 order，新组出现在第一位。
+            keepOrderOnReload = editing != null
             sheetOpen = false
             editing = null
             autoPick = false
@@ -1045,3 +1090,8 @@ private val RASTER_TRANSITION_LABELS = listOf("默认", "条纹玻璃", "磨砂�
 /** 取值 → 文案；越界时回退到默认档（锁屏），绝不抛。与空间壁纸页同名同语义。 */
 private fun scopeLabel(v: Int): String =
     RASTER_SCOPE_LABELS.getOrElse(v) { RASTER_SCOPE_LABELS[0] }
+
+/**
+ * 状态胶囊已移到 `CoverItem.badge` + `RasterCardParts.CoverBadge`（2026-11-13）：
+ * 每张卡自己一条、随卡片移动，不再做成页面级浮动层。
+ */

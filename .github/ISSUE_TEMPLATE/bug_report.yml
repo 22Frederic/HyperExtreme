@@ -1,0 +1,67 @@
+name: "🐛BUG"
+description: 模块问题反馈
+title: "🐛[BUG]"
+labels:
+  - bug
+
+body:
+  - type: checkboxes
+    id: check
+    attributes:
+      label: 请注意
+      description: |
+        请确认你执行了下列检查，未完成下列检查的请求将被直接关闭。
+      options:
+        - label: |
+            我确认使用的为最新版本（以网盘内发布的为基准）
+          required: true
+
+        - label: |
+            我已排查与其他模块的冲突，并在安装/更新模块时重启了相应作用域
+          required: true
+
+        - label: |
+            我确认使用的系统版本为HyperOS4（问题与系统壁纸服务模式有关时，则不受此限制）
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "问题概括"
+      description: | 
+        请尽量简短且完整的说明问题情况，包含设备型号与系统版本。
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: "LSPosed日志"
+      description: |
+        请提供LSPosed的日志。
+      placeholder: |
+        请粘贴完整的 LSPosed 日志。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reprod
+    attributes:
+      label: "复现步骤"
+      description: |
+        请输入问题复现的步骤，条件尽量精确。
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: "问题截图"
+      description: |
+        请上传问题截图。
+    validations:
+      required: false

@@ -528,7 +528,17 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         }
         if (loaded) {
             CoverCarousel(
-                items = candidates.map { CoverItem(it.key, it.cover, srcOf(it)) },
+                items = candidates.map {
+                    CoverItem(
+                        id = it.key,
+                        cover = it.cover,
+                        src = srcOf(it),
+                        // 状态胶囊（2026-11-13 用户要求）：深度 + 层图齐不齐 = 缓存算没算过。
+                        // 判据直接用 `hasLayers`（`layers/layer0.png` 在不在），**不看 `source`** ——
+                        // 早期缓存的组没有原图副本，但深度是算好的，那种也该显示「已计算缓存」。
+                        badge = if (it.hasLayers) "已计算缓存" else "未计算缓存",
+                    )
+                },
                 initialPage = if (candidates.isEmpty()) 0 else 1,
                 activeId = inUseKey,
                 deletingId = deletingId,

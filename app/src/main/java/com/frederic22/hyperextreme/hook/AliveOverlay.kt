@@ -317,6 +317,22 @@ half4 main(float2 fragCoord) {
      * 幂等：host / key 没变就直接返回；变了才重建。系统每次状态变化都会走到 ⇒ 天然自愈。
      */
     fun ensure(host: ViewGroup) {
+        // ⚠️ 必须同时看开关（2026-11-14 真机发现）：只看 KEY 的话，Alive 关掉之后
+        // `alive_key` 还留在属性里（关闭时只把 active 置 0），这里会继续把系统景深主体
+        // 摘掉、把我们的主体插进 `keyguard_foreground_layer` —— 日志里
+        // `ALIVE 景深 已摘掉系统主体` 在 active=0 时还在刷，屏幕上就是"关了还留着东西"。
+        if (HookRuntime.systemProperty(AliveFlag.PROP_ACTIVE) != "1") {
+            runCatching { onDisabled() }
+            return
+        }
+        // ⚠️ 还要看**渲染器在不在跑**（2026-11-14 真机）：AOD 关掉 / 启动失败时
+        // `runningKey == null`，但 active 仍是 1、key 也还在 ⇒ 这里会把**上一帧的
+        // 人像位图**继续插在 `keyguard_foreground_layer` 上。用户看到的就是
+        // 「Alive 明明没在跑，锁屏上却还有我们的东西」，MC 的封面也会被它压住。
+        if (!AliveRenderer.isRunning()) {
+            runCatching { onDisabled() }
+            return
+        }
         val key = HookRuntime.systemProperty(AliveFlag.PROP_KEY)
         if (key.isEmpty()) return
         if (Looper.myLooper() == Looper.getMainLooper()) attach(host, key)

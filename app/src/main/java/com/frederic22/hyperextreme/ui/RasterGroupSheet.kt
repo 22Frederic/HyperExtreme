@@ -69,24 +69,59 @@ import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.data.RasterGroup
 import com.frederic22.hyperextreme.data.RasterStore
 import com.frederic22.hyperextreme.data.RunLog
+import com.frederic22.hyperextreme.hook.RasterGlCore
 import com.frederic22.hyperextreme.ui.nav.NavBarBottomGap
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.IconButton
+import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.basic.Close
 import top.yukonga.miuix.kmp.squircle.squircleClip
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.window.WindowBottomSheet
+import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
+import top.yukonga.miuix.kmp.blur.layerBackdrop
+import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 
-/** 一个光栅组最多几张（用户 2026-11-03 定：2~4 张，下限 2 是产品目标，导入阶段允许 1 张）。 */
-private const val MAX_ITEMS = 4
+/**
+ * 一个光栅组最多几张。
+ *
+ * 2026-11-13 用户定：4 → **16**（下限仍是 2，导入阶段允许 1 张）。
+ * 渲染链本来就按 `n` 算（`fValue` / 纹理环 / 预取都是通用的），这里只是产品上限。
+ */
+private const val MAX_ITEMS = 16
 
 /** 提交下限：不到 2 张不许点 ✓（新建、编辑同一套判定）。 */
 private const val MIN_ITEMS = 2
+
+/**
+ * **封面分批出图**（2026-11-13 用户要求）。
+ *
+ * 浮页的 content 只在 `visible=true` 时才组合（miuix `BottomSheetContentLayout` 的
+ * `popupHost(visible)` 里才建 Dialog），所以每次打开都是**冷启动**：16 张
+ * `rememberCover` 会同时发起解码（单张 1000×1777 ≈ 7MB），把 CPU 打满，
+ * 与弹出动画（spring 380ms）抢帧预算 ⇒ 图一多就看得出卡。
+ *
+ * 对策：先只解**一屏可见的量**（槽宽 0.36 屏宽 ⇒ 一屏 3 张，留 1 张余量），
+ * 之后每 [COVER_BATCH_MS] 补 [COVER_BATCH] 张 —— 约 0.4s 补齐，
+ * 动画期间最多 7 张在解。没轮到的卡只画底色（`CardImage` 空态本来就不画东西，
+ * 就绪后自带 0.15s 渐显，观感是"陆续浮现"）。
+ */
+private const val COVER_FIRST_BATCH = 4
+private const val COVER_BATCH = 3
+private const val COVER_BATCH_MS = 70L
+
+/**
+ * 「左右镜像展示」可以关闭的最少张数（2026-11-13 用户定）。
+ *
+ * 不足 3 张时「中点」没有意义（2 张时中点就是端点），开关置灰并强制按「开」渲染。
+ */
+private const val MIN_MIRROR_ITEMS = 3
 
 /**
  * 槽位尺寸 = 卡片流**中间态卡片**的 80%（用户 2026-11-04 定）。
@@ -405,7 +440,7 @@ internal fun RasterGroupSheet(
     // ───────────── 导入「遮罩 / 主体」（2026-11-04）─────────────
     //
     // 用户 2026-11-04：编辑 / 新建浮页里的「导入图片」改成「导入选中图片的遮罩或主体」，
-    // 批量的「导入图片」完全交给**空槽（= 新建卡）**负责 —— 有几个空位选几张，满 4 张没有空槽。
+    // 批量的「导入图片」完全交给**空槽（= 新建卡）**负责 —— 有几个空位选几张，满 16 张没有空槽。
     var maskBusy by remember { mutableStateOf(false) }
     /** 点「导入遮罩或主体」时选中的那张（回调里要用，不能依赖那一刻的 `selectedName`）。 */
     var maskTarget by remember { mutableStateOf<String?>(null) }
@@ -503,7 +538,7 @@ internal fun RasterGroupSheet(
         endAction = {
             IconButton(onClick = {
                 haptic()
-                // 产品目标是 2~4 张（用户 2026-11-03）：不到两张不许提交。
+                // 下限 2 张（2026-11-03 定；上限 2026-11-13 升到 16）：不到两张不许提交。
                 // **新建和编辑走同一条判定** —— 编辑时删到只剩 1 张（或删空）也一样拦住，
                 // 不会顺手把整组删掉（用户 2026-11-04 要求）。
                 if (names.size < MIN_ITEMS) {
@@ -516,6 +551,17 @@ internal fun RasterGroupSheet(
             }
         },
     ) {
+    // 封面分批出图（2026-11-13）：打开瞬间只解前几张，其余按批次补（见 COVER_* 常量）。
+    // 状态放 content 内部 ⇒ Dialog 销毁即丢，下次打开重新从第一批开始（这正是要的）。
+    var readyCount by remember { mutableIntStateOf(COVER_FIRST_BATCH) }
+    LaunchedEffect(Unit) {
+        var n = COVER_FIRST_BATCH
+        while (n < MAX_ITEMS) {
+            delay(COVER_BATCH_MS)
+            n = (n + COVER_BATCH).coerceAtMost(MAX_ITEMS)
+            readyCount = n
+        }
+    }
     // 槽位尺寸 = 卡片流**中间态卡片**的 80%（用户 2026-11-04 定）。
     // 卡宽 = 屏宽 × 0.45，所以槽宽 = 屏宽 × 0.45 × 0.8；高度按屏幕比例 = 竖屏预览。
     val screen = rememberScreenSizePx()
@@ -624,6 +670,11 @@ internal fun RasterGroupSheet(
                     .horizontalScroll(scroll),
                 contentAlignment = Alignment.CenterStart,
             ) {
+                // 卡内序号胶囊的「封面」标记（2026-11-13 用户要求）：
+                // 序号 = 槽位下标 + 1；**归位点那张**额外带「封面」二字（15 张 + 关镜像 ⇒ `8 封面`）。
+                // 归位点口径与渲染链**同一个函数**（`RasterGlCore.baseOf`）：镜像开 / 不足 3 张 ⇒ 第 1 张，
+                // 镜像关 + ≥3 张 ⇒ 中点。拖动换位时 `i` 变 ⇒ 胶囊随 `names` 顺序实时更新。
+                val baseIdx = RasterGlCore.baseOf(names.size, working?.mirror ?: true)
                 Row(
                     modifier = Modifier.padding(end = badgePad),
                     horizontalArrangement = Arrangement.spacedBy(SLOT_GAP),
@@ -653,6 +704,16 @@ internal fun RasterGroupSheet(
                                 radius = radius,
                                 selected = name != null && name == selectedName,
                                 surface = surfaceColor,
+                                // 分批出图：还没轮到这一张就先只画底色（见 COVER_* 常量）。
+                                loadCover = i < readyCount,
+                                // 序号胶囊：空槽（新建卡）**不显示**（用户明确「新建卡不用加」）。
+                                badgeText = if (name == null) {
+                                    null
+                                } else if (i == baseIdx) {
+                                    "${i + 1} 封面"
+                                } else {
+                                    "${i + 1}"
+                                },
                                 modifier = Modifier
                                     .zIndex(if (dragging) 1f else 0f)
                                     .graphicsLayer {
@@ -728,6 +789,71 @@ internal fun RasterGroupSheet(
             }
         }
 
+        // ── 左右镜像展示 ──（2026-11-13 用户要求）
+        //
+        // 位置：槽位行下方、景深按钮上方（与 Alive 编辑浮页「桌面与锁屏一致」同一套排版）。
+        // 语义：开 = 归位点第 1 张、左右两侧沿同一序列往后翻（= 加这个选项之前的行为）；
+        //       关 = 归位点取中点、两侧各走半边。详见 `RasterGlCore.baseOf`。
+        // 「至少三张才可关」：不足 3 张时中点没有意义 ⇒ 置灰、强制显示为开；
+        // 用户原来存的「关」不动，加回第 3 张自动恢复。
+        //
+        // 容器照 `AliveGroupSheet` 那三行：**看不见的卡片** —— `squircleClip(16dp)` 把 ripple
+        // 裁成卡片形，底色 = miuix `Button` 的默认容器色 `secondaryVariant`（= 下面「计算选中景深」
+        // 那些按钮的灰）。2026-11-13 用户指正：第一版只写了 Row，没有这层卡片。
+        val mirrorEnabled = names.size >= MIN_MIRROR_ITEMS
+        val mirrorChecked = if (mirrorEnabled) (working?.mirror ?: true) else true
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 12.dp)
+                .squircleClip(16.dp)
+                .background(MiuixTheme.colorScheme.secondaryVariant)
+                .clickable(enabled = mirrorEnabled) {
+                    haptic()
+                    val g = working ?: return@clickable
+                    working = g.copy(mirror = !g.mirror)
+                },
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = "左右镜像展示",
+                        style = MiuixTheme.textStyles.headline1,
+                        // 不可点时标题一起变淡（照 Alive 浮页：只灰开关会显得文字还能点）。
+                        color = if (mirrorEnabled) {
+                            Color.Unspecified
+                        } else {
+                            MiuixTheme.colorScheme.onSurfaceVariantSummary
+                        },
+                    )
+                    Text(
+                        text = "至少选三张图片才可关闭",
+                        style = MiuixTheme.textStyles.body2,
+                        // ⚠️ 不要 `copy(alpha = 1f)`：`onSurfaceVariantSummary` 自带约 60% 的黑。
+                        color = if (mirrorEnabled) {
+                            MiuixTheme.colorScheme.onSurfaceVariantSummary
+                        } else {
+                            MiuixTheme.colorScheme.disabledOnSurface
+                        },
+                    )
+                }
+                Switch(
+                    checked = mirrorChecked,
+                    onCheckedChange = { on ->
+                        haptic()
+                        val g = working ?: return@Switch
+                        working = g.copy(mirror = on)
+                    },
+                    enabled = mirrorEnabled,
+                )
+            }
+        }
+
         // ── 景深主体 ──（2026-11-04）
         // 两行两列：上排「选中」的计算 + 删除，下排「所有」的计算 + 删除。
         // 行距 = 列距 = 12dp；样式 = 常规按钮底 + 彩色字（计算 primary / 删除 error）。
@@ -789,7 +915,7 @@ internal fun RasterGroupSheet(
         }
 
         // 用户 2026-11-04：批量的「导入图片」**整块删掉** —— 入口只留空槽（新建卡），
-        // 满 4 张时没有空槽，也就不需要「已到上限」的提示。
+        // 满 16 张时没有空槽，也就不需要「已到上限」的提示。
         // 这里换成本次需求的主角：给**选中的那一张**导入 / 更换遮罩或主体。
         val selHasSubject = sel?.let { s -> working?.subjectFileOf(s)?.isFile == true } == true
         TextButton(
@@ -907,6 +1033,10 @@ private fun SlotCard(
     radius: Dp,
     selected: Boolean,
     surface: Color,
+    /** 卡内底部的序号胶囊文案（null = 不显示；空槽恒 null）。 */
+    badgeText: String?,
+    /** 这一张的封面**现在要不要解码**（分批出图，见 `COVER_*` 常量）。false = 先只画底色。 */
+    loadCover: Boolean,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
     onRemove: () -> Unit,
@@ -922,7 +1052,13 @@ private fun SlotCard(
         )
         return
     }
-    val cover = rememberCover(file)
+    // 分批出图：还没轮到就传 null 进 `rememberCover` —— 里面是 `produceState(key)`，
+    // key 从空串变文件路径时会重启解码；所以从"底色"到"出图"不需要额外状态。
+    val cover = rememberCover(if (loadCover) file else null)
+    // 序号胶囊的玻璃（2026-11-13）：与一级页卡片流**同一套** —— 每张卡一个 backdrop，
+    // 磨的是这张卡自己的封面，胶囊画在层外（否则会把自己也画进 backdrop = 自模糊）。
+    val canBlur = remember { isRuntimeShaderSupported() }
+    val backdrop = if (canBlur) rememberLayerBackdrop { drawContent() } else null
     val stroke by animateColorAsState(
         targetValue = if (selected) MiuixTheme.colorScheme.primary else CARD_STROKE,
         animationSpec = tween(SLOT_STROKE_MS),
@@ -942,11 +1078,25 @@ private fun SlotCard(
             modifier = Modifier
                 .fillMaxSize()
                 .squircleClip(radius)
+                // 玻璃背景取卡片本体（封面 + 底色 + 描边），胶囊在外层、不进这个层。
+                .then(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
                 .background(surface)
                 .squircleStroke({ strokeW }, { stroke }, radius)
                 .clickable(onClick = onClick),
         ) {
             CardImage(cover, Modifier.fillMaxSize())
+        }
+        badgeText?.let { text ->
+            CoverBadge(
+                text = text,
+                backdrop = backdrop,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    // 小卡比一级页那张矮，8dp 比 12dp 的视觉留白比例更接近。
+                    .padding(bottom = 8.dp)
+                    // 卡片本体带 `squircleClip`（离屏 layer），不加会被盖在下面。
+                    .zIndex(1f),
+            )
         }
         if (badge > 0f) {
             val d = slotW * DELETE_CIRCLE_RATIO

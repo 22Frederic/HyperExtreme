@@ -1,5 +1,7 @@
 package com.frederic22.hyperextreme.hook
 
+import kotlin.math.abs
+
 /**
  * 光栅壁纸的**渲染常量与着色器**（2026-11-04，2026-11-06 按 vivo 原版重写）。
  *
@@ -80,6 +82,71 @@ internal object RasterGlCore {
 
     /** 重绘死区（以"图号"为单位）：小于它不重绘。 */
     const val DRAW_EPS = 1e-4f
+
+    // ───────────────────── 「左右镜像展示」与归位点（2026-11-13）─────────────────────
+    //
+    // 归位点 = 开始转动时停在哪张图上。两条链（hook / 服务）必须用**同一套**函数算，
+    // 否则同一组图在两种挂载模式下会从不同的一张开始、并且每张的角度也不一样。
+
+    /**
+     * 中点下标：奇数取正中，偶数取**索引 n/2**（4 张 ⇒ 2 = 第 3 张，5 张 ⇒ 2 = 第 3 张）。
+     *
+     * 用户 2026-11-13 明确「偶数向上取整」按索引口径 = n/2，不是序号 ceil(n/2)。
+     */
+    fun midOf(n: Int): Int = if (n < 2) 0 else n / 2
+
+    /**
+     * 本次运行的**归位点下标**。
+     *
+     * 开镜像（默认）/ 不足 3 张 ⇒ 0（= 加这个选项之前的行为）；
+     * 关且 ≥3 张 ⇒ [midOf]。不足 3 张时中点没有意义，渲染层自己也兜一道。
+     */
+    fun baseOf(n: Int, mirror: Boolean): Int = if (!mirror && n >= 3) midOf(n) else 0
+
+    /**
+     * 每张图对应的转角（弧度）—— **整段（第 1 张 ↔ 最后一张）= `panMaxRad`**，与镜像开关无关。
+     *
+     * 16 张、60° ⇒ 4°/张（用户 2026-11-13 把上限从 45° 抬到 60° 就是为了这个手感）。
+     */
+    fun stepOf(panMaxRad: Float, n: Int): Float =
+        if (n < 2) panMaxRad else panMaxRad / (n - 1f)
+
+    /**
+     * 累计角 → 连续图号（0..n−1）。
+     *
+     * * 开：`|pan| / step` —— 两侧共用同一序列（左转右转都往后翻，只有擦除方向相反）；
+     * * 关：`base + pan / step` —— 一侧索引递增、另一侧递减。
+     *
+     * `base == 0` 就是镜像口径（关镜像且 ≥3 张时 base 恒 ≥ 1）。
+     */
+    fun posOf(pan: Float, n: Int, base: Int, panMaxRad: Float): Float {
+        if (n < 2) return 0f
+        val step = stepOf(panMaxRad, n)
+        val raw = if (base <= 0) abs(pan) / step else base + pan / step
+        return raw.coerceIn(0f, (n - 1).toFloat())
+    }
+
+    /**
+     * 图号 → 累计角（[posOf] 的逆）。
+     *
+     * @param dir 开镜像时必须给符号（+1 / −1），否则反算出来永远是正的一侧；
+     *   关镜像时符号由 `pos − base` 自己决定，忽略它。
+     */
+    fun panOf(pos: Float, n: Int, base: Int, panMaxRad: Float, dir: Float): Float {
+        if (n < 2) return 0f
+        val step = stepOf(panMaxRad, n)
+        return if (base <= 0) pos * step * (if (dir < 0f) -1f else 1f) else (pos - base) * step
+    }
+
+    /**
+     * 累计角的合法范围。开镜像是对称的 ±panMaxRad；关镜像时两侧各只有半程
+     * （合计仍是 `panMaxRad`，所以「最大幅度角度」的语义不变）。
+     */
+    fun panRangeOf(n: Int, base: Int, panMaxRad: Float): ClosedFloatingPointRange<Float> {
+        if (n < 2 || base <= 0) return -panMaxRad..panMaxRad
+        val step = stepOf(panMaxRad, n)
+        return (-(base * step))..((n - 1 - base) * step)
+    }
 
     // ───────────────────── 「过渡效果」四档（2026-11-06）─────────────────────
 

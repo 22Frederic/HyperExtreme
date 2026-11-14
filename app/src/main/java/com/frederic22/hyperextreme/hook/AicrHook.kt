@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * 光栅壁纸的「景深主体」走 `AicrVision.segmentFile()` 直连 `com.xiaomi.aicr`。
  * 真机反馈里有设备返回 `getPluginBinder 返回空（Status=-1）`，而服务端反编译
- * （`re-glass/out/aiengine`）里**每条失败分支都会 `ret.putInt("Status", …)`**
+ * （`analyse/re-glass/out/aiengine`）里**每条失败分支都会 `ret.putInt("Status", …)`**
  * ⇒ 只可能是三种情况之一：
  *
  * 1. 返回的 Bundle 根本没写回来（`onTransact` 顺序/版本不一致）；

@@ -11,7 +11,7 @@ package com.frederic22.hyperextreme.hook
  * 上游 `app/assets/shader/` 与 `native/shaders.rs` 不属 MIT，一个字都没有复制。
  *
  * 装饰图（球面阴影）同样是自绘：官方那张是「纯黑 + alpha 渐变」的压暗遮罩，
- * 5 阶多项式拟合，逐像素 MAE 0.9/255。见 `alive分析/decorator_compare/`。
+ * 5 阶多项式拟合，逐像素 MAE 0.9/255。见 `analyse/alive分析/decorator_compare/`。
  *
  * ## 「启航」到底是什么
  *
@@ -370,7 +370,7 @@ void main() {
      * 「以球心为原点、半径 = 球半径」的归一化坐标 ⇒ 与 `(uv - center) / lensScale`
      * 完全等价。这里直接按 5 阶多项式算，省一次纹理采样、也没有 8bit 量化误差。
      * 系数来自对官方 alpha 的最小二乘拟合（14 项→5 阶，MAE 0.9/255），
-     * 见 `alive分析/decorator_compare/gen_decorator.py`。
+     * 见 `analyse/alive分析/decorator_compare/gen_decorator.py`。
      */
     const val LENS_FRAG = """
 precision highp float;

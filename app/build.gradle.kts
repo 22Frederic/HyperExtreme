@@ -33,8 +33,8 @@ android {
         applicationId = "com.frederic22.hyperextreme"
         minSdk = 33
         targetSdk = 37
-        versionCode = 101
-        versionName = "1.0 Beta1"
+        versionCode = 103
+        versionName = "1.0 Beta3"
 
         ndk {
             abiFilters += "arm64-v8a"

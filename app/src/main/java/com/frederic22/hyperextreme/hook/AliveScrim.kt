@@ -4,7 +4,7 @@ import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 
 /**
- * **Alive 的三态权威来源**（2026-11-08，参考 `alive分析/fork` 的 `AliveHooks`）。
+ * **Alive 的三态权威来源**（2026-11-08，参考 `analyse/alive分析/fork` 的 `AliveHooks`）。
  *
  * 挂 `ScrimController#updateScrims`，读它的 `mState`（`ScrimState` 枚举）：
  *

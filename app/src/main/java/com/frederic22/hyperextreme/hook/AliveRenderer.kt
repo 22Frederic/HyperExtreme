@@ -83,7 +83,7 @@ internal object AliveRenderer {
     /**
      * 锁屏 → 桌面的内容交叉时长。
      *
-     * **照 `alive分析/fork2` 的 `SceneMotion.blendDuration(4)` 取**（用户 2026-11-08 定
+     * **照 `analyse/alive分析/fork2` 的 `SceneMotion.blendDuration(4)` 取**（用户 2026-11-08 定
      * 「分支怎么做过过渡我们就怎么做」）：本机参数（`aod==0` / `lock==0`）下是
      * `max(l[4]=400, h[4]=500) = 500ms`。
      *
@@ -154,6 +154,50 @@ internal object AliveRenderer {
     private var context: EGLContext? = null
     private var eglConfig: EGLConfig? = null
     private var sharedLeash = false
+
+    /**
+     * **解锁转场期间两份都画、内容一致**（2026-11-14 用户定）。
+     *
+     * 解锁那一下系统会让锁屏 / 桌面两条 leash **同时可见一小段**（用户真机观察）：
+     * 只画"当前该显示的那份"的话，另一份停在上一帧（AOD 球 / 旧图），
+     * 屏幕上就是「漏锁屏壁纸 / 闪一下」。
+     *
+     * 双画时两份都走 `drawScene(locked = true)` 那套内容（同一份 `lens` / `ratio`），
+     * 所以叠加起来视觉完全一致，系统怎么切都不露。
+     * 代价是每帧两个全屏 pass（2026-11-08 实测 166~188ms），因此**只在解锁转场这一小段**启用；
+     * 留光有自己的换层流程（还要重画遮罩帧），不参与。
+     */
+    private var mirrorToDesk = false
+
+    /** AOD 转场结束后收起桌面份（关闭 [mirrorToDesk]）的定时任务，便于中断。 */
+    private var aodMirrorOff: Runnable? = null
+
+    // ───────────────────────── HyperMusicCover 共存（2026-11-14）─────────────────────────
+
+    /** 音乐屏在显示 ⇒ 我们彻底让路（alpha 归零 + 停帧）。只在装了 MC 时可能为 true。 */
+    private var musicYield = false
+
+    /** `Coexist` 的订阅只装一次（startInternal 每次都会跑）。 */
+    private var musicListenerInstalled = false
+
+    // ───────────────────────── 壁纸层自检（事件驱动看门狗）─────────────────────────
+
+    /** 挂载时那条 leash 的签名（`getLeash().toString()`）。 */
+    private var attachedLeashSig: String? = null
+
+    /** 上次重挂时刻，用于去抖（连续重建只挂一次）。 */
+    private var lastRemountAt = 0L
+
+    /** 60s 低频兜底（只在亮屏且渲染器在跑时探一次）。 */
+    private var leashProbeTick: Runnable? = null
+
+    /** `IActivityManager#registerProcessObserver` 的代理对象（拿不到就为 null）。 */
+    private var processObserver: Any? = null
+
+    /** `unregisterProcessObserver` 方法句柄（注册时一起拿到）。 */
+    private var unregisterHolder: java.lang.reflect.Method? = null
+
+    private val remountDebounceMs = 500L
 
     // ───────────────────────────── GL 对象 ─────────────────────────────
 
@@ -323,7 +367,18 @@ internal object AliveRenderer {
      */
     private var deskShown = false
 
+    /** 锁屏份的 alpha（**只**代表 `lockScs()` 那一组）。 */
     private var currentAlpha = 1f
+
+    /**
+     * 桌面份的 alpha（**只**代表 `deskScs()` 那一组）。
+     *
+     * 2026-11-14 新增：从前所有「两份 alpha 一起算」的地方（`fadeBothTo` 的起点）都是
+     * 用 `showingDesktop` **推算**出来的，与真实值会分叉 —— 挂载/收起/`enterAodInternal`
+     * 里单独抬压过桌面份之后，推算值就错了（桌面态启动时 `deskFrom` 推成 1、实际是 0
+     * ⇒ `fadeBothTo` 早退，桌面份永远不显示）。真实值统一在这里维护。
+     */
+    private var deskAlpha = 0f
     private var fadeTick: Runnable? = null
 
     /** AOD 退出后的「回锁屏」延迟裁决（见 [onExitAod]）。 */
@@ -585,15 +640,46 @@ internal object AliveRenderer {
         )
 
         // 七、挂到壁纸 leash
-        attachToLeash(scope)
+        attachToLeashWithRetry(scope)
 
         watchScreen(appCtx!!)
+        // 壁纸层自检：进程死亡回调（拿不到就跳过）+ 60s 低频兜底（2026-11-14）
+        startProcessWatch()
+        startLeashProbe()
+        // MC 共存：只订阅一次（startInternal 每次启动都会跑到这里）
+        if (!musicListenerInstalled) {
+            musicListenerInstalled = true
+            Coexist.addListener { handler?.post { onMusicScreenChanged() } }
+        }
+        // MC 封面在锁屏上时**根本不该启动**（`HookEntry` 的 tick 会拦住），
+        // 这里只是防御：真被拉起来了就立刻自己关掉。
+        if (Coexist.musicCoverOn) {
+            HookRuntime.log("$TAG 启动时 MC 封面已在锁屏上 ⇒ 立即关闭（等它退出再拉起）")
+            handler?.post { stopInternal("MC 全屏封面") }
+            return
+        }
         AliveFlag.pushRendering(true)
         scheduleFrame()
         HookRuntime.log(
             "$TAG 渲染器已启动：key=$key scope=$scope 屏幕 ${screenW}×$screenH " +
                 "expanded=${"%.2f".format(expandedScale)}",
         )
+        // **不再从 0 淡入**（v1.22.100）：挂载不设 alpha（新建 SC = 1），这里按显示态
+        // 一次性把两份设到位。`fadeBothTo` 的 `deskFrom` 是从 `showingDesktop` **推算**的，
+        // 桌面态启动时推算值与目标相同 ⇒ 旧写法直接早退、桌面份就永远停在 0。
+        // MC 让路恢复的过渡由 `fadeBothTo` 在重新启动后显式调用（见 `fadeOutAndStop`）。
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
+        val lockA = if (showingDesktop) 0f else 1f
+        val deskA = if (showingDesktop) 1f else 0f
+        currentAlpha = lockA
+        deskAlpha = deskA
+        applyAlphaBoth(lockA, deskA)
+        // **景深主体必须在启动后主动重算**（v1.22.101）：MC 让路那一下
+        // `Coexist.musicCoverOn` 先翻 false、渲染器还没起来 ⇒ `SpatialForegroundHider.handle()`
+        // 走「旧链」把 `keyguard_foreground_layer` 压成 INVISIBLE / 摘掉系统主体；
+        // 这里不补一刀，景深就一直不回来（用户：「三者恢复时我们的景深都没恢复」）。
+        runCatching { SpatialForegroundHider.refresh() }
     }
 
     // ───────────────────────────── 挂载（与光栅逐条同构）─────────────────────────────
@@ -614,6 +700,10 @@ internal object AliveRenderer {
             "reparent", android.view.SurfaceControl::class.java, android.view.SurfaceControl::class.java,
         )
         val show = txClass.getMethod("show", android.view.SurfaceControl::class.java)
+        // ⚠️ **挂载时不设 alpha**（v1.22.100 回退 v1.22.97 的「先全透再淡入」）：
+        // 桌面份在那套逻辑里被设成 0 后，`fadeBothTo` 的 `deskFrom` 又用 `showingDesktop`
+        // **推算**（桌面态 = 1）⇒ 目标与推算相同 ⇒ 直接早退 ⇒ 桌面份永远停在 0。
+        // 新建 SC 默认 alpha=1，`startInternal` 末尾按显示态显式设一次。
 
         fun leashOf(locked: Boolean): Any? {
             val token = runCatching { gw.invoke(inst, 0, locked) }.getOrNull() ?: return null
@@ -657,7 +747,7 @@ internal object AliveRenderer {
         }
         runCatching { txClass.getMethod("apply").invoke(tx) }
 
-        if (kept.size != mounts.size) {
+        if (kept.size != mounts.size && kept.isNotEmpty()) {
             val drop = mounts.filter { it !in kept }
             runCatching {
                 val tx2 = txClass.getConstructor().newInstance()
@@ -675,13 +765,49 @@ internal object AliveRenderer {
             mounts.clear()
             mounts.addAll(kept)
         }
-        check(mounts.isNotEmpty()) { "全部目标挂载失败（scope=$scope）" }
+        check(kept.isNotEmpty()) { "全部目标挂载失败（scope=$scope）" }
+        // 记下这次挂到的 leash 签名，供事件驱动自检比对（2026-11-14）
+        attachedLeashSig = (leashes[true] ?: leashes[false])?.toString()
+    }
+
+    /**
+     * **挂载重试**（2026-11-14）。
+     *
+     * 壁纸层重建期间（`killall miwallpaper` 之后最长约 5s）`getWallpaperByShowWhenLocked`
+     * 拿不到 token，一次性挂载会直接判失败、渲染器停掉 ⇒ 用户看到的就是「点应用没反应，得再点一次」。
+     * 这里每 250ms 重试，最多 24 次；失败期间 `mounts` 保留（见上面的 `kept.isNotEmpty()`），
+     * 否则下一次从空列表起手永远挂不上。
+     */
+    private fun attachToLeashWithRetry(scope: Int) {
+        var attempt = 0
+        while (true) {
+            try {
+                attachToLeash(scope)
+                if (attempt > 0) HookRuntime.log("$TAG 挂载重试成功（第 ${attempt + 1} 次）")
+                return
+            } catch (e: IllegalStateException) {
+                attempt++
+                if (attempt >= 24) {
+                    HookRuntime.log("$TAG 挂载重试耗尽（24 次），判启动失败：${e.message}")
+                    throw e
+                }
+                if (attempt == 1 || attempt % 4 == 0) {
+                    HookRuntime.log("$TAG 壁纸层未就绪（$attempt/24），250ms 后重试：${e.message}")
+                }
+                try {
+                    Thread.sleep(250L)
+                } catch (ie: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+        }
     }
 
     // ───────────────────────────── 帧循环 ─────────────────────────────
 
     /**
-     * 帧回调 —— **跟 display vsync 走**（2026-11-08 照 `alive分析/fork2` 的 `EglWorker`）。
+     * 帧回调 —— **跟 display vsync 走**（2026-11-08 照 `analyse/alive分析/fork2` 的 `EglWorker`）。
      *
      * ⚠️ 之前是 `handler.postDelayed(frameTick, 16)`，那是**固定延迟**：
      * 实际间隔 = 渲染耗时(5~10ms) + 16ms + `eglSwapBuffers` 等 vsync(0~16ms) ≈ 30~40ms，
@@ -692,6 +818,10 @@ internal object AliveRenderer {
         framePosted = false
         try {
             if (runningKey == null) return@FrameCallback
+            // MC 的封面在锁屏上：锁屏态停帧（我们的锁屏份 alpha 已是 0，继续画只是白烧）。
+            // ⚠️ 桌面态 / 解锁双画（mirrorToDesk）期间**不能停** —— 那时桌面份还要画
+            // （2026-11-14 判据重做：以前是无条件 return，桌面上 Alive 也跟着不动）。
+            if (musicYield && !mirrorToDesk && activeMountIsLocked()) return@FrameCallback
             val now = SystemClock.elapsedRealtime()
             val dtSec = if (lastTickAt == 0L) 0f else (now - lastTickAt) / 1000f
             lastTickAt = now
@@ -1046,7 +1176,7 @@ internal object AliveRenderer {
     }
 
     /**
-     * **Scrim 状态**（权威三态来源，2026-11-08 参考 `alive分析/fork` 的 `AliveHooks`）。
+     * **Scrim 状态**（权威三态来源，2026-11-08 参考 `analyse/alive分析/fork` 的 `AliveHooks`）。
      *
      * hook 点：`ScrimController#updateScrims`，读字段 `mState`（`ScrimState` 枚举）。
      * 它比 `KeyguardManager.isKeyguardLocked` 准 —— 后者在 AOD 退出的瞬间仍然是 locked，
@@ -1069,6 +1199,7 @@ internal object AliveRenderer {
                 }
                 state.contains("UNLOCKED") -> {
                     HookRuntime.log("$TAG scrim=$state ⇒ 解锁（mode=$mode）")
+                    checkLeashFresh("解锁")
                     fadeInternal()
                 }
                 state.contains("KEYGUARD") -> {
@@ -1108,6 +1239,11 @@ internal object AliveRenderer {
         // 进 AOD 要跟小球缩放 ⇒ 必须结束解锁淡出，否则 scale 被 fading 挡住
         runCatching { AliveOverlay.endFade() }
         dim = 1f
+        // 先清掉可能残留的双画与它的收尾定时（快速连按电源键时上一轮的还没跑），
+        // 下面画完启动帧后会重新打开。
+        mirrorToDesk = false
+        aodMirrorOff?.let { handler?.removeCallbacks(it) }
+        aodMirrorOff = null
         val fromDesktop = deskShown || mode == 2
         showingDesktop = false
         aodFromDesktop = fromDesktop
@@ -1152,8 +1288,24 @@ internal object AliveRenderer {
         // **还停在上一次锁屏画面**。先 `applyAlphaBoth` 再画，SurfaceFlinger 可能先用旧 buffer
         // 提交那一帧 ⇒ 露出 1~2 帧旧锁屏。顺序反过来后，抬起来的就是刚画好的这一帧
         // （起点 ratio 仍是 `(0,0,1)`、球半径 1.24 ⇒ 画出来与桌面份逐像素同图）。
+        // **转场期间两份都画、都可见**（2026-11-14 用户要求，与解锁对称）：
+        // 这 1s 里系统可能同时显示锁屏 / 桌面两条 leash，只画一份的话另一份停在旧帧
+        // ⇒ 桌面→AOD 也会漏壁纸。两份用同一份 lens/ratio，内容一致。
+        mirrorToDesk = true
         forceDraw()
-        applyAlphaBoth(1f, 0f)
+        applyAlphaBoth(1f, 1f)
+        // 转场结束再收掉桌面份、恢复「只画可见份」（AOD 稳态只需要锁屏份，省一半 pass）
+        aodMirrorOff?.let { handler?.removeCallbacks(it) }
+        val holdMs = (animDur + 150L).coerceAtLeast(500L)
+        val off = Runnable {
+            if (runningKey != null && aodActive) {
+                mirrorToDesk = false
+                applyAlpha(deskScs(), 0f)
+                HookRuntime.log("$TAG AOD 转场结束：桌面份收起（恢复单画）")
+            }
+        }
+        aodMirrorOff = off
+        handler?.postDelayed(off, holdMs)
         deskShown = false
         scheduleFrame()
         diagAod("进入")
@@ -1229,11 +1381,22 @@ internal object AliveRenderer {
     fun onExitAod() {
         handler?.post {
             if (runningKey == null) return@post
+            checkLeashFresh("出 AOD")
             aodActive = false
             dim = 1f
             showingDesktop = false
             deskShown = false
+            // ⚠️ **收掉进 AOD 时的「两份都画」（2026-11-14 真机：AOD→锁屏动画异常）**：
+            // `enterAodInternal` 会置 `mirrorToDesk = true` + `applyAlphaBoth(1,1)`，
+            // 收尾由 `aodMirrorOff` 在 `animDur+150`（≈1150ms）后执行。若用户在这之前
+            // 亮屏退出，那个定时到点时 `aodActive` 已是 false ⇒ **自己跳过** ⇒
+            // `mirrorToDesk` 永久 true、桌面份永久 alpha=1（且画的是锁屏 lens）⇒
+            // 之后每帧双画、桌面 leash 上留着锁屏图。这里必须无条件收口。
+            aodMirrorOff?.let { handler?.removeCallbacks(it) }
+            aodMirrorOff = null
+            mirrorToDesk = false
             if (abs(currentAlpha - 1f) > 0.001f) applyAlpha(lockScs(), 1f)
+            if (abs(deskAlpha) > 0.001f) applyAlpha(deskScs(), 0f)
             // 2026-11-08：这里**要主动回锁屏**（tr=0，650ms 球收拢）。
             // 之前留空是为了「分不清回锁屏还是直接进桌面」，现在用户已定「AOD→桌面也走
             // 0.15s 交叉」，所以先回锁屏是正确路径：随后 scrim=UNLOCKED 从锁屏态做交叉。
@@ -1313,6 +1476,9 @@ internal object AliveRenderer {
                 if (screenOn()) forceDraw()
                 return@post
             }
+            // **预热桌面份**（2026-11-14）：这条路是逐帧降锁屏份 alpha，
+            // 桌面份一直露在它下面 ⇒ buffer 必须是当前内容，否则整个淡出都在露旧图。
+            runCatching { prewarmDesktop() }
             val started = SystemClock.elapsedRealtime()
             var lastA = currentAlpha
             val r = object : Runnable {
@@ -1358,10 +1524,23 @@ internal object AliveRenderer {
     private fun crossFadeOnUnlock(h: Handler) {
         if (fadeTick != null || unlocking) return
         unlocking = true
+        // **先把桌面份画成当前内容**（2026-11-14）：否则它停在启动时那一帧，
+        // 交叉/抬 alpha 交接时露旧画面。见 [prewarmDesktop]。
+        runCatching { prewarmDesktop() }
         // 景深主体随解锁 0.1s 淡出（与下面的转场同时发生）
         runCatching { AliveOverlay.fadeOutOnUnlock() }
-        // 桌面份先压到 0（它躺在锁屏份下面，等交叉结束再接手）
-        applyAlpha(deskScs(), 0f)
+        // **转场期间两份都画、都可见**（2026-11-14 用户定）：系统在解锁那一下会让
+        // 锁屏 / 桌面两条 leash 同时可见一小段，只画一份就会露出另一份的旧内容。
+        // 两份用同一份 lens/ratio ⇒ 叠加无感。留光同样走这条（用户 2026-11-14 要求）。
+        aodMirrorOff?.let { h.removeCallbacks(it) }
+        aodMirrorOff = null
+        if (!sharedLeash) {
+            mirrorToDesk = true
+            applyAlpha(deskScs(), 1f)
+        } else {
+            // 共用 leash：只有一份，维持原来的「桌面份压在 0 等接手」
+            applyAlpha(deskScs(), 0f)
+        }
 
         // **留光：AOD 退场没跑完就收到解锁**（偶发，取决于 `doWallpaperBlackAnim` 与
         // `scrim=UNLOCKED` 的间隔）。此时如果照常走「AOD→锁屏」再叠一层「锁屏→桌面」交叉，
@@ -1385,6 +1564,7 @@ internal object AliveRenderer {
                     return@postDelayed
                 }
                 if (mode == 0 || aodActive) {
+                    mirrorToDesk = false
                     unlocking = false
                     return@postDelayed
                 }
@@ -1394,7 +1574,10 @@ internal object AliveRenderer {
                 forceDraw()
                 fadeDoneAt = SystemClock.elapsedRealtime()
                 if (!sharedLeash) {
-                    swapToDesktopLayer(h) { unlocking = false }
+                    swapToDesktopLayer(h) {
+                        mirrorToDesk = false
+                        unlocking = false
+                    }
                 } else {
                     unlocking = false
                 }
@@ -1436,6 +1619,7 @@ internal object AliveRenderer {
                 //    否则桌面份会在球缩到一半时被抬起来（用户 2026-11-09 真机日志里
                 //    `灭屏` 后 31ms 就有这条「解锁完成」）。
                 if (mode == 0 || aodActive) {
+                    mirrorToDesk = false
                     unlocking = false
                     HookRuntime.log("$TAG 解锁换层作废（期间又进了 AOD）")
                     return@postDelayed
@@ -1453,10 +1637,15 @@ internal object AliveRenderer {
                     if (sharedLeash) {
                         unlocking = false
                     } else {
-                        swapToDesktopLayer(h) { unlocking = false }
+                        swapToDesktopLayer(h) {
+                        mirrorToDesk = false
+                        unlocking = false
+                    }
                     }
                 } else {
                     if (!sharedLeash) applyAlphaBoth(0f, 1f)
+                    // 转场结束：恢复"只画可见那份"（下一帧 forceDraw 走单画）
+                    mirrorToDesk = false
                     showingDesktop = true
                     deskShown = true
                     dirty = true
@@ -1475,6 +1664,7 @@ internal object AliveRenderer {
         val r = object : Runnable {
             override fun run() {
                 if (runningKey == null) {
+                    mirrorToDesk = false
                     fadeTick = null
                     return
                 }
@@ -1505,11 +1695,15 @@ internal object AliveRenderer {
                     if (sharedLeash) {
                         unlocking = false
                     } else {
-                        swapToDesktopLayer(h) { unlocking = false }
+                        swapToDesktopLayer(h) {
+                        mirrorToDesk = false
+                        unlocking = false
+                    }
                     }
                 } else {
                     unlocking = false
                     if (!sharedLeash) applyAlphaBoth(0f, 1f)
+                    mirrorToDesk = false
                     showingDesktop = true
                     deskShown = true
                     mode = 2
@@ -1538,7 +1732,11 @@ internal object AliveRenderer {
                 return@post
             }
             val locked = queryKeyguardLocked()
-            if (locked != null) showingDesktop = !locked
+            if (locked != null) {
+                showingDesktop = !locked
+            }
+            // 进入可见：自检壁纸层（事件驱动看门狗，2026-11-14）
+            checkLeashFresh("回到前台")
             // **画面优先**（2026-11-09）：`isKeyguardLocked` 在「已解锁到桌面、面板还没收完」
             // 时会返回 true，照它 `changeMode(1)` 就把 `mode` 从 2 拉回 1 ——
             // 下一次桌面进 AOD 就退化成 tr=1 + ratio 从 `(0,1,0)` 起（先到锁屏态）。
@@ -1604,8 +1802,106 @@ internal object AliveRenderer {
      * 会出现「锁屏已 0、桌面还没 1」的一帧 ⇒ 用户看到锁屏壁纸**闪一下**
      * （2026-11-08 报的「锁屏→桌面过渡时中间闪一下」）。
      */
+    // ─────────────────── MC 让路 / 恢复的 0.15s 过渡（2026-11-14 用户定）───────────────────
+
+    /** 过渡时长：MC 全屏封面进出时，画面淡出 / 淡入用（不硬切）。 */
+    private val MUSIC_FADE_MS = 150L
+
+    /** 正在跑的过渡（进出封面各一次；中途反向要取消）。 */
+    private var musicFadeTick: Runnable? = null
+
+    /**
+     * 150ms 内把两份 alpha 线性渐变到目标值，结束后回调。
+     *
+     * 起点取**当前值**（`currentAlpha` / `showingDesktop` 推出来），所以中途被打断
+     * 再反向也不会跳。用户 2026-11-14：「关闭、恢复加一个 0.15s 的过渡，看起来不那么突兀」。
+     */
+    private fun fadeBothTo(lockTo: Float, deskTo: Float, then: (() -> Unit)?) {
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
+        val lockFrom = currentAlpha
+        val deskFrom = deskAlpha
+        if (abs(lockFrom - lockTo) < 0.001f && abs(deskFrom - deskTo) < 0.001f) {
+            then?.invoke()
+            return
+        }
+        val t0 = SystemClock.elapsedRealtime()
+        val r = object : Runnable {
+            override fun run() {
+                val p = ((SystemClock.elapsedRealtime() - t0).toFloat() / MUSIC_FADE_MS)
+                    .coerceIn(0f, 1f)
+                applyAlphaBoth(
+                    lockFrom + (lockTo - lockFrom) * p,
+                    deskFrom + (deskTo - deskFrom) * p,
+                )
+                if (p < 1f) {
+                    handler?.postDelayed(this, 16L)
+                } else {
+                    musicFadeTick = null
+                    then?.invoke()
+                }
+            }
+        }
+        musicFadeTick = r
+        handler?.post(r)
+    }
+
+    /**
+     * 让路时把**锁屏份**压成 0（逻辑 alpha 不变，恢复时按状态重设即可）。
+     *
+     * ⚠️ 只压锁屏份（2026-11-14）：MC 换的是**锁屏**壁纸纹理（它 hook 的是壁纸进程的
+     * keyguard renderer），桌面份那条 leash 上不是封面 ⇒ 压了只会让桌面上的 Alive 白消失。
+     */
+    private fun effectiveAlpha(a: Float, lockGroup: Boolean): Float =
+        if (lockGroup && musicYield) 0f else a
+
+    /**
+     * MC 进入 / 退出全屏封面（[Coexist] 通过 `dispatchChanged` 通知）。
+     *
+     * 用户 2026-11-14 定：**不做 alpha 级别的精细让路，直接关闭应用**——
+     * 只要 MC 在全屏封面（含全屏歌词）里，我们的层 / 景深主体就整份撤掉；
+     * 退出封面后由 `HookEntry` 的 tick 按属性重新拉起来。
+     *
+     * 这样最省事也最可靠：`stopInternal` 本来就把层 remove、主体还回去、
+     * `pushRendering(false)`，不会留任何残影（v1.22.96 的"只压锁屏份"太细，
+     * 实测反而有压不到的面）。
+     */
+    /**
+     * **MC 全屏封面：150ms 淡出后关闭渲染器**。
+     *
+     * 幂等 —— listener（状态翻转）和 `HookEntry` 的 tick 都会调它，
+     * 谁先到谁触发，另一个不重复（2026-11-14 真机：tick 曾经在淡出中途又硬停一次，
+     * 过渡等于没有）。
+     */
+    fun fadeOutAndStop() {
+        handler?.post {
+            if (runningKey == null) return@post
+            if (musicFadeTick != null) return@post
+            HookRuntime.log("$TAG MC 全屏封面 → ${MUSIC_FADE_MS}ms 淡出后关闭（退出封面再拉起）")
+            fadeBothTo(0f, 0f) {
+                if (Coexist.musicCoverOn) {
+                    stopInternal("MC 全屏封面")
+                } else {
+                    // 淡出期间封面撤了：淡回来，别停
+                    fadeBothTo(if (showingDesktop) 0f else 1f, if (showingDesktop) 1f else 0f, null)
+                }
+            }
+        }
+    }
+
+    private fun onMusicScreenChanged() {
+        if (!Coexist.musicCoverOn) {
+            // 退出封面：若正在淡出，立刻取消（不要在半透明时还去 stop）
+            musicFadeTick?.let { handler?.removeCallbacks(it) }
+            musicFadeTick = null
+            return
+        }
+        fadeOutAndStop()
+    }
+
     private fun applyAlphaBoth(lockA: Float, deskA: Float) {
         currentAlpha = lockA
+        deskAlpha = deskA
         dirty = true
         val l = lockScs()
         val d = deskScs()
@@ -1618,13 +1914,21 @@ internal object AliveRenderer {
             val setAlpha = txClass.getMethod(
                 "setAlpha", android.view.SurfaceControl::class.java, Float::class.javaPrimitiveType,
             )
-            for (sc in l) runCatching { setAlpha.invoke(tx, sc, lockA) }
-            for (sc in d) runCatching { setAlpha.invoke(tx, sc, deskA) }
+            val la = effectiveAlpha(lockA, lockGroup = true)
+            val da = effectiveAlpha(deskA, lockGroup = false)
+            for (sc in l) runCatching { setAlpha.invoke(tx, sc, la) }
+            for (sc in d) runCatching { setAlpha.invoke(tx, sc, da) }
             txClass.getMethod("apply").invoke(tx)
         }
     }
 
-    private fun applyAlpha(scs: List<android.view.SurfaceControl>, a: Float) {        currentAlpha = a
+    private fun applyAlpha(scs: List<android.view.SurfaceControl>, a: Float) {
+        // 这一组是不是锁屏份：MC 只在锁屏壁纸纹理上换封面（见 [effectiveAlpha]）。
+        // ⚠️ 记录必须与真实值同步（v1.22.100）：从前无条件写 `currentAlpha`，
+        // 于是 `aodMirrorOff` 收起桌面份那一下把「锁屏份 alpha」写成了 0
+        // （日志实证 `AOD诊断[稳态] alpha=0.0`），后续任何以它当起点的淡出都从 0 起算。
+        val lockGroup = scs.isEmpty() || scs.any { sc -> mounts.any { it.locked && it.sc === sc } }
+        if (lockGroup) currentAlpha = a else deskAlpha = a
         dirty = true
         if (scs.isEmpty()) return
         runCatching {
@@ -1635,7 +1939,8 @@ internal object AliveRenderer {
             val setAlpha = txClass.getMethod(
                 "setAlpha", android.view.SurfaceControl::class.java, Float::class.javaPrimitiveType,
             )
-            for (sc in scs) runCatching { setAlpha.invoke(tx, sc, a) }
+            val out = effectiveAlpha(a, lockGroup)
+            for (sc in scs) runCatching { setAlpha.invoke(tx, sc, out) }
             txClass.getMethod("apply").invoke(tx)
         }
     }
@@ -1652,7 +1957,11 @@ internal object AliveRenderer {
                         // 解锁转场（tr=2 / 交叉）期间不能插进来改 mode，否则会把转场切成硬切
                         if (!aodActive && !unlocking) {
                             val locked = queryKeyguardLocked()
-                            if (locked != null) showingDesktop = !locked
+                            if (locked != null) {
+                                showingDesktop = !locked
+                            }
+                            // **进入可见**：顺手自检壁纸层（事件驱动看门狗，2026-11-14）
+                            checkLeashFresh("亮屏")
                             // 同 [resetAlpha]：屏幕上还是桌面份就以桌面为准，别把 mode 拉回锁屏
                             changeMode(if (showingDesktop || deskShown) 2 else 1, animate = false)
                             resetAlpha()
@@ -1725,6 +2034,14 @@ internal object AliveRenderer {
      * 砍掉不可见那份后，交叉能稳定出帧。
      */
     private fun drawAllFrames() {
+        if (mirrorToDesk) {
+            // **解锁转场：两份都画、内容完全一致**（2026-11-14 用户定）。
+            // 解锁那一下系统会让锁屏 / 桌面两条 leash **同时可见一小段**，
+            // 只画可见那份的话，另一份停在上一帧（AOD 球 / 旧图）⇒ 看起来就是「漏壁纸」。
+            // 两份用同一份 `lens` / `ratio`（`drawScene` 只读状态、不随时间推进）⇒ 严格同步。
+            drawEveryMount()
+            return
+        }
         val wantLocked = activeMountIsLocked()
         val group = mounts.filter { it.locked == wantLocked }.ifEmpty { mounts }
         for (m in group) drawMount(m)
@@ -1733,6 +2050,40 @@ internal object AliveRenderer {
     private fun drawEveryMount() {
         for (m in mounts) drawMount(m)
     }
+
+    /**
+     * **只画桌面份**，用于解锁转场开始前预热目标 buffer（2026-11-14）。
+     *
+     * ## 为什么需要
+     *
+     * `drawAllFrames()` 在锁屏态只画锁屏份（2026-11-08 为省帧砍掉另一份），
+     * 所以桌面份的内容**停留在启动时** `drawEveryMount()` 那一帧。
+     * 而解锁转场期间它要么躺在锁屏份下面（`sameLayer` 那条路逐帧降锁屏 alpha），
+     * 要么最后被抬起 alpha（AOD→桌面 / 交叉收尾）——
+     * 只要它的 buffer 不是当前内容（换过图、参数变过、几何不同），
+     * 交接那几帧就会露出**旧画面或系统桌面壁纸**（用户 2026-11-10 报的「进桌面闪一下」）。
+     *
+     * 层树实证见 `analyse/HyperExtreme-fork-改动分析.md` §7：两个 `WallpaperWindowToken`
+     * 是 `Leaf:1:1` 的兄弟，系统自己切可见性，我们两份层各自跟着走 ——
+     * 所以正确做法不是换壁纸，而是**让目标份在交接前就是对的**。
+     *
+     * ⚠️ 同步执行（一次全屏 pass，约 50~80ms），必须在**改 alpha / 切 showingDesktop 之前**调用。
+     * 不要在 `drawAllFrames` 里改成"两份都画"——那会回到 2026-11-08 的老问题
+     * （每帧两个 pass，交叉只来得及出 1~2 帧）。
+     */
+    private fun prewarmDesktop() {
+        if (display == null) return
+        val desk = mounts.filter { !it.locked }
+        if (desk.isEmpty()) return
+        val t0 = SystemClock.elapsedRealtime()
+        var ok = 0
+        for (m in desk) if (drawMount(m)) ok++
+        HookRuntime.log(
+            "$TAG 桌面份预热：$ok/${desk.size} 帧，" +
+                "${SystemClock.elapsedRealtime() - t0}ms",
+        )
+    }
+
 
     private fun forceDraw() {
         if (display == null) return
@@ -1765,7 +2116,9 @@ internal object AliveRenderer {
         }
         // 留光的遮罩没就绪 ⇒ **整帧不提交**（Surface 停在上一次的完整画面）。
         // 与官方 `MaskFrames.upload()==false` 时 `return` 一致：几何与遮罩共用一个采样。
-        if (!drawScene(m.locked)) return false
+        // 双画期间（解锁转场）桌面份也要走**锁屏份那套内容**（同一 lens / ratio），
+        // 否则它停在 `deskState` 的终点图，与锁屏份对不上（见 [mirrorToDesk]）。
+        if (!drawScene(if (mirrorToDesk) true else m.locked)) return false
         if (EGL14.eglSwapBuffers(d, es)) {
             if (m.locked) swapLock++ else swapDesk++
         } else {
@@ -2513,6 +2866,127 @@ internal object AliveRenderer {
         return s
     }
 
+    // ───────────────────── 壁纸层自检（事件驱动看门狗，2026-11-14）─────────────────────
+
+    /**
+     * 只探测当前壁纸 leash 的签名，不产生任何副作用。
+     *
+     * 解锁 / 锁屏 / AOD 三种状态可见的 token 不同，但**签名变化 = 壁纸层被重建**
+     * （killall miwallpaper / 换壁纸 / 系统重建），这正是要发现的事件。
+     */
+    private fun probeLeashSig(): String? = runCatching {
+        val wmg = Class.forName("android.view.WindowManagerGlobal", false, javaClass.classLoader)
+        val inst = wmg.getMethod("getInstance").invoke(null)
+        val gw = wmg.getMethod(
+            "getWallpaperByShowWhenLocked",
+            Int::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType,
+        )
+        val token = gw.invoke(inst, 0, true) ?: gw.invoke(inst, 0, false) ?: return null
+        token.javaClass.getMethod("getLeash").invoke(token)?.toString()
+    }.getOrNull()
+
+    /**
+     * **事件驱动的壁纸层自检**（2026-11-14）。
+     *
+     * 与「每 3s 轮询」等效的依据：故障只在**看得见**的时候才算故障，
+     * 而所有「进入可见」的入口（亮屏 / 解锁 / 出 AOD / 回到桌面）都会调这里一次，
+     * 所以进入可见的瞬间签名已经是新的 ⇒ 比 3s 轮询更快发现。
+     * 唯一的「正在看时被重建」（miwallpaper 崩溃）由 [startProcessWatch] 的进程死亡回调
+     * + [startLeashProbe] 的 60s 兜底覆盖。
+     */
+    internal fun checkLeashFresh(reason: String) {
+        if (runningKey == null) return
+        val sig = probeLeashSig() ?: return
+        val old = attachedLeashSig
+        if (old == null) {
+            attachedLeashSig = sig
+            return
+        }
+        if (sig == old) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRemountAt < remountDebounceMs) return
+        lastRemountAt = now
+        HookRuntime.log("$TAG 壁纸层已变化（$reason）→ 重新挂载：old=$old new=$sig")
+        runCatching { attachToLeashWithRetry(runningScope) }
+            .onFailure {
+                HookRuntime.log("$TAG 重新挂载失败：${it.javaClass.simpleName}: ${it.message}")
+            }
+    }
+
+    /**
+     * 监听**壁纸进程死亡**（`com.miui.miwallpaper`）。这是唯一「正在看时」会发生的情况，
+     * 用进程回调补上，就不必为此保留 3s 轮询；拿不到 hidden API 就跳过（靠 60s 兜底）。
+     */
+    private fun startProcessWatch() {
+        if (processObserver != null) return
+        runCatching {
+            // ⚠️ 两个坑（真机实测）：
+            // 1) 不要 `Class.forName("android.app.ActivityManager")` —— 模块的 classloader
+            //    看不到 framework 类，会 ClassNotFoundException；
+            // 2) 也不要写死 `IActivityManager$ProcessObserver` —— 内部接口的类名各版本不同。
+            // 用 `ActivityManager` **实例的类**反查方法，再从方法参数类型拿接口，最稳。
+            val svc = HookRuntime.appContext()
+                ?.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                ?: error("拿不到 ActivityManager")
+            val amClass = svc.javaClass
+            val reg = amClass.declaredMethods.firstOrNull { it.name == "registerProcessObserver" }
+                ?: error("没有 registerProcessObserver（hidden API 变了）")
+            val iface = reg.parameterTypes.firstOrNull()
+                ?: error("registerProcessObserver 没有参数类型")
+            val unreg = amClass.declaredMethods.firstOrNull { it.name == "unregisterProcessObserver" }
+            val proxy = java.lang.reflect.Proxy.newProxyInstance(
+                iface.classLoader ?: javaClass.classLoader,
+                arrayOf(iface),
+            ) { _, method, _ ->
+                if (method.name == "onProcessDied") {
+                    // 壁纸层重建要几百 ms，稍后再探（去抖在 checkLeashFresh 里）
+                    handler?.postDelayed({ checkLeashFresh("壁纸进程退出") }, 800L)
+                }
+                null
+            }
+            reg.invoke(svc, proxy)
+            processObserver = proxy
+            unregisterHolder = unreg
+            HookRuntime.log("$TAG 进程观察者已注册（${iface.name}）")
+        }.onFailure {
+            HookRuntime.log(
+                "$TAG 进程观察者不可用（跳过，靠 60s 兜底）：" +
+                    "${it.javaClass.simpleName}: ${it.message}",
+            )
+        }
+    }
+
+    private fun stopProcessWatch() {
+        val proxy = processObserver ?: return
+        processObserver = null
+        runCatching {
+            val svc = HookRuntime.appContext()
+                ?.getSystemService(android.content.Context.ACTIVITY_SERVICE) ?: return
+            unregisterHolder?.invoke(svc, proxy)
+        }
+        unregisterHolder = null
+    }
+
+    /** 60s 低频兜底：只在**亮屏且渲染器在跑**时探一次（进程回调拿不到时的唯一保险）。 */
+    private fun startLeashProbe() {
+        stopLeashProbe()
+        val h = ensureHandler()
+        val task = object : Runnable {
+            override fun run() {
+                if (runningKey != null && screenOn()) checkLeashFresh("低频兜底")
+                h.postDelayed(this, 60_000L)
+            }
+        }
+        leashProbeTick = task
+        h.postDelayed(task, 60_000L)
+    }
+
+    private fun stopLeashProbe() {
+        leashProbeTick?.let { ensureHandler().removeCallbacks(it) }
+        leashProbeTick = null
+    }
+
     private fun stopInternal(reason: String) {
         val had = runningKey != null
         runningKey = null
@@ -2522,10 +2996,20 @@ internal object AliveRenderer {
         fadeTick = null
         aodExitTick?.let { handler?.removeCallbacks(it) }
         aodExitTick = null
+        aodMirrorOff?.let { handler?.removeCallbacks(it) }
+        aodMirrorOff = null
+        mirrorToDesk = false
+        stopLeashProbe()
+        stopProcessWatch()
+        attachedLeashSig = null
+        musicYield = false
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
         framePosted = false
         choreographer?.removeFrameCallback(frameCallback)
         unregisterScreen()
         runCatching { AliveFlag.pushRendering(false) }
+        mirrorToDesk = false
         // 景深主体层：撤掉我们的图（层本身还给系统）
         runCatching { AliveOverlay.onDisabled() }
 

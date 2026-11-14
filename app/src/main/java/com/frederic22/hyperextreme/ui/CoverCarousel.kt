@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -43,6 +44,9 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
+import top.yukonga.miuix.kmp.blur.layerBackdrop
+import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import top.yukonga.miuix.kmp.squircle.squircleClip
@@ -75,6 +79,15 @@ internal data class CoverItem(
      * 只影响显示，不落盘。
      */
     val src: RectF? = null,
+    /**
+     * 卡内底部的**状态胶囊**文案（2026-11-13）。null = 不显示。
+     *
+     * **每张卡各自带一条**，随卡片移动、不固定在屏幕中央。三页各一套文案：
+     * * 光栅：`16张 镜像开`（不足 3 张按实际生效值显示"开"）；
+     * * 空间：`已计算缓存` / `未计算缓存`（判据 `SpatialCandidate.hasLayers`）；
+     * * Alive：`启航` / `留光`（判据 `AliveItem.style`）。
+     */
+    val badge: String? = null,
 )
 
 // ------------------------------------------------------------------ 尺寸 / 节奏
@@ -489,6 +502,10 @@ private fun CoverCard(
     onDelete: () -> Unit,
 ) {
     val cover = rememberCover(item.cover, item.src)
+    // 状态胶囊的玻璃（2026-11-13）：**每张卡自己一个 backdrop**，磨的是自己的封面 ——
+    // 这样胶囊随卡片移动。页面级共用一个 backdrop 的话，卡内胶囊会被画进 backdrop（自模糊）。
+    val canBlur = remember { isRuntimeShaderSupported() }
+    val backdrop = if (canBlur) rememberLayerBackdrop { drawContent() } else null
     // 删除动画：整张卡（连上面的删除钮）一起缩小 + 淡出，播完由调用方删数据、列表自动补位。
     val removeAnim by animateFloatAsState(
         targetValue = if (removing) 0f else 1f,
@@ -518,6 +535,8 @@ private fun CoverCard(
             modifier = Modifier
                 .fillMaxSize()
                 .squircleClip(radius)
+                // 玻璃背景取「卡片本体」（封面 + 底色 + 描边），胶囊在外层、不进这个层。
+                .then(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
                 .background(MiuixTheme.colorScheme.surfaceContainerHigh)
                 .squircleStroke({ CARD_STROKE_WIDTH }, { CARD_STROKE }, radius)
                 // `enabled = false` 时不消费触摸：侧卡点击完全无响应，也不会抢走
@@ -527,6 +546,17 @@ private fun CoverCard(
         ) {
             // 封面（带 0.15s 渐显）；没加载出来 / 空内容时**只留底色**。
             CardImage(cover, Modifier.fillMaxSize())
+        }
+        item.badge?.let { text ->
+            CoverBadge(
+                text = text,
+                backdrop = backdrop,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 12.dp)
+                    // 卡片本体带 `squircleClip`（离屏 layer），不加会被盖在下面。
+                    .zIndex(1f),
+            )
         }
         if (deleteAnim > 0f) {
             // 红色圆 + 白色横杠，**圆心刚好落在卡片右上角的角点上**（用户 2026-11-03 定的位置）。

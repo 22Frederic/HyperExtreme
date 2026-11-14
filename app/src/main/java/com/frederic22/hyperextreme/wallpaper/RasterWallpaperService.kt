@@ -122,7 +122,7 @@ class RasterWallpaperService : WallpaperService() {
         private val slotIdx = IntArray(3) { -1 }
         private val slotUv = Array(3) { floatArrayOf(1f, 1f, 0f, 0f) }
 
-        /** 后台预取（与 hook 版同一套策略：最多留 2 张，各约 12.8MB）。 */
+        /** 后台预取（与 hook 版同一套策略：预取 ±2、最多留 4 张，各约 12.8MB）。 */
         private val preloaded = java.util.concurrent.ConcurrentHashMap<Int, Bitmap>()
         private val preloading = java.util.Collections.synchronizedSet(HashSet<Int>())
 
@@ -140,6 +140,15 @@ class RasterWallpaperService : WallpaperService() {
         private var panDeg = 25
         /** 「停顿时就近归位」（`RasterServiceTarget` 的 `settle`，默认开）：关 = 停在两张之间不动。 */
         private var settleOnIdle = true
+        /**
+         * 「左右镜像展示」（`RasterServiceTarget` 的 `mirror`，默认开；2026-11-13）。
+         *
+         * 开 = 归位点第 1 张、两侧共用同一序列；关 = 归位点取中点、两侧各走半边。
+         * 与 hook 链同一套算法（[RasterGlCore.baseOf] / [posOf] / [panOf]）。
+         */
+        private var mirror = true
+        /** 归位点下标（0 基）：开镜像 / 不足 3 张 ⇒ 0；关且 ≥3 张 ⇒ `n / 2`。 */
+        private var baseIndex = 0
         /** 「过渡效果」（`RasterServiceTarget` 的 `transition`）：0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲。 */
         private var style = 0
         /** 条纹周期（屏幕像素）= screenW × 19/1200，随 surface 尺寸一起更新。 */
@@ -214,7 +223,7 @@ class RasterWallpaperService : WallpaperService() {
         }
 
         /**
-         * 只热更新「过渡效果 / 停顿归位」两项。
+         * 只热更新「过渡效果 / 停顿归位 / 左右镜像展示」三项。
          *
          * ⚠️ `panDeg` 故意不读：分母变了会让 `t = pan/panMaxRad` 当场跳图，按用户决定
          * 角度维持「下一次可见（`ensureContent`）」才生效。所以 UI 改角度虽然也会重写
@@ -225,18 +234,22 @@ class RasterWallpaperService : WallpaperService() {
             val ctx = applicationContext
             val tr = RasterServiceTarget.readTransition(ctx)
             val settle = RasterServiceTarget.readSettle(ctx)
-            if (tr == style && settle == settleOnIdle) return
+            val mirrorNow = RasterServiceTarget.readMirror(ctx)
+            if (tr == style && settle == settleOnIdle && mirrorNow == mirror) return
             style = tr
             settleOnIdle = settle
+            mirror = mirrorNow
+            baseIndex = RasterGlCore.baseOf(images.size, mirror)
             log(
                 "参数热更新：过渡效果=" + when (tr) {
                     1 -> "条纹玻璃"
                     2 -> "磨砂玻璃"
                     3 -> "条纹玻璃（扭曲变形）"
                     else -> "默认"
-                } + " 停顿时就近归位=${if (settle) 1 else 0}",
+                } + " 停顿时就近归位=${if (settle) 1 else 0}" +
+                    " 左右镜像展示=${if (mirror) 1 else 0}（归位点 #$baseIndex）",
             )
-            // 用户定：改这两项时立刻硬切归位一次（此刻画面在模块手里，跳变可接受）。
+            // 用户定：改这几项时立刻硬切归位一次（此刻画面在模块手里，跳变可接受）。
             if (surfaceReady) resetBase(redraw = true)
         }
 
@@ -405,7 +418,8 @@ class RasterWallpaperService : WallpaperService() {
             }
 
             val before = pan
-            pan = (pan + gyroRate * dt).coerceIn(-panMaxRad, panMaxRad)
+            val range = RasterGlCore.panRangeOf(images.size, baseIndex, panMaxRad)
+            pan = (pan + gyroRate * dt).coerceIn(range.start, range.endInclusive)
             val delta = pan - before
             if (abs(delta) < 1e-9f) return
             lastMotionAt = SystemClock.elapsedRealtime()
@@ -422,13 +436,8 @@ class RasterWallpaperService : WallpaperService() {
             }
         }
 
-        /** 当前连续图号（0 .. N−1）。 */
-        private fun fValue(): Float {
-            val n = images.size
-            if (n < 2) return 0f
-            val step = panMaxRad / (n - 1)
-            return (abs(pan) / step).coerceIn(0f, (n - 1).toFloat())
-        }
+        /** 当前连续图号（0 .. N−1）。与 hook 链**同一个函数**（开镜像 = |pan|/step；关 = base + pan/step）。 */
+        private fun fValue(): Float = RasterGlCore.posOf(pan, images.size, baseIndex, panMaxRad)
 
         // ─────────────────────────── 收尾 / 基点 ───────────────────────────
 
@@ -449,8 +458,13 @@ class RasterWallpaperService : WallpaperService() {
             if (frac < 0.02f || frac > 0.98f) return@Runnable
             // 就近：过半就擦完，不到一半就退回去。
             val target = if (frac >= 0.5f) (idx + 1).toFloat() else idx.toFloat()
-            val step = panMaxRad / (images.size - 1)
-            startSnap(target * step * (if (pan >= 0f) 1f else -1f))
+            // 图号 → 累计角：开镜像要带符号（两侧共用同一序列），关镜像由 pos−base 决定。
+            startSnap(
+                RasterGlCore.panOf(
+                    target, images.size, baseIndex, panMaxRad,
+                    if (pan >= 0f) 1f else -1f,
+                ),
+            )
         }
 
         private fun startSnap(targetPan: Float) {
@@ -490,9 +504,11 @@ class RasterWallpaperService : WallpaperService() {
             gl?.removeCallbacks(snapTick)
         }
 
-        /** 立刻回到第一张（无过渡）。 */
+        /** 立刻回到归位点（无过渡）：`pan = 0` 恰好对应 [baseIndex] 那张。 */
         private fun resetBase(redraw: Boolean) {
             cancelSnap()
+            // 张数 / 镜像开关都可能在两次可见之间变过 ⇒ 这里兜底重算一次。
+            baseIndex = RasterGlCore.baseOf(images.size, mirror)
             pan = 0f
             lastMoveDir = 1f
             lastAt = 0L
@@ -672,12 +688,21 @@ class RasterWallpaperService : WallpaperService() {
                     },
                 )
             }
+            // 「左右镜像展示」（2026-11-13）：同样独立于组内容；值变了要重算归位点并落位。
+            val mirrorNow = RasterServiceTarget.readMirror(ctx)
+            if (mirrorNow != mirror) {
+                mirror = mirrorNow
+                baseIndex = RasterGlCore.baseOf(images.size, mirror)
+                log("左右镜像展示=${if (mirror) 1 else 0}（归位点 #$baseIndex）")
+                if (surfaceReady) runCatching { resetBase(redraw = true) }
+            }
             val key = RasterServiceTarget.readKey(ctx)
             if (key == null) {
                 if (loadedKey != null) {
                     log("目标被清空 → 释放纹理")
                     dropTextures()
                     images = emptyList()
+                    baseIndex = 0
                     groupDir = null
                     loadedKey = null
                     loadedStamp = 0L
@@ -699,7 +724,9 @@ class RasterWallpaperService : WallpaperService() {
             groupDir = dir
             loadedKey = key
             loadedStamp = stamp
-            log("组 OK key=$key imgs=${images.size}")
+            // 张数变了 ⇒ 归位点跟着重算（关镜像时是中点，n 一变就换一张）。
+            baseIndex = RasterGlCore.baseOf(images.size, mirror)
+            log("组 OK key=$key imgs=${images.size} 归位点=#$baseIndex")
         }
 
         private fun dropTextures() {
@@ -820,12 +847,12 @@ class RasterWallpaperService : WallpaperService() {
             }.apply { isDaemon = true }.start()
         }
 
-        /** 只保留最近两张，多的立刻回收。 */
+        /** 只保留最近 4 张（2026-11-13 与 hook 链同步：预取 ±2），多的立刻回收。 */
         private fun putPreloaded(index: Int, bmp: Bitmap) {
             preloaded[index] = bmp
-            if (preloaded.size > 2) {
+            if (preloaded.size > PRELOAD_KEEP) {
                 for (k in preloaded.keys.toList()) {
-                    if (preloaded.size <= 2) break
+                    if (preloaded.size <= PRELOAD_KEEP) break
                     if (k != index) preloaded.remove(k)?.recycle()
                 }
             }
@@ -878,13 +905,25 @@ class RasterWallpaperService : WallpaperService() {
             var idx = f.toInt()
             if (idx > n - 1) idx = n - 1
             var frac = f - idx
-            if (idx >= n - 1) frac = 0f
-            fromIdx = idx
-            toIdx = (idx + 1).coerceAtMost(n - 1)
-            if (toIdx == fromIdx) frac = 0f
-            t = frac
+            // **递增 = 图号变大的方向**：开镜像恒递增；关镜像看 pan 符号。
+            // 关镜像往回翻时 f 递减，from/to 必须跟着换（与 hook 版同一条）。
+            val asc = baseIndex <= 0 || pan >= 0f
+            if (asc) {
+                if (idx >= n - 1) frac = 0f
+                fromIdx = idx
+                toIdx = (idx + 1).coerceAtMost(n - 1)
+                if (toIdx == fromIdx) frac = 0f
+                t = frac
+            } else {
+                // pos 从 idx+1 走向 idx ⇒ from = idx+1（旧图）、to = idx（新图），t 由 1→0。
+                fromIdx = (idx + 1).coerceAtMost(n - 1)
+                toIdx = idx
+                if (fromIdx == toIdx) frac = 0f
+                t = 1f - frac
+            }
             // 方向 = **累计角的符号**（与 hook 版同一条，不是瞬时运动方向）。
             val dir = if (pan >= 0f) 1f else -1f
+            // t=0 显示 from、t=1 显示 to；极小时收成一张（两种配对都收 from）。
             if (t <= 0.0005f) {
                 toIdx = fromIdx
                 t = 0f
@@ -903,8 +942,13 @@ class RasterWallpaperService : WallpaperService() {
             GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 16, quad)
 
             // ⚠️ 顺序不能反：先确保纹理在位（首次会现传并算出 cover 参数），再读 uv。
-            preload(fromIdx + 1)
-            preload(fromIdx - 1)
+            // 预取 ±2（2026-11-13：单组上限 16 张，只备 ±1 时甩快一点仍会现解 528ms）。
+            // 中心取 from/to 里较小的那个（关镜像往回翻时 from = idx+1、to = idx）。
+            val near = minOf(fromIdx, toIdx)
+            preload(near + 1)
+            preload(near + 2)
+            preload(near - 1)
+            preload(near - 2)
             val texF = textureFor(fromIdx, toIdx)
             val texT = if (toIdx == fromIdx) texF else textureFor(toIdx, fromIdx)
             val uvF = uvOf(fromIdx)
@@ -948,5 +992,8 @@ class RasterWallpaperService : WallpaperService() {
 
     private companion object {
         const val TAG = "RASTER_WP"
+
+        /** 预取缓存上限（2026-11-13：与 ±2 的预取半径配套；与 hook 链同值）。 */
+        const val PRELOAD_KEEP = 4
     }
 }

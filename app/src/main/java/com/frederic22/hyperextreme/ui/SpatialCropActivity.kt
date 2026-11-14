@@ -205,32 +205,9 @@ private val CROP_SHADOW_BLUR = 28.dp
 private const val CROP_SHADOW_ALPHA = 0.13f
 
 /**
- * **平滑圆角**（squircle）的 `Shape`，给 `textureBlur` / 投影层用。
- *
- * 为什么需要它：miuix 的 `Button` 本体是 `squircleSurface`（SDF 平滑圆角）画的，
- * 而 `textureBlur(shape = …)` 收的是普通 Compose `Shape`。用 `RoundedCornerShape`
- * 会和按钮本体的轮廓对不上 —— 圆角处玻璃「鼓出来」一点（2026-11-04 用户指出）。
- *
- * `extension = 0f` 与 miuix `Button` 内部调用 `squircleSurface` 时传的值一致，
- * 这样玻璃、投影、按钮三者几何完全相同。
+ * 平滑圆角 Shape 已提到 **`ui/RasterCardParts.kt` 的 [SquircleShape]**（2026-11-13）：
+ * 光栅二级页的状态胶囊也要同一颗玻璃，两处共用一份，几何不会漂。
  */
-private class CropSquircleShape(private val corner: Dp) : Shape {
-    override fun createOutline(
-        size: Size,
-        layoutDirection: LayoutDirection,
-        density: Density,
-    ): Outline {
-        val path = Path()
-        path.addSquircleRect(
-            width = size.width,
-            height = size.height,
-            cornerRadius = with(density) { corner.toPx() },
-            extension = 0f,
-            squircleEnabled = true,
-        )
-        return Outline.Generic(path)
-    }
-}
 
 @Composable
 private fun CropScreen(key: String, onClose: () -> Unit) {
@@ -334,7 +311,7 @@ private fun CropScreen(key: String, onClose: () -> Unit) {
     )
     // 按钮的**平滑圆角**：玻璃层、投影层、按钮本体三者几何必须完全相同，
     // 否则圆角处玻璃会比按钮"鼓"出来（用户 2026-11-04 指出）。
-    val buttonShape = remember { CropSquircleShape(CROP_BUTTON_CORNER) }
+    val buttonShape = remember { SquircleShape(CROP_BUTTON_CORNER) }
 
     val shader = remember { RuntimeShader(CROP_AGSL) }
     // 绘制用的 Paint：用原生 `android.graphics.Paint`（比 Compose 的包装类少一层、

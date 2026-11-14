@@ -58,6 +58,17 @@ object RasterFlag {
      */
     const val PROP_TRANSITION = "debug.hyperextreme.raster_transition"
 
+    /**
+     * 「左右镜像展示」：1 = 开（默认）/ 0 = 关（2026-11-13）。
+     *
+     * 开 = 归位点第 1 张、两侧沿同一序列；关 = 归位点取中点（`n / 2`）、两侧各走半边。
+     * **组级属性**（存在该组的 `meta.json` 里），应用时随其它参数一起推。
+     *
+     * ⚠️ 不进实时通道：正在应用的组合禁止编辑 ⇒ 运行期这个值不可能变，
+     * 渲染器只在 `startInternal` 里读一次。不足 3 张时渲染层强制按开处理。
+     */
+    const val PROP_MIRROR = "debug.hyperextreme.raster_mirror"
+
     /** 渲染器是否**真的**在跑（1 = 已挂上并出过帧）。排查「点了应用但没反应」用。 */
     const val PROP_RENDERING = "debug.hyperextreme.raster_rendering"
 
@@ -70,6 +81,8 @@ object RasterFlag {
         panDeg: Int = 25,
         transition: Int = 0,
         settle: Boolean = true,
+        /** 「左右镜像展示」（2026-11-13，组级）：默认开 = 加这个选项之前的行为。 */
+        mirror: Boolean = true,
     ) {
         val script = "setprop $PROP_ACTIVE ${if (active) 1 else 0}; " +
             "setprop $PROP_KEY ${key.orEmpty()}; " +
@@ -77,7 +90,8 @@ object RasterFlag {
             "setprop $PROP_LOCKDEPTH ${if (lockDepth) 1 else 0}; " +
             "setprop $PROP_PAN_DEG $panDeg; " +
             "setprop $PROP_TRANSITION ${transition.coerceIn(0, 3)}; " +
-            "setprop $PROP_SETTLE ${if (settle) 1 else 0}"
+            "setprop $PROP_SETTLE ${if (settle) 1 else 0}; " +
+            "setprop $PROP_MIRROR ${if (mirror) 1 else 0}"
         Thread {
             val r = runCatching { RootShell.run(script) }.getOrNull()
             if (r == null || !r.ok) {

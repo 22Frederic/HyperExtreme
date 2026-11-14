@@ -93,14 +93,24 @@ class App : Application() {
             // 属性一亮 hook 链也会去挂 leash ⇒ 同一张图被画两遍（错位 + 掉帧）。
             // `rasterActiveId` 在服务模式下只是 UI 指针，不能当作"要渲染"的判据。
             val rasterLsposed = prefs.rasterMountMode == MaskPrefs.RASTER_MOUNT_LSPOSED
+            val rasterId = prefs.rasterActiveId
+            // 「左右镜像展示」是**组级**属性（meta.json）⇒ 补推时必须回读当前这一组，
+            // 不能用某个全局默认值，否则重启后归位点从「中点」跳回「第一张」。
+            val rasterMirror = rasterId.takeIf { it.isNotEmpty() }
+                ?.let { id ->
+                    com.frederic22.hyperextreme.data.RasterStore
+                        .load(File(com.frederic22.hyperextreme.data.RasterStore.root(this), id))
+                        ?.mirror
+                } ?: true
             RasterFlag.push(
-                rasterLsposed && prefs.rasterActiveId.isNotEmpty(),
-                prefs.rasterActiveId.takeIf { it.isNotEmpty() },
+                rasterLsposed && rasterId.isNotEmpty(),
+                rasterId.takeIf { it.isNotEmpty() },
                 prefs.rasterScope,
                 prefs.rasterLockDepth,
                 prefs.rasterMaxAngle,
                 prefs.rasterTransition,
                 prefs.rasterSettle,
+                rasterMirror,
             )
             // 开关开着但图可能失效（重装/换图）——启动时再推一次给 miwallpaper。
             if (prefs.parallaxCoverDesktop) {

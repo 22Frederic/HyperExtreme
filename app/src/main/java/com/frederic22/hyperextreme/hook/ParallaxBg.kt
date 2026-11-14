@@ -412,7 +412,7 @@ internal object ParallaxBg {
     /** 传感器采样周期：60Hz（与 60Hz 渲染刷新对齐）。 */
     private const val SENSOR_PERIOD_US = 16_667
 
-    /** 状态机实现类（真机 `re-glass` 核实：`setState(int, boolean)`，int：0=SHADE / 1=KEYGUARD / 2=SHADE_LOCKED）。 */
+    /** 状态机实现类（真机 `analyse/re-glass` 核实：`setState(int, boolean)`，int：0=SHADE / 1=KEYGUARD / 2=SHADE_LOCKED）。 */
     private const val CLS_STATE_IMPL = "com.android.systemui.statusbar.StatusBarStateControllerImpl"
 
     private const val STATE_SHADE = 0

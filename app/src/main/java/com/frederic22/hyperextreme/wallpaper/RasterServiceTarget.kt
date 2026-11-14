@@ -22,14 +22,16 @@ internal object RasterServiceTarget {
     private fun tmp(ctx: Context) = File(ctx.filesDir, "$NAME.tmp")
 
     /**
-     * 主进程：点「跳转系统页」后记下要渲染的组 id 与**最大幅度角度**、**停顿时就近归位**。
+     * 主进程：点「跳转系统页」后记下要渲染的组 id 与**最大幅度角度**、**停顿时就近归位**、
+     * **左右镜像展示**。
      *
      * 角度一起写：壁纸进程读不到 `MaskPrefs`，而它与组 id 是同一时刻的配置快照，
      * 分两个文件就会出现「组换了、角度还是旧的」。
      *
-     * @param panDeg 15..45（度）；越界按 25 兜底
+     * @param panDeg 15..60（度）；越界按 25 兜底
      * @param transition 过渡效果（0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃·扭曲）
      * @param settle 停顿时是否就近归位（默认开）
+     * @param mirror 左右镜像展示（默认开；2026-11-13 组级属性）
      *
      * 2026-11-07：生效中改 transition / settle 也会走这里，**实时**触发壁纸进程的
      * `FileObserver`；`panDeg` 只在壁纸进程下次可见（`ensureContent`）时才被应用。
@@ -40,13 +42,15 @@ internal object RasterServiceTarget {
         panDeg: Int = 25,
         transition: Int = 0,
         settle: Boolean = true,
+        mirror: Boolean = true,
     ) {
         runCatching {
             val json = org.json.JSONObject()
                 .put("key", key)
-                .put("panDeg", panDeg.coerceIn(15, 45))
+                .put("panDeg", panDeg.coerceIn(15, 60))
                 .put("transition", transition.coerceIn(0, 3))
                 .put("settle", settle)
+                .put("mirror", mirror)
                 .put("at", System.currentTimeMillis())
             val f = tmp(ctx)
             f.writeText(json.toString())
@@ -61,8 +65,20 @@ internal object RasterServiceTarget {
     fun readPanDeg(ctx: Context): Int = runCatching {
         val f = file(ctx)
         if (!f.isFile) return 25
-        org.json.JSONObject(f.readText()).optInt("panDeg", 25).coerceIn(15, 45)
+        org.json.JSONObject(f.readText()).optInt("panDeg", 25).coerceIn(15, 60)
     }.getOrDefault(25)
+
+    /**
+     * 「左右镜像展示」；没写 / 读不出来按**开**（= 加这个选项之前的行为）。
+     *
+     * 2026-11-13 加。组级属性，壁纸进程在 `ensureContent` 里重读；值变了就 `resetBase`
+     * （归位点从第 0 张变成中点，画面必须重新落位）。
+     */
+    fun readMirror(ctx: Context): Boolean = runCatching {
+        val f = file(ctx)
+        if (!f.isFile) return true
+        org.json.JSONObject(f.readText()).optBoolean("mirror", true)
+    }.getOrDefault(true)
 
     /** 「停顿时就近归位」；没写 / 读不出来按**开**（= 加这个选项之前的行为）。 */
     fun readSettle(ctx: Context): Boolean = runCatching {
