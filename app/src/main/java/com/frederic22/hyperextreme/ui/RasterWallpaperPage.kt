@@ -1,5 +1,8 @@
 package com.frederic22.hyperextreme.ui
 
+import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.animation.Crossfade
@@ -46,6 +49,7 @@ import com.frederic22.hyperextreme.data.RasterControl
 import com.frederic22.hyperextreme.data.RasterFlag
 import com.frederic22.hyperextreme.data.RasterGroup
 import com.frederic22.hyperextreme.data.RasterStore
+import com.frederic22.hyperextreme.data.WallpaperProc
 import com.frederic22.hyperextreme.wallpaper.DynamicWallpaperPermission
 import com.frederic22.hyperextreme.wallpaper.RasterServiceTarget
 import com.frederic22.hyperextreme.wallpaper.RasterWallpaperService
@@ -188,6 +192,22 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     // 「当前使用中的组」——空串 = 一套都没应用。
     var activeId by remember { mutableStateOf(prefs.rasterActiveId) }
 
+    // **外部关闭的回灌**（2026-11-15）：换壁纸 / 壁纸进程重启会在**本进程的另一条路径**里
+    // 清掉 `raster_active_id`（provider 的自动关闭），页面收不到 ⇒ 卡片一直显示「已应用」、
+    // 按钮还是「取消应用」，必须退出重进才刷新。监听 prefs 把本地状态跟上去。
+    // 服务模式不写这个键（真值在壁纸进程），那条链仍由 `ON_RESUME` 的 `serviceRunning` 负责。
+    val uiHandler = remember { Handler(Looper.getMainLooper()) }
+    DisposableEffect(Unit) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == MaskPrefs.KEY_RASTER_ACTIVE) {
+                val next = prefs.rasterActiveId
+                uiHandler.post { if (activeId != next) activeId = next }
+            }
+        }
+        prefs.registerListener(listener)
+        onDispose { prefs.unregisterListener(listener) }
+    }
+
     LaunchedEffect(reload) {
         // 顺序**持久化**在 `rasterGroupOrder` 里（2026-11-05）：应用 / 新建时把 id 提到最前，
         // 关闭应用**不动它**。
@@ -329,25 +349,15 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     }
 
     /**
-     * 把某一套设为「正在使用」，按挂载模式走两条完全不同的路。
+     * 把某一套设为「正在使用」 —— **真正的注入**，按挂载模式走两条完全不同的路。
      *
      * * **LSPosed**：写 prefs 指针 + 推系统属性（渲染器每秒轮询一次）。
      * * **系统壁纸服务**：写**独立**的 target 文件 + 拉起系统页；**绝不推属性**
      *   （推了 hook 链也会画，同一张图被渲染两遍）。
+     *
+     * 入口请走 [applyGroup]（它先过一道「壁纸进程可注入」的闸门）。
      */
-    fun applyGroup(g: RasterGroup) {
-        // 服务模式**不早退**：即使 id 没变也要重新写 target + 拉起系统页
-        //（用户可能刚从系统页把壁纸换回去了，这时点「跳转系统页」必须能重来）。
-        if (mountMode != RASTER_MOUNT_SERVICE && g.id == activeId) return
-        // **功能冲突检测**（2026-11-04 用户要求，三侧统一）：
-        // 视差 / 空间任一在跑就不许应用 —— 三条链都靠"压住系统壁纸"工作，同时开会互相盖。
-        // 弹窗复用 `FeatureConflictDialog`，正文里的名字取实际在跑的那条。
-        val other = WallpaperConflict.running(ctx, state, WallpaperChain.RASTER)
-        if (other != null) {
-            conflictOther = other
-            showConflict = true
-            return
-        }
+    fun applyGroupNow(g: RasterGroup) {
         haptic()
         if (mountMode == RASTER_MOUNT_SERVICE) {
             // **服务模式只写 target 文件**（真值在壁纸进程），不落 `prefs.rasterActiveId`。
@@ -402,6 +412,33 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                 "光栅壁纸已生效（${scopeLabel(prefs.rasterScope)}）",
                 Toast.LENGTH_LONG,
             ).show()
+        }
+    }
+
+    /**
+     * 「应用」的入口（2026-11-15）。
+     *
+     * 1. 服务模式**不早退**：即使 id 没变也要重新写 target + 拉起系统页
+     *    （用户可能刚从系统页把壁纸换回去了，这时点「跳转系统页」必须能重来）；
+     *    那条链不碰 miwallpaper 的 leash，不需要等重载。
+     * 2. **功能冲突检测**（2026-11-04 用户要求，三侧统一）：视差 / 空间任一在跑就不许应用 ——
+     *    三条链都靠"压住系统壁纸"工作，同时开会互相盖。
+     * 3. LSPosed 链：先确认壁纸进程可注入 —— 关闭光栅不会杀进程，但**关闭空间 / Alive 会**
+     *    （400ms 后的一刀）。撞上那个窗口推属性 = 新层刚挂上就被父 leash 带走，而光栅渲染器
+     *    **没有** leash 自检，不会自愈。
+     */
+    fun applyGroup(g: RasterGroup) {
+        if (mountMode != RASTER_MOUNT_SERVICE && g.id == activeId) return
+        val other = WallpaperConflict.running(ctx, state, WallpaperChain.RASTER)
+        if (other != null) {
+            conflictOther = other
+            showConflict = true
+            return
+        }
+        if (mountMode == RASTER_MOUNT_SERVICE) {
+            applyGroupNow(g)
+        } else {
+            WallpaperProc.applyWhenReady(ctx) { applyGroupNow(g) }
         }
     }
 

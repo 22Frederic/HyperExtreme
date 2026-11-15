@@ -34,9 +34,17 @@ object AliveControl {
      * 关闭 Alive 壁纸。**已经关着就什么都不做**（不重复 toast）。
      *
      * @param toastText 提示文案。手动关闭用默认的「Alive壁纸已关闭」；
-     *   换壁纸自动关闭传「检测到壁纸变化，Alive壁纸已自动关闭」；传 **null 表示静默**。
+     *   换壁纸自动关闭传「检测到壁纸变化，Alive壁纸已自动关闭」；
+     *   壁纸进程重启传「因壁纸进程重启，Alive壁纸已自动关闭」（2026-11-15）；
+     *   传 **null 表示静默**。
+     * @param restartProcess 关闭后要不要再排一刀 `killall miwallpaper`。正常关闭要（重建壁纸层、
+     *   清掉 `he-alive-*` 残留子层）；**壁纸进程刚重启过就不要**（那一刀是我方多余的第二次重启）。
      */
-    fun disable(ctx: Context, toastText: String? = "Alive壁纸已关闭") {
+    fun disable(
+        ctx: Context,
+        toastText: String? = "Alive壁纸已关闭",
+        restartProcess: Boolean = true,
+    ) {
         val app = ctx.applicationContext ?: ctx
         val prefs = MaskPrefs(app)
         if (prefs.aliveActiveId.isEmpty()) return
@@ -44,7 +52,7 @@ object AliveControl {
         prefs.setAliveActiveId(null)
         prefs.setAliveWallpaperFp("")
         AliveFlag.push(false, null, MaskPrefs.SPATIAL_SCOPE_GLOBAL)
-        restartWallpaperService()
+        if (restartProcess) restartWallpaperService()
         if (toastText != null) {
             if (Looper.myLooper() == null) {
                 Handler(Looper.getMainLooper()).post {
@@ -56,13 +64,13 @@ object AliveControl {
         }
     }
 
-    /** 后台重启 miwallpaper（强制重建壁纸层，连带销毁我们残留的子层）。 */
+    /**
+     * 后台重启 miwallpaper（强制重建壁纸层，连带销毁我们残留的子层）。
+     *
+     * 2026-11-15 起统一走 [WallpaperProc.scheduleKill]：它记住"将要落刀"的时刻，
+     * 让紧接着的「应用」先等重载完成再注入。
+     */
     fun restartWallpaperService(delayMs: Long = RESTART_DELAY_MS) {
-        Thread {
-            runCatching {
-                if (delayMs > 0L) Thread.sleep(delayMs)
-                RootShell.run("killall com.miui.miwallpaper")
-            }
-        }.apply { isDaemon = true }.start()
+        WallpaperProc.scheduleKill(delayMs)
     }
 }

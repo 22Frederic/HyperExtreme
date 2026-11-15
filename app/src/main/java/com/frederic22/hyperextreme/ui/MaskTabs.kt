@@ -68,7 +68,6 @@ import com.frederic22.hyperextreme.data.AodPackageName
 import com.frederic22.hyperextreme.data.MaskRole
 import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.data.MaskProvider
-import com.frederic22.hyperextreme.data.MiuiHomePackageName
 import com.frederic22.hyperextreme.data.MiuiWallpaperPackageName
 import com.frederic22.hyperextreme.data.RasterStore
 import com.frederic22.hyperextreme.data.SystemUiPackageName
@@ -277,14 +276,6 @@ internal fun FunctionHome(onOpen: (DetailPage) -> Unit) {
             packageName = SystemUiPackageName,
             title = "系统界面",
             onClick = { onOpen(DetailPage.SystemUi) },
-        )
-        // 「系统桌面」（2026-10-16）：与上面几张同构 —— 「多任务」页的入口。
-        // 触发信号由桌面自己发给 SystemUI，模块**不往桌面进程装载任何东西**；
-        // 生效逻辑（多任务出现 → 藏状态栏内容、退出还原）见 hook/RecentsStatusBar。
-        AppEntryCard(
-            packageName = MiuiHomePackageName,
-            title = "系统桌面",
-            onClick = { onOpen(DetailPage.Desktop) },
         )
     }
 }
@@ -1225,40 +1216,6 @@ private val ForceToneOptions = listOf("保持系统判定", "浅色", "深色")
  */
 private val ForceToneOptionsShortcut =
     listOf("保持系统判定", "浅色", "深色", "浅色（不透明）", "深色（不透明）")
-
-// ------------------------------------------------------------------ 系统桌面（二级）
-
-/**
- * 二级页「系统桌面」的内容 —— 「多任务」（2026-10-16 加）。
- *
- * 只有一张卡、一个开关；真正的逻辑全在 SystemUI 侧（`hook/RecentsStatusBar`）：
- * 桌面经 `LauncherProxyService` 把「多任务显示 / 隐藏」通知 SystemUI，那边按本开关
- * 设 / 清状态栏 disable 位（内容隐藏、下拉保留；滑入过渡瞬间的时机口径见该文件注释）。
- * 默认关（用户定的）—— 打开后进出一次多任务即可看到效果。
- */
-@Composable
-internal fun DesktopDetail(state: MaskUiState) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberPageScroll())
-            .padding(top = LocalTopBarHeight.current, bottom = 32.dp),
-    ) {
-        SmallTitle(text = "多任务与文件夹")
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp),
-            insideMargin = PaddingValues(0.dp),
-        ) {
-            SwitchRow(
-                title = "打开多任务和文件夹时隐藏状态栏",
-                checked = state.hideStatusBarInRecents,
-                onCheckedChange = { state.applyHideStatusBarInRecents(it) },
-            )
-        }
-    }
-}
 
 // ------------------------------------------------------------------ 关于
 

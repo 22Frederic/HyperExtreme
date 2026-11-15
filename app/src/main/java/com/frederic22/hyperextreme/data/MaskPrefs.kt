@@ -439,20 +439,6 @@ class MaskPrefs(context: Context) {
     }
 
     /**
-     * 「打开多任务和文件夹时隐藏状态栏」（2026-10-16 加，v1.3.0 起覆盖文件夹，**默认关**）。
-     *
-     * 打开后：多任务页 / 文件夹打开时隐藏状态栏"内容"（时钟 / 系统图标 / 通知图标），回到桌面或打开应用即还原；
-     * 下拉（通知面板）不受影响。消费方是 `com.android.systemui` 进程里的 `hook/RecentsStatusBar`
-     * （触发信号 = 桌面经 `LauncherProxyService` 通知的 overview shown / hidden）。
-     */
-    val hideStatusBarInRecents: Boolean
-        get() = prefs.getBoolean(KEY_HIDE_STATUSBAR_IN_RECENTS, false)
-
-    fun setHideStatusBarInRecents(value: Boolean) {
-        prefs.edit().putBoolean(KEY_HIDE_STATUSBAR_IN_RECENTS, value).commit()
-    }
-
-    /**
      * 「强制锁屏元素深浅模式」主开关（2026-10-11 加，**默认关**）。
      *
      * 打开后，下面 6 个锁屏元素的「深浅档」不再看系统判定，而是由各自的 `forceTone*` 值决定：
@@ -877,6 +863,17 @@ class MaskPrefs(context: Context) {
         prefs.registerOnSharedPreferenceChangeListener(listener)
     }
 
+    /**
+     * 注销 [registerListener] 注册的监听（2026-11-15）。
+     *
+     * [SharedPreferences] 内部只持弱引用，不注销也不会泄漏实例；但二级页进出频繁，
+     * 显式注销能让"关了页还收到回调"这件事在代码层面不可见 —— 免得以后有人误以为
+     * 回调还活着而在里面写状态。
+     */
+    fun unregisterListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) {
+        prefs.unregisterOnSharedPreferenceChangeListener(listener)
+    }
+
     companion object {
         const val NAME = "mask_swap"
 
@@ -1015,8 +1012,6 @@ class MaskPrefs(context: Context) {
         const val KEY_AUTO_SCREEN_FLASH = "auto_screen_flash"
         /** 「使自定义锁屏按钮显示在上层」—— 作用到 `com.android.systemui` 的开关之一。 */
         const val KEY_LOCKSCREEN_BUTTON_TOP = "lockscreen_button_on_top"
-        /** 「打开多任务时隐藏状态栏」—— 消费方是 SystemUI 进程里的 `RecentsStatusBar`（默认关）。 */
-        const val KEY_HIDE_STATUSBAR_IN_RECENTS = "hide_statusbar_in_recents"
         /** 「强制锁屏元素深浅模式」—— 主开关 + 7 个元素各自的档位（0=保持系统判定/1=浅色/2=深色）。 */
         const val KEY_FORCE_TONE_MODE = "force_tone_mode"
         const val KEY_FORCE_TONE_STATUS_BAR = "force_tone_status_bar"

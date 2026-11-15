@@ -37,7 +37,7 @@ HyperExtreme是一款LSPosed美化模块，支持空间壁纸、光栅壁纸、A
 
 本模块可能与其他修改相同作用域的LSPosed模块产生冲突，在使用模块出现问题时，请先排查模块冲突。
 
-**目前对HyperMusicCover进行了适配**
+**目前对HyperMusicCover已初步完成适配。**
 
 ## 开源代码许可
 

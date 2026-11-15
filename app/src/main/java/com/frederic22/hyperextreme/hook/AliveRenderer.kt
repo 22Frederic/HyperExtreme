@@ -116,6 +116,16 @@ internal object AliveRenderer {
     private const val FADE_MS = 380f
     private const val FADE_LATCH_MS = 800L
 
+    /**
+     * **探测窗口**（2026-11-15）：解锁后这段时间先只看「系统壁纸真值」有没有下降，不动 alpha。
+     *
+     * 这套 ROM 的 `UniversalEngine#h()` 在解锁路径上**不被调用**（`spatial_wp_alpha` 整段恒 1），
+     * 于是「跟随真值」退化成「自己按 380ms 时间驱动」⇒ 淡到 0 的过程就是把 alpha=1 的
+     * 系统锁屏壁纸**露出来**（用户报「桌面↔AOD 偶发跳系统壁纸」）。
+     * 真值不动 ⇒ 系统不淡 ⇒ 我们也不淡（保持 1，等系统切 leash）。
+     */
+    private const val PROBE_MS = 120L
+
     /** AOD→桌面（启航）：tr=2 球扩 1000ms + 20ms 余量再换层。 */
     private const val AOD_TO_DESK_SWITCH_MS = 1020L
 
@@ -176,6 +186,17 @@ internal object AliveRenderer {
 
     /** 音乐屏在显示 ⇒ 我们彻底让路（alpha 归零 + 停帧）。只在装了 MC 时可能为 true。 */
     private var musicYield = false
+
+    /**
+     * **MC 全屏封面：已让路（锁屏份 alpha=0），但渲染器没停**（v1.22.105 改）。
+     *
+     * 从前让路是 `stopInternal`（整条链关掉），代价是**解锁到桌面那一下没有桌面份**
+     * ⇒ 跳系统原壁纸（用户 2026-11-15：「全屏封面，锁屏进桌面时跳原壁纸，所以还是两个
+     * leash 都要画」）。现在改成只把**锁屏份**淡到 0、桌面份保持 1、渲染器继续跑：
+     * 锁屏上我们完全透明（露出 MC 的封面），解锁时 `crossFadeOnUnlock` 的预热/双画
+     * 仍然是活的 ⇒ 桌面份现成。
+     */
+    @Volatile private var musicYielded = false
 
     /** `Coexist` 的订阅只装一次（startInternal 每次都会跑）。 */
     private var musicListenerInstalled = false
@@ -651,13 +672,9 @@ internal object AliveRenderer {
             musicListenerInstalled = true
             Coexist.addListener { handler?.post { onMusicScreenChanged() } }
         }
-        // MC 封面在锁屏上时**根本不该启动**（`HookEntry` 的 tick 会拦住），
-        // 这里只是防御：真被拉起来了就立刻自己关掉。
-        if (Coexist.musicCoverOn) {
-            HookRuntime.log("$TAG 启动时 MC 封面已在锁屏上 ⇒ 立即关闭（等它退出再拉起）")
-            handler?.post { stopInternal("MC 全屏封面") }
-            return
-        }
+        // MC 封面在锁屏上时**照样启动**，只是以「让路态」上屏（v1.22.105）：
+        // 从前是直接 `stopInternal`，代价是解锁到桌面那一下没有桌面份 ⇒ 跳系统原壁纸。
+        // 现在锁屏份 alpha=0（锁屏上露出 MC 的封面）、桌面份保持 1，解锁时直接可用。
         AliveFlag.pushRendering(true)
         scheduleFrame()
         HookRuntime.log(
@@ -675,6 +692,13 @@ internal object AliveRenderer {
         currentAlpha = lockA
         deskAlpha = deskA
         applyAlphaBoth(lockA, deskA)
+        // 启动时 MC 已在全屏封面 ⇒ 直接以让路态上屏（v1.22.105）：
+        // 锁屏份 0（露出封面）、桌面份 1（解锁时用）。
+        if (Coexist.musicCoverOn) {
+            musicYielded = true
+            applyAlphaBoth(0f, 1f)
+            HookRuntime.log("$TAG 启动时 MC 封面已在锁屏上 ⇒ 以让路态启动（锁屏份 0 / 桌面份 1）")
+        }
         // **景深主体必须在启动后主动重算**（v1.22.101）：MC 让路那一下
         // `Coexist.musicCoverOn` 先翻 false、渲染器还没起来 ⇒ `SpatialForegroundHider.handle()`
         // 走「旧链」把 `keyguard_foreground_layer` 压成 INVISIBLE / 摘掉系统主体；
@@ -767,7 +791,9 @@ internal object AliveRenderer {
         }
         check(kept.isNotEmpty()) { "全部目标挂载失败（scope=$scope）" }
         // 记下这次挂到的 leash 签名，供事件驱动自检比对（2026-11-14）
-        attachedLeashSig = (leashes[true] ?: leashes[false])?.toString()
+        // ⚠️ 与 `probeLeashSig()` **同一口径**：去掉 `/@0x…`（identityHashCode），
+        // 否则这里记一次、探针算一次，两次的 Java 对象不同 ⇒ 恒不相等（v1.22.103）。
+        attachedLeashSig = (leashes[true] ?: leashes[false])?.toString()?.substringBefore("/@")
     }
 
     /**
@@ -1481,6 +1507,9 @@ internal object AliveRenderer {
             runCatching { prewarmDesktop() }
             val started = SystemClock.elapsedRealtime()
             var lastA = currentAlpha
+            // **系统到底会不会自己淡？**（2026-11-15，见 [PROBE_MS]）
+            var fadeDecided = false
+            var systemFades = false
             val r = object : Runnable {
                 override fun run() {
                     val scs = lockScs()
@@ -1489,8 +1518,44 @@ internal object AliveRenderer {
                         return
                     }
                     val elapsed = SystemClock.elapsedRealtime() - started
-                    val timeBased = (1f - elapsed.toFloat() / FADE_MS).coerceIn(0f, 1f)
                     val ext = readSystemWallpaperAlpha()?.takeIf { it > 0.02f && it < 0.999f }
+                    // ── ① 探测窗口：只看真值，**不动 alpha** ───────────────────────────
+                    if (!fadeDecided) {
+                        if (ext != null) {
+                            fadeDecided = true
+                            systemFades = true
+                        } else if (elapsed >= PROBE_MS) {
+                            fadeDecided = true
+                            systemFades = false
+                        }
+                        h.postDelayed(this, 16)
+                        return
+                    }
+                    // ── ② 系统不淡 ⇒ 我们也不淡（alpha 保持 1，等系统切 leash） ─────────
+                    if (!systemFades) {
+                        val fading = SpatialUnlockFade.isFadingAway()
+                        // 主判据 = 系统锁屏态（同空间那条：`isFadingAway()` 依赖
+                        // `notifyKeyguardState` 的实例引用，重启后可能恒 null）
+                        val unlocked = elapsed >= 300L && queryKeyguardLocked() == false
+                        val switched = fading == false || unlocked || elapsed >= FADE_MS + 600L
+                        if (switched) {
+                            HookRuntime.log(
+                                "$TAG 解锁淡出 取消（${PROBE_MS}ms 内系统壁纸 alpha 未下降 ⇒ " +
+                                    "系统自己不淡），改硬切：实测 ${elapsed}ms",
+                            )
+                            fadeTick = null
+                            fadeDoneAt = SystemClock.elapsedRealtime()
+                            // 用系统锁屏态校正（滑一半又滑回去时 `fadingAway` 也会落 false）
+                            val locked = queryKeyguardLocked()
+                            showingDesktop = locked?.let { !it } ?: true
+                            deskShown = showingDesktop
+                            if (screenOn()) forceDraw()
+                        } else {
+                            h.postDelayed(this, 16)
+                        }
+                        return
+                    }
+                    val timeBased = (1f - elapsed.toFloat() / FADE_MS).coerceIn(0f, 1f)
                     val a = if (ext != null) minOf(lastA, ext) else minOf(lastA, timeBased)
                     lastA = a
                     applyAlpha(scs, a)
@@ -1852,8 +1917,22 @@ internal object AliveRenderer {
      * ⚠️ 只压锁屏份（2026-11-14）：MC 换的是**锁屏**壁纸纹理（它 hook 的是壁纸进程的
      * keyguard renderer），桌面份那条 leash 上不是封面 ⇒ 压了只会让桌面上的 Alive 白消失。
      */
-    private fun effectiveAlpha(a: Float, lockGroup: Boolean): Float =
-        if (lockGroup && musicYield) 0f else a
+    /**
+     * **MC 让路的统一门**（v1.22.108 复活，取代 v1.22.97 那个恒压 0 的 `musicYield` 版本）。
+     *
+     * 让路期间**任何**抬锁屏份的路径都会被压回去 —— 不用逐个转场加判断：
+     * * `enterAodInternal` 的 `applyAlphaBoth(1f, 1f)`（锁屏直接进 AOD + AOD 恰好进封面时，
+     *   它和 `fadeBothTo(0f,1f)` 抢同一个主线程队列，后跑就把封面盖住 —— 用户 2026-11-15 报的
+     *   「有概率不触发避让」）；
+     * * `onExitAod` 的 `applyAlpha(lockScs(), 1f)`、`resetAlpha()`、`crossFadeOnUnlock` 的抬 alpha。
+     *
+     * ⚠️ **只拦"抬"不拦"降"**（`minOf(a, currentAlpha)`）：让路自己的淡出是递减的，必须放行；
+     * 恒压 0 的写法会让淡出第一帧就跳到 0（没有过渡）。
+     */
+    private fun effectiveAlpha(a: Float, lockGroup: Boolean): Float {
+        if (!lockGroup || !musicYielded) return a
+        return kotlin.math.min(a, currentAlpha)
+    }
 
     /**
      * MC 进入 / 退出全屏封面（[Coexist] 通过 `dispatchChanged` 通知）。
@@ -1877,31 +1956,44 @@ internal object AliveRenderer {
         handler?.post {
             if (runningKey == null) return@post
             if (musicFadeTick != null) return@post
-            HookRuntime.log("$TAG MC 全屏封面 → ${MUSIC_FADE_MS}ms 淡出后关闭（退出封面再拉起）")
-            fadeBothTo(0f, 0f) {
-                if (Coexist.musicCoverOn) {
-                    stopInternal("MC 全屏封面")
-                } else {
-                    // 淡出期间封面撤了：淡回来，别停
-                    fadeBothTo(if (showingDesktop) 0f else 1f, if (showingDesktop) 1f else 0f, null)
-                }
-            }
+            if (musicYielded) return@post
+            musicYielded = true
+            HookRuntime.log(
+                "$TAG MC 全屏封面 → ${MUSIC_FADE_MS}ms 淡掉锁屏份" +
+                    "（渲染器不停，桌面份保留 1.0）",
+            )
+            // 锁屏份 0、**桌面份 1**：让路期间桌面 leash 不可见，但「锁屏 → 桌面」那一下
+            // 要靠它，否则会跳系统原壁纸。
+            fadeBothTo(0f, 1f, null)
         }
+    }
+
+    /** 退出封面：锁屏份淡回（渲染器一直在跑，不需要重建）。 */
+    fun resumeFromMusic() {
+        if (!musicYielded) return
+        musicYielded = false
+        HookRuntime.log("$TAG MC 封面已撤 → 锁屏份淡回 1.0")
+        fadeBothTo(if (showingDesktop) 0f else 1f, if (showingDesktop) 1f else 0f, null)
     }
 
     private fun onMusicScreenChanged() {
         if (!Coexist.musicCoverOn) {
-            // 退出封面：若正在淡出，立刻取消（不要在半透明时还去 stop）
+            // 退出封面：取消可能还在跑的淡出，然后淡回来
             musicFadeTick?.let { handler?.removeCallbacks(it) }
             musicFadeTick = null
+            resumeFromMusic()
             return
         }
         fadeOutAndStop()
     }
 
     private fun applyAlphaBoth(lockA: Float, deskA: Float) {
-        currentAlpha = lockA
-        deskAlpha = deskA
+        // ⚠️ 先过门再记录：`currentAlpha` / `deskAlpha` 必须是**实际值**，
+        // 否则 `fadeBothTo` 的起点会用逻辑值（让路时是 1）⇒ 恢复时从 1 淡到 1，锁屏份不淡入。
+        val la = effectiveAlpha(lockA, lockGroup = true)
+        val da = effectiveAlpha(deskA, lockGroup = false)
+        currentAlpha = la
+        deskAlpha = da
         dirty = true
         val l = lockScs()
         val d = deskScs()
@@ -1914,8 +2006,6 @@ internal object AliveRenderer {
             val setAlpha = txClass.getMethod(
                 "setAlpha", android.view.SurfaceControl::class.java, Float::class.javaPrimitiveType,
             )
-            val la = effectiveAlpha(lockA, lockGroup = true)
-            val da = effectiveAlpha(deskA, lockGroup = false)
             for (sc in l) runCatching { setAlpha.invoke(tx, sc, la) }
             for (sc in d) runCatching { setAlpha.invoke(tx, sc, da) }
             txClass.getMethod("apply").invoke(tx)
@@ -1928,7 +2018,9 @@ internal object AliveRenderer {
         // 于是 `aodMirrorOff` 收起桌面份那一下把「锁屏份 alpha」写成了 0
         // （日志实证 `AOD诊断[稳态] alpha=0.0`），后续任何以它当起点的淡出都从 0 起算。
         val lockGroup = scs.isEmpty() || scs.any { sc -> mounts.any { it.locked && it.sc === sc } }
-        if (lockGroup) currentAlpha = a else deskAlpha = a
+        // 先过让路门，再记录（记录的必须是实际值）
+        val out = effectiveAlpha(a, lockGroup)
+        if (lockGroup) currentAlpha = out else deskAlpha = out
         dirty = true
         if (scs.isEmpty()) return
         runCatching {
@@ -1939,7 +2031,6 @@ internal object AliveRenderer {
             val setAlpha = txClass.getMethod(
                 "setAlpha", android.view.SurfaceControl::class.java, Float::class.javaPrimitiveType,
             )
-            val out = effectiveAlpha(a, lockGroup)
             for (sc in scs) runCatching { setAlpha.invoke(tx, sc, out) }
             txClass.getMethod("apply").invoke(tx)
         }
@@ -2883,7 +2974,13 @@ internal object AliveRenderer {
             Boolean::class.javaPrimitiveType,
         )
         val token = gw.invoke(inst, 0, true) ?: gw.invoke(inst, 0, false) ?: return null
-        token.javaClass.getMethod("getLeash").invoke(token)?.toString()
+        // ⚠️ **必须去掉 `/@0x…`**（v1.22.103）：`SurfaceControl.toString()` 会追加
+        // `"/@" + identityHashCode(this)`，而每次反射都拿到**新的 Java wrapper 对象**
+        // ⇒ 两次 toString 必然不同 ⇒ 签名永远对不上 ⇒ 每个事件点（亮屏 / 解锁 / 出 AOD /
+        // 回前台 / 60s 兜底）都误判「壁纸层已变化」并重挂。重挂那一瞬我们的层脱离父层，
+        // SurfaceFlinger 重合成 1~2 帧 ⇒ 露出**系统壁纸**（用户 2026-11-14 报的「偶发漏壁纸」）。
+        // 保留 `Surface(name=… #60448)` 这一段：系统真的重建壁纸层时层号会变，检测能力不变。
+        token.javaClass.getMethod("getLeash").invoke(token)?.toString()?.substringBefore("/@")
     }.getOrNull()
 
     /**
@@ -3003,6 +3100,7 @@ internal object AliveRenderer {
         stopProcessWatch()
         attachedLeashSig = null
         musicYield = false
+        musicYielded = false
         musicFadeTick?.let { handler?.removeCallbacks(it) }
         musicFadeTick = null
         framePosted = false

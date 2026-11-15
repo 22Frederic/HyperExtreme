@@ -53,6 +53,9 @@ internal object AliveScrim {
                         val st = readState(chain.getThisObject()) ?: return r
                         if (st != last) {
                             last = st
+                            // MC 共存要用它判「现在是不是桌面态」（v1.22.104）：
+                            // `sCoverMode` 在解锁后仍是 true，桌面态必须**不让路**。
+                            runCatching { Coexist.noteScrim(st) }
                             runCatching { AliveRenderer.onScrimState(st) }
                         }
                         return r

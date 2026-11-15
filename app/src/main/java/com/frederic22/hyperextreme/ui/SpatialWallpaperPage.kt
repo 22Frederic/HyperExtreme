@@ -1,7 +1,10 @@
 package com.frederic22.hyperextreme.ui
 
+import android.content.SharedPreferences
 import android.graphics.RectF
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -36,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.frederic22.hyperextreme.data.MaskPrefs
+import com.frederic22.hyperextreme.data.WallpaperProc
 import com.frederic22.hyperextreme.hook.SpatialGlCore
 import com.frederic22.hyperextreme.data.SpatialControl
 import com.frederic22.hyperextreme.data.RunLog
@@ -133,6 +137,22 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     // **正在生效**的键（LSPosed 链）。服务模式的"在渲染哪张"在 target 文件里，单独记。
     var activeKey by remember { mutableStateOf(prefs.spatialKey) }
     var serviceTargetKey by remember { mutableStateOf(SpatialServiceTarget.readKey(ctx).orEmpty()) }
+
+    // **外部关闭的回灌**（2026-11-15）：换壁纸 / 关 AOD / 壁纸进程重启都会在**本进程的
+    // 另一条路径**里清掉 `spatial_active` + `spatial_key`，页面收不到 ⇒ 卡片一直显示「已应用」、
+    // 按钮还是「取消应用」，必须退出重进才刷新。监听 prefs 把本地状态跟上去。
+    val uiHandler = remember { Handler(Looper.getMainLooper()) }
+    DisposableEffect(Unit) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            // `setSpatialActive` 一次 commit 两个键（active + key），监听 key 这一个就够。
+            if (key == MaskPrefs.KEY_SPATIAL_KEY) {
+                val next = prefs.spatialKey
+                uiHandler.post { if (activeKey != next) activeKey = next }
+            }
+        }
+        prefs.registerListener(listener)
+        onDispose { prefs.unregisterListener(listener) }
+    }
 
     /** 当前**居中选中**的候选；null = 新建卡居中（没有选中任何图）。 */
     val selected = candidates.getOrNull(focused - 1)
@@ -244,12 +264,14 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     }
 
     /**
-     * 开启空间壁纸（同步）。
+     * 开启空间壁纸 —— **真正的注入**。
      *
      * **关闭不再走这里**：统一交给 [SpatialControl.disable]（改 prefs → 推属性 → toast →
      * 重启 miwallpaper），因为视差页的「功能冲突提醒」也要用同一套关闭动作。
+     *
+     * 入口请走 [enableSpatial]（它先过一道「壁纸进程可注入」的闸门）。
      */
-    fun enableSpatial(key: String) {
+    fun enableSpatialNow(key: String) {
         prefs.setSpatialActive(key)
         activeKey = key
         // 应用即置顶，但**只写顺序、不动当前列表**（2026-11-05 用户明确）：
@@ -308,6 +330,17 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                 if (version.usable) prefs.setSpatialWallpaperFp(version.value)
             }
         }.apply { isDaemon = true }.start()
+    }
+
+    /**
+     * 「应用」的入口（2026-11-15）：先确认壁纸进程处于**可注入**状态。
+     *
+     * 关闭空间壁纸会在 400ms 后杀一次 miwallpaper（重建壁纸层、清残留），这期间推属性等于让
+     * 新层刚 `reparent` 上去就被父 leash 一起销毁 —— 空间渲染器**没有** leash 自检，
+     * 不会自愈。所以：能直接注就同步注（点按零延迟），要等就提示后等，等完再注。
+     */
+    fun enableSpatial(key: String) {
+        WallpaperProc.applyWhenReady(ctx) { enableSpatialNow(key) }
     }
 
     /** 真正干活：深度 →（紧接着）生成层图。分层失败**不阻断**深度结果。 */

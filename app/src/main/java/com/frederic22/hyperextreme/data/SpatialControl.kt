@@ -37,12 +37,20 @@ object SpatialControl {
      *
      * @param toastText 提示文案。手动关闭用默认的「空间壁纸已关闭」；
      *   换壁纸自动关闭传「检测到壁纸变化，空间壁纸已自动关闭」（2026-10-29）；
+     *   壁纸进程重启传「因壁纸进程重启，空间壁纸已自动关闭」（2026-11-15）；
      *   传 **null 表示静默不弹** —— 「清除所有深度缓存」会紧接着弹「已清除 N 项深度缓存」，
      *   两条 LENGTH_LONG 叠在一起要排队播好几秒（2026-10-31 收口时加的）。
+     * @param restartProcess 关闭后要不要再排一刀 `killall miwallpaper`。正常关闭要（重建壁纸层、
+     *   清掉我们残留的子层）；**壁纸进程刚重启过就不要**（再杀一刀纯属多余，还会把紧随其后的
+     *   「应用」推进重载窗口）。
      *
      * 调用方负责同步自己的界面状态（页面里的 `activeKey`）。
      */
-    fun disable(ctx: Context, toastText: String? = "空间壁纸已关闭") {
+    fun disable(
+        ctx: Context,
+        toastText: String? = "空间壁纸已关闭",
+        restartProcess: Boolean = true,
+    ) {
         val app = ctx.applicationContext ?: ctx
         val prefs = MaskPrefs(app)
         if (!prefs.spatialActive) return
@@ -55,7 +63,7 @@ object SpatialControl {
         prefs.setSpatialWallpaperFp("")
         // SystemUI 侧读的是系统属性，prefs 通道在那里不可用。
         SpatialFlag.push(false, null, prefs.spatialScope, prefs.spatialLockDepth)
-        restartWallpaperService()
+        if (restartProcess) restartWallpaperService()
         // Toast 需要 Looper：binder 线程直接弹会抛
         // "Can't create handler inside thread that has not called Looper.prepare()"。
         // toastText == null ⇒ 完全不弹（调用方自己会弹一条）。
@@ -70,13 +78,13 @@ object SpatialControl {
         }
     }
 
-    /** 后台重启 miwallpaper（强制重建壁纸层）。 */
+    /**
+     * 后台重启 miwallpaper（强制重建壁纸层）。
+     *
+     * 2026-11-15 起统一走 [WallpaperProc.scheduleKill] —— 它会把这个"将要落刀"的时刻记下来，
+     * 让紧接着的「应用」先等重载完成再注入（否则新层会被这一刀连父层一起带走）。
+     */
     fun restartWallpaperService(delayMs: Long = RESTART_DELAY_MS) {
-        Thread {
-            runCatching {
-                if (delayMs > 0L) Thread.sleep(delayMs)
-                RootShell.run("killall com.miui.miwallpaper")
-            }
-        }.apply { isDaemon = true }.start()
+        WallpaperProc.scheduleKill(delayMs)
     }
 }

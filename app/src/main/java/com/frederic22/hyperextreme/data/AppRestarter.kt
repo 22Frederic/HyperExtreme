@@ -10,11 +10,10 @@ const val AodPackageName = "com.miui.aod"
 const val SystemUiPackageName = "com.android.systemui"
 
 /**
- * 系统桌面 —— 「打开多任务和文件夹时隐藏状态栏」的触发源。
+ * 系统桌面 —— 模块**不再往这个进程装载任何东西**（2026-11-15 起：原先的
+ * 「多任务隐藏状态栏」整条链已删除，桌面 scope 与 native 桥一并撤掉）。
  *
- * 模块**不往这个进程装载任何东西**（触发信号由桌面自己经 binder 发给 SystemUI，生效动作在
- * SystemUI 侧，见 `hook/RecentsStatusBar`）；它出现在重启列表里 = "重启桌面进程本身"
- * （多任务状态/桌面上出怪状时的恢复手段）。
+ * 它出现在重启列表里 = "重启桌面进程本身"（多任务状态 / 桌面上出怪状时的恢复手段）。
  */
 const val MiuiHomePackageName = "com.miui.home"
 
@@ -74,8 +73,17 @@ object AppRestarter {
      */
     data class Result(val ok: Boolean, val reason: String? = null)
 
-    fun restart(context: Context, target: String): Result =
-        if (RootShell.isAvailable()) restartWithRoot(target) else restartWithoutRoot(context, target)
+    fun restart(context: Context, target: String): Result {
+        val result = if (RootShell.isAvailable()) {
+            restartWithRoot(target)
+        } else {
+            restartWithoutRoot(context, target)
+        }
+        // 「重启壁纸」也是**壁纸进程重启**的一种（用户在顶栏刷新里手动杀）⇒ 登记一下，
+        // 让紧随其后的「应用」先等重载完成再注入（2026-11-15，见 [WallpaperProc]）。
+        if (result.ok && target == MiuiWallpaperPackageName) WallpaperProc.noteKill()
+        return result
+    }
 
     /**
      * 用 **`kill -15`**，不用 `am force-stop`。

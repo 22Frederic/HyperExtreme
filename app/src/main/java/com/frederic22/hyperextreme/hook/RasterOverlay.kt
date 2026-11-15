@@ -464,7 +464,11 @@ internal object RasterOverlay {
 
     private fun attach(host: ViewGroup, key: String) {
         val cur = view
-        if (cur != null && cur.parent === host && installedKey == key) return
+        if (cur != null && cur.parent === host && installedKey == key) {
+            // 让路时只设了 GONE（位图保留），这里原样抬回来即可（v1.22.108）
+            if (cur.visibility != View.VISIBLE) cur.visibility = View.VISIBLE
+            return
+        }
         detach()
 
         val v = SubjectView(host.context)
@@ -502,14 +506,29 @@ internal object RasterOverlay {
     }
 
     /** 清场：移掉我们的 View + **把系统主体插回去**（幂等）。 */
-    fun onDisabled() {
+    fun onDisabled() = onDisabled(keepBitmaps = false)
+
+    /**
+     * @param keepBitmaps **MC 让路专用**（v1.22.108）：只把 View 设 `GONE`、**不移除也不释放位图**。
+     *
+     * 从前让路走的是 `detach()`，里面 `releaseBitmaps()` 会把已解码的主体位图扔掉；
+     * 退出封面重新 `attach()` 时 `ensureBitmaps()` 又要读盘 + decode 一张 1200×2670
+     * ⇒ 壁纸先回来、人像慢半拍（用户 2026-11-15：「光栅恢复比空间 / Alive 要慢一点」）。
+     * 让路是高频短时事件，留着一张位图（≈几 MB）比每次重解码划算。
+     */
+    fun onDisabled(keepBitmaps: Boolean) {
         if (view == null && installedKey.isEmpty() && systemSubject == null) return
-        if (Looper.myLooper() == Looper.getMainLooper()) disabledOnMain()
-        else mainHandler.post { runCatching { disabledOnMain() } }
+        if (Looper.myLooper() == Looper.getMainLooper()) disabledOnMain(keepBitmaps)
+        else mainHandler.post { runCatching { disabledOnMain(keepBitmaps) } }
     }
 
-    private fun disabledOnMain() {
-        runCatching { detach() }
+    private fun disabledOnMain(keepBitmaps: Boolean) {
+        if (keepBitmaps) {
+            // 只藏起来：View / installedKey / 位图全部保留，恢复时 attach() 会原样抬回来
+            view?.let { if (it.visibility != View.GONE) it.visibility = View.GONE }
+        } else {
+            runCatching { detach() }
+        }
         runCatching { restoreSystemSubject() }
     }
 

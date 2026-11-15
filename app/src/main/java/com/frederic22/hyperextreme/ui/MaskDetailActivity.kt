@@ -287,7 +287,6 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                 DetailPage.RasterWallpaper -> "光栅壁纸"
                 DetailPage.AliveWallpaper -> "Alive壁纸"
                 DetailPage.SystemUi -> "系统界面"
-                DetailPage.Desktop -> "系统桌面"
             },
             onBack = onClose,
             onRestartAod = { askRestartAod = true },
@@ -302,7 +301,6 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                 // 「Alive壁纸」（2026-11-07）：照片透镜「启航」，三态（AOD / 锁屏 / 桌面）。
                 DetailPage.AliveWallpaper -> AliveWallpaperDetail(state)
                 DetailPage.SystemUi -> SystemUiDetail(state)
-                DetailPage.Desktop -> DesktopDetail(state)
             }
         }
     }

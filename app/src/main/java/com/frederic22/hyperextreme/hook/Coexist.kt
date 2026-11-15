@@ -52,8 +52,9 @@ import java.util.concurrent.CopyOnWriteArrayList
  * * **主信号 = hook `enterCoverMode` / `exitCoverMode`**（0 延迟）：这两个方法在发行版里
  *   没被 R8 改名（dexdump 核过），`proceed()` 之后重新 `apply(rawCoverOn())` 即可。
  * * 轮询 300ms **降级为兜底**（hook 装不上 / MC 升级改名时）：只在装了 MC 时启动。
- * * 退出延后 [LEAVE_DELAY_MS] = 120ms：原先 450ms 是「等 MC 的封面淡出（~400ms）」，
- *   但我们自己的渲染器从 `start()` 到首帧上屏本身 370~420ms，**天然盖住** ⇒ 450 是重复等待。
+ * * **退出不延后**（v1.22.106）：450（v1.22.97「等 MC 淡出」）→ 120（v1.22.102，靠渲染器
+ *   启动 370~420ms 盖住）→ **0**（v1.22.105 让路不再停渲染器，启动耗时没了 ⇒ 120 是纯延迟）。
+ *   只保留一跳 `handler.post`，避免和 MC 自己的 `exitCoverMode` 同帧。
  * * `setState()` 里 `notifyAll` 唤醒三条链的 tick 线程（它们用 `wait` 而非 `sleep`）。
  * * **AOD 也让**（2026-11-14 真机改判）：起初按「AOD 的 `AODView` 黑底盖着、我们的层看不见」
  *   写成不让路，实测不成立 —— v1.22.80 起 AOD 的 `AODView` 背景被我们置空（为了透出壁纸），
@@ -94,15 +95,6 @@ internal object Coexist {
 
     private const val POLL_MS = 300L
 
-    /**
-     * 退出封面后**等多久才真正恢复**。
-     *
-     * 2026-11-14 从 450ms 压到 120ms：这段原本是「等 MC 的封面淡出走完」（~400ms），
-     * 但我们自己的渲染器从 `start()` 到首帧上屏本身就要 370~420ms（建 EGL + 首帧 + 上传纹理），
-     * 天然盖住淡出 ⇒ 450 是**重复等待**，真机上表现为「退出好一会才回来」。
-     */
-    private const val LEAVE_DELAY_MS = 120L
-
     private var started = false
     private var tries = 0
     private val handler by lazy { Handler(Looper.getMainLooper()) }
@@ -119,6 +111,37 @@ internal object Coexist {
 
     /** 广播兜底：最后一次 `op=art` 的结果；null = 还没收到过。 */
     @Volatile private var artOnFromBroadcast: Boolean? = null
+
+    /**
+     * **锁屏是否还在前台**（v1.22.104）。
+     *
+     * 为什么需要：MC 的封面是**锁屏壁纸纹理**，而它的 `sCoverMode` 在**解锁到桌面后仍然是 true**
+     * —— MC 只有三个出口（`toggle-out` 手动退出 / 关封面功能总开关 / 媒体会话全空），
+     * **没有"解锁"**。我们照 `sCoverMode` 让路的话，桌面就永远不恢复（用户 2026-11-15 真机：
+     * 「在 MC 全屏封面下直接进桌面，桌面不恢复」，日志里 `RASTER 轮询 active=true last=null`
+     * 一直卡在让路分支，3.5 分钟没再启动过）。
+     *
+     * 默认 `true`（宁可让路）：`updateScrims` 还没上报 / hook 没装上时保持 v1.22.103 的行为。
+     */
+    @Volatile private var keyguardVisible = true
+
+    /**
+     * 由 `AliveScrim` 的 `ScrimController#updateScrims` hook 调 —— 那是 AOD / 锁屏 / 解锁的
+     * **唯一权威**（`doWallpaperBlackAnim` 太早，分不出回锁屏还是进桌面，见《02》§3.15）。
+     *
+     * 只把 `UNLOCKED` / `UNLOCKED_SHADE` 认作桌面；其余（`KEYGUARD` / `SHADE_LOCKED` /
+     * `BOUNCER` / `AOD` / `DOZING` / 认不出的新枚举）**一律按锁屏**处理 ——
+     * 宁可多让一次，也不能盖住 MC 的封面。
+     */
+    fun noteScrim(state: String) {
+        val next = !(state == "UNLOCKED" || state == "UNLOCKED_SHADE")
+        if (next == keyguardVisible) return
+        keyguardVisible = next
+        HookRuntime.log(
+            "MUSIC_COVER scrim=$state ⇒ " + (if (next) "锁屏态（可让路）" else "桌面态（不让路）"),
+        )
+        handler.post { runCatching { apply(rawCoverOn()) } }
+    }
 
     private var warnedNoClass = false
 
@@ -293,6 +316,8 @@ internal object Coexist {
 
     /** 真的"封面盖在锁屏上"吗；null = 两条判据都读不到。 */
     private fun rawCoverOn(): Boolean? {
+        // **桌面态不让路**（v1.22.104）：MC 的封面只在锁屏，`sCoverMode` 解锁后仍是 true。
+        if (!keyguardVisible) return false
         val f = fCoverMode
         val m = mKeepsWallpaper
         if (f != null && m != null) {
@@ -318,7 +343,10 @@ internal object Coexist {
             if (rawCoverOn() != true) setState(false)
         }
         offRun = r
-        handler.postDelayed(r, LEAVE_DELAY_MS)
+        // **不再延后**（2026-11-15 用户定：「视觉效果很好，这个常量不用留了」）。
+        // 保留这一跳 `post` 而不是直接调 `setState`：让「状态翻转 → 三条链恢复」
+        // 不和 MC 自己的 `exitCoverMode` 落在同一帧里。
+        handler.post(r)
     }
 
     private fun setState(on: Boolean) {

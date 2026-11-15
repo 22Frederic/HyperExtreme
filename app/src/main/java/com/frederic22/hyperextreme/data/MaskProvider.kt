@@ -174,9 +174,6 @@ class MaskProvider : ContentProvider() {
                 putBoolean(KEY_PROTECTING, prefs.protecting)
                 // 给 com.android.systemui 侧读的开关（它只在锁屏长按菜单出现时才读一次）。
                 putBoolean(KEY_LOCKSCREEN_BUTTON_TOP, prefs.lockScreenButtonOnTop)
-                // 「打开多任务时隐藏状态栏」（2026-10-16）—— 消费方：SystemUI 侧的 RecentsStatusBar
-                //（每次「进入多任务」事件时现读一次，无缓存）。
-                putBoolean(KEY_HIDE_STATUSBAR_IN_RECENTS, prefs.hideStatusBarInRecents)
                 // 「视差壁纸效果」开启状态 —— 消费方：SystemUI 侧的 ParallaxBg（自愈时按它决定插不插背景层）。
                 putBoolean(KEY_PARALLAX_ACTIVE, prefs.parallaxBgActive)
                 // 「视差壁纸效果 → 参数调整」（2026-10-13）：5 个参数 —— 消费方同样是 ParallaxBg
@@ -431,6 +428,32 @@ class MaskProvider : ContentProvider() {
                 Bundle.EMPTY
             }
 
+            // **壁纸进程重启 → 无条件关闭当前那条链**（2026-11-15，用户要求）。
+            //
+            // 为什么必须关：我们的层是壁纸 leash 的子层，进程一重启父层连同子层一起销毁，
+            // 而空间 / 光栅的渲染器**没有** leash 自检 ⇒ 属性还是 active=1、进程还在跑，
+            // 屏幕上却什么都没有（真机日志：13:37:04 挂载 → 13:37:18 进程重启 → 之后再无挂载）。
+            //
+            // 三条链互斥，`disable` 内部都有「已经关着就什么都不做（不重复 toast）」的早退
+            // ⇒ 只有真正在跑的那一条会执行 + 弹「因壁纸进程重启，XX已自动关闭」。
+            //
+            // ⚠️ `restartProcess = false`：进程**刚刚**重启过，再排一刀 killall 是多余动作，
+            // 还会把用户紧接着的「应用」推进重载窗口（见 [WallpaperProc]）。
+            METHOD_WALLPAPER_RESTART -> {
+                SpatialControl.disable(
+                    appContext,
+                    "因壁纸进程重启，空间壁纸已自动关闭",
+                    restartProcess = false,
+                )
+                RasterControl.disable(appContext, "因壁纸进程重启，光栅壁纸已自动关闭")
+                AliveControl.disable(
+                    appContext,
+                    "因壁纸进程重启，Alive壁纸已自动关闭",
+                    restartProcess = false,
+                )
+                Bundle.EMPTY
+            }
+
             // 「壁纸改变后自动关闭替换」：hook 侧检测到换壁纸后来这儿收尾 ——
             // 双重检查（开关还开着、视差还在生效）后置状态 + 清基准 + 生成指令号；
             // **广播由 hook 侧拿到 token 后自行发出**（写状态在前、发广播在后，与 App 的
@@ -543,6 +566,14 @@ class MaskProvider : ContentProvider() {
         const val METHOD_ALIVE_AUTO_OFF = "alive_auto_off"
         const val METHOD_ALIVE_FP = "alive_fp"
 
+        /**
+         * **壁纸进程重启 → 无条件关闭当前在用的那条链**（2026-11-15）。
+         *
+         * 发起方 = SystemUI 的 `WallpaperProcWatch`（它读 miwallpaper 进程写的
+         * `debug.hyperextreme.wp_pid`，一变就调这里）。arg = 新 pid，只用于日志。
+         */
+        const val METHOD_WALLPAPER_RESTART = "wallpaper_restart"
+
         /** [METHOD_PARALLAX_AUTO_OFF] 回执 bundle 里的指令号键（与广播 extra 同名，hook 拿到后发广播用）。 */
         const val KEY_PARALLAX_TOKEN = "token"
 
@@ -564,8 +595,6 @@ class MaskProvider : ContentProvider() {
         /** 「使自定义锁屏按钮显示在上层」—— 消费方是 SystemUI 进程里的 `LockScreenButton`。 */
         const val KEY_LOCKSCREEN_BUTTON_TOP = "lockscreen_button_on_top"
 
-        /** 「打开多任务时隐藏状态栏」—— 消费方是 SystemUI 进程里的 `RecentsStatusBar`（默认关）。 */
-        const val KEY_HIDE_STATUSBAR_IN_RECENTS = "hide_statusbar_in_recents"
         /** 「视差壁纸效果」开启状态 —— 消费方是 SystemUI 进程里的 `ParallaxBg`（自愈时读它）。 */
         const val KEY_PARALLAX_ACTIVE = "parallax_bg_active"
 

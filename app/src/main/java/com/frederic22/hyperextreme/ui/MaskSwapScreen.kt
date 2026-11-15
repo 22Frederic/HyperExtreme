@@ -129,9 +129,9 @@ private const val BottomFadeAlpha = 0.85f
  * 一级功能页各张卡片通向的**二级页**。
  *
  * 二级页是**盖住底栏**的全屏页（用户指定），所以它们不占 [Tab] 的位置。
- * 见 [FunctionHome] / [MaskReplaceDetail] / [SystemUiDetail] / [DesktopDetail]。
+ * 见 [FunctionHome] / [MaskReplaceDetail] / [SystemUiDetail]。
  */
-internal enum class DetailPage { MaskReplace, ParallaxBg, SpatialWallpaper, RasterWallpaper, AliveWallpaper, SystemUi, Desktop }
+internal enum class DetailPage { MaskReplace, ParallaxBg, SpatialWallpaper, RasterWallpaper, AliveWallpaper, SystemUi }
 
 // 二级页（[DetailPage]）的转场**不归本文件管**：它现在是独立 Activity（[MaskDetailActivity]），
 // 转场由**系统的 Activity 动画**负责 —— 为什么必须如此、以及为什么不在这里复刻，见那个类的注释。
@@ -851,7 +851,7 @@ internal fun BigStatusCard(
                     Column {
                         Text(text = statusText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(1.dp))
-                        // `versionName` 是 "1.0 Beta3"（不带 v），界面统一拼一个 "v" 显示。
+                        // `versionName` 是 "1.0 Beta4"（不带 v），界面统一拼一个 "v" 显示。
                         Text(text = "v$version", fontSize = 15.sp)
                     }
                 }

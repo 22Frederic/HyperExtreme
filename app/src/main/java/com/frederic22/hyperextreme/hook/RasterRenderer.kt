@@ -336,6 +336,16 @@ internal object RasterRenderer {
 
     private const val FADE_MS = 380f
 
+    /**
+     * **探测窗口**（2026-11-15）：解锁后这段时间先只看「系统壁纸真值」有没有下降，不动 alpha。
+     *
+     * 这套 ROM 的 `UniversalEngine#h()` 在解锁路径上**不被调用**（`spatial_wp_alpha` 整段恒 1），
+     * 于是「跟随真值」退化成「自己按 380ms 时间驱动」，而我们淡到 0 的过程就是把
+     * alpha=1 的系统锁屏壁纸**露出来**（用户报「解锁时闪一下锁屏壁纸」）。
+     * 真值不动 ⇒ 系统不淡 ⇒ 我们也不淡（保持 1，等系统切 leash，桌面份已是同一张图）。
+     */
+    private const val PROBE_MS = 120L
+
     /** 预取缓存最多留几张（2026-11-13：与 ±2 的预取半径配套，4 张 ≈ 51MB）。 */
     private const val PRELOAD_KEEP = 4
 
@@ -397,6 +407,15 @@ internal object RasterRenderer {
      * 只由三个真实事件翻转：启动时读系统锁屏态 / 解锁淡出落地 / 回锁屏复位放行。
      */
     @Volatile private var showingDesktop = false
+
+    /**
+     * **解锁镜像：每帧两份都画**（2026-11-15，照 Alive 的 `mirrorToDesk` 抄）。
+     *
+     * 置 true 期间 [drawAllFrames] 走 [drawEveryMount]（所有挂载目标各画一帧，同一套参数
+     * ⇒ 内容逐像素一致），**alpha 一格不动** —— 系统壁纸（buffer 层 alpha 恒 1）没有一帧
+     * 能透出来，而系统切 leash 那一帧桌面份就是最新内容。
+     */
+    @Volatile private var mirrorToDesk = false
 
     /**
      * **过渡期冻结**（与 `SpatialRenderer.transitionFrozen` 同义）。
@@ -631,6 +650,12 @@ internal object RasterRenderer {
         musicFadeTick = null
         currentAlpha = 1f
         pendingRaise = false
+        // 启动时 MC 已在全屏封面 ⇒ 直接以让路态上屏（v1.22.105）：锁屏份 0，桌面份不动。
+        if (Coexist.musicCoverOn) {
+            musicYielded = true
+            applyAlphaTo(lockScs, 0f)
+            HookRuntime.log("RASTER 启动时 MC 封面已在锁屏上 ⇒ 以让路态启动（锁屏份 0）")
+        }
         // **景深主体必须在启动后主动重算**（v1.22.101）：MC 让路那一下
         // `Coexist.musicCoverOn` 先翻 false、渲染器还没起来 ⇒ `SpatialForegroundHider.handle()`
         // 走「旧链」把 `keyguard_foreground_layer` 压成 INVISIBLE / 摘掉系统主体；
@@ -836,9 +861,12 @@ internal object RasterRenderer {
         dim = 1f
         currentAlpha = 1f
         cancelFade()
+        // 解锁镜像必须一起收（否则下一次启动还在"两份都画"）
+        mirrorToDesk = false
         fadeDoneAt = 0L
         pendingRaise = false
         raiseScheduled = false
+        musicYielded = false
         sharedLeash = false
         desktopOnlyShared = false
         deskOnlyAlpha = -1f
@@ -1274,6 +1302,8 @@ internal object RasterRenderer {
         handler?.post {
             if (runningKey == null) return@post
             aodActive = true
+            // 进 AOD 只画锁屏份（桌面 leash 不可见），把解锁镜像关掉
+            mirrorToDesk = false
             dim = (1f - black.coerceIn(0f, 1f))
             // 诊断（2026-11-07）：自定义 AOD 下 black=1.0 ⇒ dim=0（全黑），最容易暴露「不恢复」。
             HookRuntime.log(
@@ -1419,6 +1449,18 @@ internal object RasterRenderer {
      * 经 `debug.hyperextreme.spatial_wp_alpha`（×1000）桥过来，读得到就跟随；
      * 读不到退回 380ms 线性。结束真值 = `SpatialUnlockFade.isFadingAway()` 落回 false。
      */
+    /**
+     * **解锁：两份都画、alpha 全程 1**（2026-11-15，照 Alive 的 `mirrorToDesk` 抄，与空间同一套）。
+     *
+     * 真机硬数据：系统壁纸 buffer 层 alpha 恒为 1，而 `UniversalEngine#h()` 只是**间歇性**
+     * 被调用 ⇒ 任何 alpha 淡出都会把系统锁屏壁纸露出来。Alive 的解锁路径 alpha 全程 1、
+     * 桌面份每帧都更新，**实证不闪**；这里照抄同样的两条：
+     *
+     * 1. **alpha 一格不动**；
+     * 2. **每帧两份都画**（[mirrorToDesk]）—— 系统切 leash 那一帧桌面份就是最新内容。
+     *
+     * 收尾只剩「翻显示态 + 停镜像」，判据三选一（`isFadingAway()` 可能恒 null，见 v1.22.112）。
+     */
     fun fadeOutOnUnlock() {
         val h = handler ?: return
         h.post {
@@ -1427,7 +1469,7 @@ internal object RasterRenderer {
             // `startKeyguardExitAnimationByInteractiveOrFullAODUnlockAnimation`，
             // **不会**调 `doWallpaperBlackAnim(show=true)` ⇒ `onExitAod()` 不执行 ⇒
             // `dim` 停在 AOD 的 0.5。必须在这里无条件复位（2026-11-05 真机问题二）。
-            // 放在所有分支之前：仅桌面档、共用 leash、正常淡出都要复位。
+            // 放在所有分支之前：仅桌面档、共用 leash、镜像都要复位。
             val hadDim = dim < 0.999f
             if (hadDim) {
                 dim = 1f
@@ -1436,8 +1478,7 @@ internal object RasterRenderer {
             }
             // 冻结同样要解：AOD 里 aodFrozen=true，这条路径上没有 onExitAod 帮它解。
             // 两个标志都要清：aodFrozen 拦的是绘制，transitionFrozen 拦的是采样/重绘。
-            // AOD 归位 tick 也必须作废 —— 否则它落地后会把 aodFrozen 又写成 true
-            // （空间壁纸 v1.17.6 真机日志实证的顺序）。
+            // AOD 归位 tick 也必须作废 —— 否则它落地后会把 aodFrozen 又写成 true。
             cancelAodHoming()
             // **AOD 直接解锁不经过 `onExitAod()`** ⇒ 标志必须在这里清（v1.20.5），
             // 否则残留 true 会让下一次回锁屏的复位只抬 GL 份、主体永远不显。
@@ -1445,98 +1486,64 @@ internal object RasterRenderer {
             aodFrozen = false
             unfreezeTransition()
             if (lockScs.isEmpty()) {
-                // 仅桌面档（没有锁屏份）：不需要淡出。解锁后这份该显示 ⇒ alpha 1.0。
+                // 仅桌面档（没有锁屏份）：不需要镜像。解锁后这份该显示 ⇒ alpha 1.0。
                 setDeskOnlyAlpha(1f)
-                // 补一帧让复位后的亮度落到桌面。
                 if (hadDim && screenOn()) forceDraw()
                 return@post
             }
             // 幂等：三个触发点（退场动画起点 / 锁屏状态跳变 / dismiss 动画）都会到，先到者生效。
-            // 少了这句，第二次触发会把已淡到一半的 alpha 重置回 1（看得见的回弹）。
             if (fadeTick != null) return@post
             cancelFade()
             // 灭屏触发的 showing→false 不是解锁：那时 swap 必阻塞，会把 GL 线程卡死。
             if (!screenOn()) {
-                HookRuntime.log("RASTER 解锁淡出 跳过（灭屏触发，非解锁）")
+                HookRuntime.log("RASTER 解锁 跳过（灭屏触发，非解锁）")
                 return@post
             }
             // **景深主体同步退场**（2026-11-04）：它是窗口内的 View，系统那 200ms 的
-            // self-blur ramp 照样糊到它 ⇒ 任何时候都要退。必须在 sharedLeash 分支**之前**：
-            // 共用 leash 只是省掉 GL 那份的 alpha 淡出，前景主体照样要退。
+            // self-blur ramp 照样糊到它 ⇒ 任何时候都要退（必须在 sharedLeash 之前）。
             runCatching { RasterOverlay.fadeOutOnUnlock() }
-            // **共用一条 leash ⇒ 不淡出**：它解锁后还要当桌面壁纸用，淡到 0 桌面就空了。
-            // 系统自己会让这条 leash 连续过渡 ⇒ 本来就不需要切换，天然无缝。
+            // **共用一条 leash ⇒ 不动任何东西**：它解锁后还要当桌面壁纸用。
             if (sharedLeash) {
-                HookRuntime.log("RASTER 解锁淡出 跳过（共用一条 leash，交给系统连续过渡）")
-                // 共用 leash 没有「桌面份接手」这一步，压暗复位后必须自己补一帧。
+                HookRuntime.log("RASTER 解锁 跳过（共用一条 leash，交给系统连续过渡）")
                 if (hadDim && screenOn()) forceDraw()
                 return@post
             }
-            // 冻结整个过渡期（见 transitionFrozen）：不采样、不重绘。
-            freezeTransition()
-            // **把「冻结的这一帧」同时写进两份**：桌面那份的 buffer 队列里躺的是旧内容，
-            // 而 SF 是 FIFO 从队头取 ⇒ 切换后先吐旧帧 = 用户看到的「景物换了位置」。
-            val deskBefore = swapDeskFrames
-            freezeFrameForBoth()
-            val deskReady = swapDeskFrames > deskBefore
+            // ── 镜像：两份都画、alpha 一格不动 ────────────────────────────────
+            mirrorToDesk = true
+            forceDraw()
             val started = SystemClock.elapsedRealtime()
-            // 见过 `mMiKeyguardFadingAway == true` 才认后面的 false 是"动画结束"，
-            // 否则启动瞬间它可能还是初始的 false，会被误判成"立刻结束"。
+            // 见过 `mMiKeyguardFadingAway == true` 才认后面的 false 是"动画结束"
+            // （启动瞬间它可能还是初始的 false，会被误判成"立刻结束"）
             var sawFading = false
-            var usedExternal = false
-            var minExt = 1f
-            // 从**当前值**起，不是从 1：淡出若被重复触发（两个入口 / 状态抖动），
-            // 从 1 重开会让 alpha 跳回去 = 又一次闪回。
-            var lastA = currentAlpha
             val r = object : Runnable {
                 override fun run() {
-                    val scs = lockScs
-                    if (scs.isEmpty() || runningKey == null) {
+                    if (runningKey == null) {
                         fadeTick = null
+                        mirrorToDesk = false
                         return
                     }
-                    val now = SystemClock.elapsedRealtime()
-                    val elapsed = now - started
-                    val timeBased = (1f - elapsed.toFloat() / FADE_MS).coerceIn(0f, 1f)
-                    // 只跟「系统真的在降」的区间（0.02..0.999）：稳定 1 = 还没开始，
-                    // 稳定 0 = 壁纸未呈现，都不跟 —— 否则会被"恒 0"瞬间拉黑。
-                    val extV = readSystemWallpaperAlpha()?.takeIf { it > 0.02f && it < 0.999f }
-                    // ⚠️ 与**自己的历史值**取 min，不能和时间驱动比：后者会让我们恒 ≤ 系统，
-                    // 于是总是先消失、露出系统壁纸（空间壁纸 2026-10-28 真机现象）。
-                    var a = if (extV != null) minOf(lastA, extV) else minOf(lastA, timeBased)
-                    if (extV != null) {
-                        usedExternal = true
-                        if (extV < minExt) minExt = extV
-                    }
-                    // **结束真值**：系统退场标志一落，立刻归 0 —— 不管 FADE_MS 估得准不准。
+                    val elapsed = SystemClock.elapsedRealtime() - started
                     val fading = SpatialUnlockFade.isFadingAway()
                     if (fading == true) sawFading = true
-                    val done = sawFading && fading == false
-                    if (done) {
-                        a = 0f
-                        HookRuntime.log(
-                            "RASTER 解锁淡出 系统动画结束（实测 ${elapsed}ms，FADE_MS=$FADE_MS，" +
-                                "真值=${if (usedExternal) "miwallpaper alpha(最低 ${(minExt * 1000).toInt()}‰)" else "时间驱动"}）",
-                        )
-                    }
-                    lastA = a
-                    applyAlphaTo(scs, a)
-                    if (a > 0.01f && !done) {
-                        h.postDelayed(this, 16)
-                    } else {
+                    // 主判据 = 系统锁屏态（`isFadingAway()` 的 `stateRef` 重启后可能恒 null）
+                    val unlocked = elapsed >= 300L && queryKeyguardLocked(null) == false
+                    val switched = (sawFading && fading == false) || unlocked ||
+                        elapsed >= FADE_MS + 600L
+                    if (switched) {
                         fadeTick = null
-                        if (a <= 0.01f) {
-                            // 淡出落地 ⇒ 开锁存窗口 + 翻转显示态（桌面份接手）。
-                            // 必须在 forceDraw 之前翻 —— 它自己的 activeMountIsLocked() 也要读这个值。
-                            fadeDoneAt = SystemClock.elapsedRealtime()
-                            showingDesktop = true
-                            // **先解冻，再补帧**：补帧可能阻塞（surface 不可见时），
-                            // 顺序反了就会把冻结标志一起锁死 —— 那正是"亮屏后一直静止"的成因。
-                            unfreezeTransition()
-                            // 桌面份在淡出开始时就已经写好了（同一帧）⇒ 这里通常**不用再画**。
-                            // 只有那次写失败、而且此刻亮屏（不阻塞）才兜底补一帧。
-                            if (!deskReady && screenOn()) forceDraw()
-                        }
+                        fadeDoneAt = SystemClock.elapsedRealtime()
+                        val locked = queryKeyguardLocked(null)
+                        showingDesktop = locked?.let { !it } ?: true
+                        mirrorToDesk = false
+                        unfreezeTransition()
+                        // 切过去补一帧：桌面份立刻换成"桌面成像"。
+                        // ⚠️ 这一帧可能出现「位置/缩放小跳」，真机看明显不明显再决定要不要过渡。
+                        forceDraw()
+                        HookRuntime.log(
+                            "RASTER 解锁镜像结束（实测 ${elapsed}ms，alpha 全程 1、两份都画）",
+                        )
+                    } else {
+                        h.postDelayed(this, 16)
                     }
                 }
             }
@@ -1737,20 +1744,22 @@ internal object RasterRenderer {
      */
     private fun applyAlphaTo(scs: List<android.view.SurfaceControl>, target: Float) {
         if (scs.isEmpty()) return
-        if (target > 0.01f && fadeDoneAt > 0L &&
+        // **MC 让路统一门**（v1.22.108）：只拦"抬"不拦"降"（同 SpatialRenderer 的口径）
+        val target2 = if (musicYielded && target > currentAlpha) currentAlpha else target
+        if (target2 > 0.01f && fadeDoneAt > 0L &&
             SystemClock.elapsedRealtime() - fadeDoneAt < FADE_LATCH_MS
         ) {
             pendingRaise = true
             handler?.let { scheduleRaisePump(it, 16L) }
             return
         }
-        if (target == currentAlpha) return
+        if (target2 == currentAlpha) return
         runCatching {
             val t = txAlpha ?: return
             val tx = t.first.getConstructor().newInstance()
-            scs.forEach { t.second.invoke(tx, it, target) }
+            scs.forEach { t.second.invoke(tx, it, target2) }
             t.third.invoke(tx)
-            currentAlpha = target
+            currentAlpha = target2
         }.onFailure {
             HookRuntime.log("RASTER 设 alpha 失败：${it.javaClass.simpleName}: ${it.message}")
         }
@@ -1760,6 +1769,14 @@ internal object RasterRenderer {
 
     /** 过渡时长。 */
     private val MUSIC_FADE_MS = 150L
+
+    /**
+     * **MC 全屏封面：已让路（锁屏份 alpha=0），但渲染器没停**（v1.22.105 改）。
+     *
+     * 从前是 `stopInternal`，代价是解锁到桌面那一下没有桌面份 ⇒ 跳系统原壁纸。
+     * 现在只淡锁屏组（`applyAlphaTo` 的作用域），桌面组一直是 1.0。
+     */
+    @Volatile private var musicYielded = false
 
     /** 正在跑的过渡（中途反向要取消）。 */
     private var musicFadeTick: Runnable? = null
@@ -1773,16 +1790,19 @@ internal object RasterRenderer {
     fun fadeOutAndStop() {
         ensureHandler().post {
             if (runningKey == null) return@post
-            fadeAlphaTo(0f) {
-                if (Coexist.musicCoverOn) {
-                    HookRuntime.log("RASTER MC 全屏封面 → 淡出完成，关闭渲染器")
-                    stopInternal("MC 全屏封面")
-                } else {
-                    // 淡出期间封面撤了：淡回来，别停
-                    fadeAlphaTo(1f, null)
-                }
-            }
+            if (musicYielded) return@post
+            musicYielded = true
+            HookRuntime.log("RASTER MC 全屏封面 → ${MUSIC_FADE_MS}ms 淡掉锁屏份（渲染器不停）")
+            fadeAlphaTo(0f, null)
         }
+    }
+
+    /** 退出封面：锁屏份淡回（渲染器一直在跑，不用重建）。 */
+    fun resumeFromMusic() {
+        if (!musicYielded) return
+        musicYielded = false
+        HookRuntime.log("RASTER MC 封面已撤 → 锁屏份淡回 1.0")
+        fadeAlphaTo(1f, null)
     }
 
     /** 150ms 线性渐变到 [target]，结束后回调。 */
@@ -1892,6 +1912,8 @@ internal object RasterRenderer {
 
     /** 画当前组（共用 leash / 单档只有 1 份；全局非共用时也只有 1 份可见）。 */
     private fun drawAllFrames(): Boolean {
+        // **解锁镜像**（2026-11-15，照 Alive）：所有挂载目标都画，同一套参数。
+        if (mirrorToDesk) return drawEveryMount()
         val wantLocked = activeMountIsLocked()
         val group = mounts.filter { it.locked == wantLocked }.ifEmpty { mounts }
         if (group.isEmpty()) return false

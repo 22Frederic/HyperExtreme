@@ -238,7 +238,9 @@ internal object SpatialForegroundHider {
         // 后者只要媒体卡 / 岛在就成立，会把整条链白关掉（2026-11-14 用户指出）。
         if (Coexist.musicCoverOn) {
             SpatialOverlay.onDisabled()
-            RasterOverlay.onDisabled()
+            // 光栅：**保留位图**（v1.22.108）—— 让路是高频短时事件，
+            // 释放后重新 attach 要读盘 + decode 1200×2670，人像会慢半拍。
+            RasterOverlay.onDisabled(keepBitmaps = true)
             AliveOverlay.onDisabled()
             AliveOverlay.detachSystemSubject(layer)
             if (layer.visibility != View.VISIBLE) layer.visibility = View.VISIBLE

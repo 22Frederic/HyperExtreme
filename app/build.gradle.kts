@@ -20,8 +20,8 @@ android {
     buildToolsVersion = "37.0.0"
     ndkVersion = "28.2.13676358"
 
-    // 桌面桥（home_bridge）：native 子工程（libxposed API 102 native 入口），仅 arm64-v8a；
-    // libc++ 静态链接，避免运行期依赖 libc++_shared。
+    // native 子工程（仅 arm64-v8a）：现在只剩空间壁纸的 PatchMatch 填充（纯 C）。
+    // 2026-11-15 起「系统桌面桥」（home_bridge）随隐藏状态栏功能一并删除。
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
@@ -33,16 +33,11 @@ android {
         applicationId = "com.frederic22.hyperextreme"
         minSdk = 33
         targetSdk = 37
-        versionCode = 103
-        versionName = "1.0 Beta3"
+        versionCode = 1040000
+        versionName = "1.0 Beta4"
 
         ndk {
             abiFilters += "arm64-v8a"
-        }
-        externalNativeBuild {
-            cmake {
-                arguments.add("-DANDROID_STL=c++_static")
-            }
         }
     }
 

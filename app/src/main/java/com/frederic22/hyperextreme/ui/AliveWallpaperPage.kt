@@ -1,5 +1,8 @@
 package com.frederic22.hyperextreme.ui
 
+import android.content.SharedPreferences
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -20,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -42,6 +46,7 @@ import com.frederic22.hyperextreme.data.AliveFlag
 import com.frederic22.hyperextreme.data.AliveItem
 import com.frederic22.hyperextreme.data.AliveStore
 import com.frederic22.hyperextreme.data.MaskPrefs
+import com.frederic22.hyperextreme.data.WallpaperProc
 import com.frederic22.hyperextreme.data.WallpaperVersion
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -110,6 +115,23 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
 
     val prefs = remember { MaskPrefs(ctx) }
     var activeId by remember { mutableStateOf(prefs.aliveActiveId) }
+
+    // **外部关闭的回灌**（2026-11-15）：换壁纸 / 关 AOD / 壁纸进程重启都会在**本进程的
+    // 另一条路径**里把 `alive_active_id` 清掉（provider 的自动关闭、`App.aodObserver`、
+    // `METHOD_WALLPAPER_RESTART`），页面收不到 ⇒ 卡片一直显示「已应用」、按钮还是「取消应用」，
+    // 用户必须退出重进才刷新。监听 prefs 把本地状态跟上去。
+    // 回调由 `SharedPreferences` 抛到主线程，这里再 post 一次只是为了不依赖那个实现细节。
+    val uiHandler = remember { Handler(Looper.getMainLooper()) }
+    DisposableEffect(Unit) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == MaskPrefs.KEY_ALIVE_ACTIVE) {
+                val next = prefs.aliveActiveId
+                uiHandler.post { if (activeId != next) activeId = next }
+            }
+        }
+        prefs.registerListener(listener)
+        onDispose { prefs.unregisterListener(listener) }
+    }
 
     // 编辑浮页（2026-11-08）：新建卡 → 建空组 → 开浮页；点已有卡 → 开浮页
     var sheetOpen by remember { mutableStateOf(false) }
@@ -184,21 +206,8 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         sheetOpen = true
     }
 
-    fun apply(item: AliveItem) {
-        if (!state.requireActivated()) return
-        // **AOD 没开就别应用**（2026-11-10 用户要求）：Alive 的两种样式（启航 / 留光）
-        // 都是给息屏显示做的，AOD 关着应用上去等于什么都没发生，白让用户以为坏了。
-        // 判据 = 系统「息屏显示」总开关（`doze_always_on`，见 [AodState]）。
-        if (!AodState.enabled(ctx)) {
-            Toast.makeText(ctx, "AOD未开启，请先开启AOD再使用", Toast.LENGTH_LONG).show()
-            return
-        }
-        val other = WallpaperConflict.running(ctx, state, WallpaperChain.ALIVE)
-        if (other != null) {
-            conflictOther = other
-            showConflict = true
-            return
-        }
+    /** 真正落地的「应用」（拆出来是为了让 [apply] 能在壁纸重载时等一等再调它）。 */
+    fun applyNow(item: AliveItem) {
         // **直接应用**（2026-11-14 撤掉「壁纸重置弹窗 + clear(both)」）。
         // 真机层树实验证明那套是误诊：锁屏份本来就可见
         // （`he-alive-lock` / `he-raster-lock` 在锁屏态 `flags:0`、`alpha=1`；
@@ -235,6 +244,27 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             }
         }.apply { isDaemon = true }.start()
         Toast.makeText(ctx, "Alive壁纸已生效", Toast.LENGTH_LONG).show()
+    }
+
+    fun apply(item: AliveItem) {
+        if (!state.requireActivated()) return
+        // **AOD 没开就别应用**（2026-11-10 用户要求）：Alive 的两种样式（启航 / 留光）
+        // 都是给息屏显示做的，AOD 关着应用上去等于什么都没发生，白让用户以为坏了。
+        // 判据 = 系统「息屏显示」总开关（`doze_always_on`，见 [AodState]）。
+        if (!AodState.enabled(ctx)) {
+            Toast.makeText(ctx, "AOD未开启，请先开启AOD再使用", Toast.LENGTH_LONG).show()
+            return
+        }
+        val other = WallpaperConflict.running(ctx, state, WallpaperChain.ALIVE)
+        if (other != null) {
+            conflictOther = other
+            showConflict = true
+            return
+        }
+        // **壁纸进程重载中先等它完成再注入**（2026-11-15）：关闭应用会在 400ms 后杀一次
+        // miwallpaper（重建壁纸层、清残留），这期间推属性 = 新层刚 `reparent` 上去就被
+        // 父 leash 一起销毁，而渲染器不会自愈（空间 / 光栅没有 leash 自检）。
+        WallpaperProc.applyWhenReady(ctx) { applyNow(item) }
     }
 
     fun clearActive() {

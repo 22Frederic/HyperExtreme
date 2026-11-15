@@ -67,13 +67,6 @@ class MaskUiState(
     var lockScreenButtonOnTop by mutableStateOf(prefs.lockScreenButtonOnTop)
 
     /**
-     * 「打开多任务时隐藏状态栏」（系统桌面 → 多任务，默认关，2026-10-16 加）。
-     *
-     * 单一写者（本界面）；SystemUI 侧（hook/RecentsStatusBar）在「多任务出现」事件到达时现读 prefs。
-     */
-    var hideStatusBarInRecents by mutableStateOf(prefs.hideStatusBarInRecents)
-
-    /**
      * 「视差壁纸效果」是否开启（背景层在锁屏上生效中）。
      *
      * 权威状态在 prefs（`MaskPrefs.parallaxBgActive`）——界面按钮显示「立即替换」还是
@@ -469,12 +462,6 @@ class MaskUiState(
     fun applyLockScreenButtonOnTop(value: Boolean) {
         lockScreenButtonOnTop = value
         prefs.setLockScreenButtonOnTop(value)
-    }
-
-    /** 切换「打开多任务时隐藏状态栏」（系统桌面 → 多任务）。 */
-    fun applyHideStatusBarInRecents(value: Boolean) {
-        hideStatusBarInRecents = value
-        prefs.setHideStatusBarInRecents(value)
     }
 
     /** 切换「强制锁屏元素深浅模式」主开关。 */
