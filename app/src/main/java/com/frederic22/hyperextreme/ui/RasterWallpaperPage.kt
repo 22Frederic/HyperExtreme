@@ -80,7 +80,7 @@ import kotlin.math.roundToInt
  *
  * ## 进场定位（2026-11-03 用户要求）
  *
- * 已经有一套或多套搭配时，进页面**直接停在第一套**（`RasterStore.list` 按创建时间倒序
+ * 已经有一套或多套组合时，进页面**直接停在第一套**（`RasterStore.list` 按创建时间倒序
  * ⇒ 第一个 = 最新建的那套）；一套都没有才停在「新建」卡。
  * 为此首次扫描完成前不组合卡片流（用等高占位），否则会先露「新建」卡再跳走，闪一帧。
  *
@@ -88,7 +88,7 @@ import kotlin.math.roundToInt
  *
  * | 中间是什么 | 文案 | 态 |
  * |---|---|---|
- * | 新建卡 | 新搭配 | 主色可点，打开新建浮页 |
+ * | 新建卡 | 新组合 | 主色可点，打开新建浮页 |
  * | 当前使用中的组 | 正在使用 | 禁用（miuix 自带浅灰） |
  * | 其他组 | 应用 | 主色可点，写入 `MaskPrefs.rasterActiveId` |
  *
@@ -181,7 +181,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     var shiftFromPage by remember { mutableIntStateOf(-1) }
     // 每次补位 +1：卡片流用它在**创建时**就把进度建成 0，避免晚一帧才归零（那一帧会闪）。
     var shiftToken by remember { mutableIntStateOf(0) }
-    // 「清除所有搭配」请求号（2026-11-07）：+1 交给卡片流播"全部缩小淡出 → 新建卡补位"。
+    // 「清除所有光栅壁纸组合」请求号（2026-11-07）：+1 交给卡片流播"全部缩小淡出 → 新建卡补位"。
     var clearSeq by remember { mutableIntStateOf(0) }
     // 关闭编辑浮页时「保持当前列表顺序」（2026-11-13）：
     // 编辑不改 `rasterGroupOrder`，但用户可能刚应用过某组（order 已置顶、页面列表还没动）。
@@ -301,7 +301,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     }
     var showMountWarn by remember { mutableStateOf(false) }
     var noMoreWarn by remember { mutableStateOf(false) }
-    // 「删除所有搭配」确认框。
+    // 「请确认」确认框。
     var showClearAll by remember { mutableStateOf(false) }
     // 功能冲突（2026-11-04）：视差 / 空间任一在跑时不许应用。
     var showConflict by remember { mutableStateOf(false) }
@@ -559,7 +559,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     }
 
     /**
-     * 「清除所有搭配」的动画收尾（2026-11-07）：卡片流播完 200ms 缩小淡出后回调这里。
+     * 「清除所有光栅壁纸组合」的动画收尾（2026-11-07）：卡片流播完 200ms 缩小淡出后回调这里。
      *
      * **这一帧同步清空列表** —— 新建卡的补位进度就是按 `groups` 变空的那一帧创建的，
      * 先删盘再清会看到它先瞬移到中间、再滑回来。
@@ -576,7 +576,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
         scope.launch {
             val n = withContext(Dispatchers.IO) { RasterStore.deleteAll(ctx) }
             reload++
-            Toast.makeText(ctx, "已清除 $n 项搭配", Toast.LENGTH_SHORT).show()
+            Toast.makeText(ctx, "已清除 $n 项组合", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -655,7 +655,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                     }
                 },
                 onDeleteSettled = { commitDelete() },
-                // 「清除所有搭配」：卡片流负责让所有非新建卡缩小淡出、播完在这一帧回调。
+                // 「清除所有光栅壁纸组合」：卡片流负责让所有非新建卡缩小淡出、播完在这一帧回调。
                 onClearSettled = { commitClearAll() },
             )
         } else {
@@ -669,7 +669,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
         Spacer(Modifier.height(BLOCK_GAP - pagerPadding))
 
         // 卡片下方的主操作按钮（2026-11-03）：四态 ——
-        //   新建卡「新搭配」/ LSPosed 当前组「取消应用」/ LSPosed 其余组「应用」/
+        //   新建卡「新组合」/ LSPosed 当前组「取消应用」/ LSPosed 其余组「应用」/
         //   **服务模式未运行「跳转系统页」/ 服务模式运行中「恢复默认」**（2026-11-04 用户定）。
         // 2026-11-03 晚：「老老实实圆角矩形」—— 宽 = 中间卡片的 5/6，
         // 圆角 / 高度 / 内边距 / 字号全部用 miuix 默认值（不再自己拧）。
@@ -680,7 +680,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
             // 不能只看 id 指针 —— 用户可能从系统壁纸页把壁纸换回去了。
             val secondary = if (serviceMode) serviceRunning else isActive
             val label = when {
-                selected == null -> "新搭配"
+                selected == null -> "新组合"
                 serviceMode -> if (serviceRunning) "恢复默认" else "跳转系统页"
                 // 「正在使用」改成可点的「取消应用」（用户 2026-11-03）。
                 isActive -> "取消应用"
@@ -722,7 +722,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                 //   —— 必须在 modifier 上把宽度卡死（用户 2026-11-03 连着两次问"怎么还这么宽"）。
                 modifier = Modifier.width(buttonWidth),
                 // 高度 / 圆角 / 内边距全走 miuix 默认。
-                // 默认 `buttonColors()` 是**次级灰**；「新搭配 / 应用」要的是提示色（primary 蓝）。
+                // 默认 `buttonColors()` 是**次级灰**；「新组合 / 应用」要的是提示色（primary 蓝）。
                 colors = ButtonDefaults.buttonColorsPrimary(
                     color = bg,
                     disabledColor = bg,
@@ -886,7 +886,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
             )
         }
 
-        // 「清除所有搭配」独立成一张卡 + 语义红 + 无箭头（照空间壁纸「清除所有深度缓存」的样式）。
+        // 「清除所有光栅壁纸组合」独立成一张卡 + 语义红 + 无箭头（照空间壁纸「清除所有空间壁纸及缓存」的样式）。
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -895,7 +895,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
             insideMargin = PaddingValues(0.dp),
         ) {
             BasicComponent(
-                title = "清除所有搭配",
+                title = "清除所有光栅壁纸组合",
                 summary = null,
                 titleColor = BasicComponentColors(
                     color = MiuixTheme.colorScheme.error,
@@ -933,24 +933,24 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
         onConfirm = { pendingDelete?.let { deleteGroup(it) } },
     )
 
-    // 「删除所有搭配」确认（2026-11-03）：正文前半句固定，**后缀按实际运行态分三档**
-    // （2026-11-04 用户要求，句式照空间壁纸页的「清除所有深度缓存」）。
+    // 「请确认」确认（2026-11-03）：正文前半句固定，**后缀按实际运行态分三档**
+    // （2026-11-04 用户要求，句式照空间壁纸页的「清除所有空间壁纸及缓存」）。
     // 判据用**实际运行态**（serviceRunning 优先），与下面 onConfirm 的动作保持同一口径。
     RasterClearAllDialog(
         show = showClearAll,
         summary = when {
-            serviceRunning -> "所有搭配内的图片缓存将被删除。当前光栅壁纸正在运行，" +
+            serviceRunning -> "所有光栅壁纸组合内的图片缓存将被清除。当前光栅壁纸正在运行，" +
                 "点击“清除”后将自动恢复到系统默认壁纸。"
-            inUseId.isNotEmpty() -> "所有搭配内的图片缓存将被删除。当前光栅壁纸正在运行，" +
+            inUseId.isNotEmpty() -> "所有光栅壁纸组合内的图片缓存将被清除。当前光栅壁纸正在运行，" +
                 "点击“清除”后将自动关闭替换。"
-            else -> "所有搭配内的图片缓存将被删除。"
+            else -> "所有光栅壁纸组合内的图片缓存将被清除。"
         },
         onDismissRequest = { showClearAll = false },
         onConfirm = {
             showClearAll = false
             scope.launch {
                 // **先停再删**：服务模式运行中，壁纸进程还在读 `files/raster/<id>`，
-                // 直接删会让它读到空目录 → 黑屏。与空间壁纸页「清除所有深度缓存」同一条承诺。
+                // 直接删会让它读到空目录 → 黑屏。与空间壁纸页「清除所有空间壁纸及缓存」同一条承诺。
                 if (serviceRunning) {
                     withContext(Dispatchers.IO) {
                         SpatialServiceMode.disable(ctx) { RasterServiceTarget.clear(it) }
@@ -1009,11 +1009,11 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
 }
 
 /**
- * 「删除此搭配？」确认框（2026-11-03）。
+ * 「删除此组合？」确认框（2026-11-03）。
  *
  * 标题 / 正文 / 按钮语义由用户定死：
- * * 标题「删除此搭配？」
- * * 正文「搭配内的图片缓存将被删除」
+ * * 标题「删除此组合？」
+ * * 正文「组合内的图片缓存将被删除」
  * * 取消 / 确认两个键，**确认键用 miuix 警示主题色**（`colorScheme.error` 底 + `onError` 字）
  *
  * 结构照 [FeatureConflictDialog]：正文走 `WindowDialog` 的 `summary`（官方正文位），
@@ -1026,8 +1026,8 @@ private fun DeleteRasterDialog(
     onConfirm: () -> Unit,
 ) {
     WindowDialog(
-        title = "删除此搭配？",
-        summary = "搭配内的图片缓存将被删除",
+        title = "删除此组合？",
+        summary = "组合内的图片缓存将被删除",
         show = show,
         onDismissRequest = onDismissRequest,
     ) {
@@ -1060,10 +1060,10 @@ private fun DeleteRasterDialog(
 }
 
 /**
- * 「删除所有搭配？」确认框（2026-11-03，用户给定文案）。
+ * 「请确认」确认框（2026-11-03，用户给定文案）。
  *
- * * 标题「删除所有搭配？」
- * * 正文「所有搭配内的图片缓存将被删除」
+ * * 标题「请确认」
+ * * 正文「所有光栅壁纸组合内的图片缓存将被清除」
  * * 取消 / 确认，确认键用 miuix 警示色
  *
  * 结构与 [DeleteRasterDialog] 一致。
@@ -1076,7 +1076,7 @@ private fun RasterClearAllDialog(
     onConfirm: () -> Unit,
 ) {
     WindowDialog(
-        title = "删除所有搭配？",
+        title = "请确认",
         summary = summary,
         show = show,
         onDismissRequest = onDismissRequest,
@@ -1097,7 +1097,7 @@ private fun RasterClearAllDialog(
                 )
                 Spacer(Modifier.width(20.dp))
                 TextButtonLike(
-                    text = "确认",
+                    text = "清除",
                     danger = true,
                     onClick = {
                         onConfirm()

@@ -24,9 +24,14 @@ import com.frederic22.hyperextreme.data.RootReplacer
 import com.frederic22.hyperextreme.data.RootShell
 import com.frederic22.hyperextreme.data.RunLog
 import com.frederic22.hyperextreme.data.SystemUiPackageName
+import com.frederic22.hyperextreme.data.UpdateChecker
 import com.frederic22.hyperextreme.data.WallpaperVersion
 import com.frederic22.hyperextreme.hook.HookRuntime
 import com.frederic22.hyperextreme.hook.ParallaxBg
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import com.frederic22.hyperextreme.hook.ScreenFlash
 import io.github.libxposed.service.XposedProvider
 import kotlin.math.ceil
@@ -152,6 +157,35 @@ class MaskUiState(
     /** 「启用Monet颜色」（2026-11-07）：只影响应用配色，见 [MaskPrefs.monetColor]。 */
     var monetColor by mutableStateOf(prefs.monetColor)
 
+    // ─────────────────────────── 检查更新（2026-11-16）───────────────────────────
+
+    /** 「自动检测更新」，默认关。见 [MaskPrefs.autoUpdateCheck]。 */
+    var autoUpdateCheck by mutableStateOf(prefs.autoUpdateCheck)
+
+    /**
+     * 正在检查：**只用于防连点**，界面不再显示「检查中…」
+     * （用户 2026-11-16 改成点击时弹 short toast「正在检测，请稍后」）。
+     */
+    var updateChecking by mutableStateOf(false)
+        private set
+
+    /** 检测到的新版本；非 null ⇒ 弹「发现新版本」。 */
+    var updateFound by mutableStateOf<UpdateChecker.Result.Newer?>(null)
+
+    /** 手动检测失败 ⇒ 弹「检测更新失败」。 */
+    var updateFailed by mutableStateOf(false)
+
+    /** 「选择平台」弹窗（模块发布页）—— 设置页那行和「发现新版本 → 确认」都打开它。 */
+    var showReleaseDialog by mutableStateOf(false)
+
+    /**
+     * 「今天（北京时间）已经自动查过」的闸门在 prefs 里（[MaskPrefs.updateLastAutoDate]），
+     * **不是**进程内布尔 —— 需求是「一天最多一次」，跨进程重启也得成立。
+     */
+    private fun beijingToday(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        .apply { timeZone = TimeZone.getTimeZone("Asia/Shanghai") }
+        .format(Date())
+
     /**
      * 记录下来的 root 可用性：null = 还没测过。
      *
@@ -262,6 +296,7 @@ class MaskUiState(
             frameworkConnected = ActivationState.frameworkConnected
             themeMode = ThemeMode.of(prefs.themeMode)
             monetColor = prefs.monetColor
+            autoUpdateCheck = prefs.autoUpdateCheck
             parallaxActive = prefs.parallaxBgActive
             parallaxHasBg = MaskStore.parallaxExists(context)
             syncProtectionState()
@@ -284,6 +319,9 @@ class MaskUiState(
         }
         refreshLocal()
         scope.launch { reloadPreviews() }
+        // 每天（北京时间）首次回前台补一次自动检测 —— 只挂 `LaunchedEffect` 的话，
+        // App 常驻后台跨过零点、第二天回前台不会触发。日期闸门保证重复调用无副作用。
+        autoCheckUpdateOnce()
     }
 
     /**
@@ -420,6 +458,66 @@ class MaskUiState(
     fun applyMonetColor(value: Boolean) {
         monetColor = value
         prefs.setMonetColor(value)
+    }
+
+    fun applyAutoUpdateCheck(value: Boolean) {
+        autoUpdateCheck = value
+        prefs.setAutoUpdateCheck(value)
+        // 刚打开开关就查一次（用户 2026-11-16 定）：否则"开了什么都没发生"，得等到明天。
+        // 走自动模式（静默），且同样受当天闸门约束 —— 同一天再开关一次不会重复请求。
+        if (value) autoCheckUpdateOnce()
+    }
+
+    /**
+     * 自动检测：**每天（北京时间）首次进入模块**查一次，一天最多一个请求。
+     *
+     * 两个触发点，都受同一个日期闸门约束（重复调用直接返回）：
+     * `MaskSwapScreen` 的 `LaunchedEffect`（冷启动）+ [onResume]（回前台 / 跨零点）。
+     *
+     * **先写日期再发请求** —— 「一天最多一次」是硬约束，失败也算今天查过
+     * （用户 2026-11-16 定；自动失败本来静默，想要结果可以手动点）。
+     */
+    fun autoCheckUpdateOnce() {
+        if (!prefs.autoUpdateCheck) return
+        val today = beijingToday()
+        if (prefs.updateLastAutoDate == today) return
+        prefs.setUpdateLastAutoDate(today)
+        checkUpdate(manual = false)
+    }
+
+    /**
+     * 检测更新（**只打一次 GET**，数据源见 [UpdateChecker]：Gitee 主 + GitHub 兜底）。
+     *
+     * @param manual true = 用户点「立即检测更新」：已最新弹 toast、失败弹「检测更新失败」；
+     *               false = 自动：只有「发现新版本」才弹，其余静默。
+     */
+    fun checkUpdate(manual: Boolean) {
+        // 手动点必须立刻有反馈（Gitee 偶尔 0.6s+）；放在防连点之前，
+        // 这样「检测中再点一下」也有 toast，不会像没点上。
+        if (manual) AppToast.show(context, "正在检测，请稍后")
+        if (updateChecking) return
+        updateChecking = true
+        scope.launch {
+            val r = withContext(Dispatchers.IO) {
+                UpdateChecker.check(UpdateChecker.localVersionCode(context))
+            }
+            updateChecking = false
+            when (r) {
+                is UpdateChecker.Result.Newer -> {
+                    // 手动拿到结果 = 今天这事办过了，别让自动检测再打一次（用户 2026-11-16 定）。
+                    if (manual) prefs.setUpdateLastAutoDate(beijingToday())
+                    updateFound = r
+                }
+                UpdateChecker.Result.Latest -> {
+                    if (manual) {
+                        prefs.setUpdateLastAutoDate(beijingToday())
+                        AppToast.show(context, "当前已是最新版本")
+                    }
+                }
+                UpdateChecker.Result.Failed ->
+                    if (manual) updateFailed = true // 失败不占当天名额
+            }
+        }
     }
 
     fun applyVerbose(value: Boolean) {

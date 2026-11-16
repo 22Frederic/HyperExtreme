@@ -446,7 +446,7 @@ internal fun AliveGroupSheet(
 
     WindowBottomSheet(
         show = show,
-        title = if (isNew) "新建Alive壁纸" else "编辑Alive壁纸",
+        title = if (isNew) "新建Alive壁纸组合" else "编辑Alive壁纸组合",
         onDismissRequest = { close() },
         startAction = {
             IconButton(onClick = { haptic(); close() }) {

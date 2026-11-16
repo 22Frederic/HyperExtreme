@@ -13,6 +13,9 @@
     <!-- 「视差效果覆盖桌面」第二步：把「背景 + 主体」合成图设为系统桌面壁纸（2026-10-21）。
          SET_WALLPAPER 是 normal 权限，安装即授予，不会弹授权框。 -->
     <uses-permission android:name="android.permission.SET_WALLPAPER" />
+    <!-- 检查更新（2026-11-16）：只用于 GET 一次 Gitee 的 UPDATE.json（GitHub 仅兜底）。
+         **不上传任何信息、不请求任何第三方统计**。normal 权限，安装即授予。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <queries>
         <package android:name="com.miui.aod" />

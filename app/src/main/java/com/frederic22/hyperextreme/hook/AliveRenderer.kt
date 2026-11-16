@@ -1326,8 +1326,14 @@ internal object AliveRenderer {
         val off = Runnable {
             if (runningKey != null && aodActive) {
                 mirrorToDesk = false
-                applyAlpha(deskScs(), 0f)
-                HookRuntime.log("$TAG AOD 转场结束：桌面份收起（恢复单画）")
+                // ⚠️ **不收桌面份 alpha**（2026-11-16，用户报「桌面到 AOD 偶发闪烁」）：
+                // `animDur` 是写死的 `blendDuration(2)`=1000ms，**不读系统动画时长**；
+                // 系统若此刻还没撤掉桌面 leash，alpha 一归 0 就直接露系统桌面壁纸。
+                // AOD 里桌面份本来就不可见（`mirrorToDesk=false` 只画锁屏份），
+                // alpha 留 1 没有任何副作用，却保证「任一侧 leash 意外可见时都不是空的」。
+                HookRuntime.log(
+                    "$TAG AOD 转场结束：桌面份停画（alpha 保持 ${f(deskAlpha)}，不收 0）",
+                )
             }
         }
         aodMirrorOff = off
@@ -1422,7 +1428,10 @@ internal object AliveRenderer {
             aodMirrorOff = null
             mirrorToDesk = false
             if (abs(currentAlpha - 1f) > 0.001f) applyAlpha(lockScs(), 1f)
-            if (abs(deskAlpha) > 0.001f) applyAlpha(deskScs(), 0f)
+            // ⚠️ **不无条件收桌面份 alpha**（2026-11-16）：AOD 退出的转场里系统可能同时
+            // 显示两条 leash，收 0 就直接露系统桌面壁纸。桌面份的去留交给
+            // `crossFadeOnUnlock` / `resetAlpha` 这些"知道目标态"的路径。
+            HookRuntime.log("$TAG AOD 退出：桌面份 alpha 保持 ${f(deskAlpha)}（不收 0）")
             // 2026-11-08：这里**要主动回锁屏**（tr=0，650ms 球收拢）。
             // 之前留空是为了「分不清回锁屏还是直接进桌面」，现在用户已定「AOD→桌面也走
             // 0.15s 交叉」，所以先回锁屏是正确路径：随后 scrim=UNLOCKED 从锁屏态做交叉。
@@ -1505,6 +1514,12 @@ internal object AliveRenderer {
             // **预热桌面份**（2026-11-14）：这条路是逐帧降锁屏份 alpha，
             // 桌面份一直露在它下面 ⇒ buffer 必须是当前内容，否则整个淡出都在露旧图。
             runCatching { prewarmDesktop() }
+            // ⚠️ **桌面份必须同时抬到 1**（2026-11-16 修「桌面与锁屏一致时桌面不显示」）：
+            // `startInternal` 在**锁屏态**启动时把 `deskAlpha` 设成 0，而这条单图路径
+            // 只降锁屏份、从不抬桌面份 ⇒ 锁屏份淡到 0 之后**两层都透明**，露系统桌面壁纸
+            // （用户看到的就是「桌面什么都不显示」）。与 [crossFadeOnUnlock] 同款处理；
+            // 共用 leash 时不能抬（会把锁屏份一起弄没）。
+            if (!sharedLeash && abs(deskAlpha - 1f) > 0.001f) applyAlpha(deskScs(), 1f)
             val started = SystemClock.elapsedRealtime()
             var lastA = currentAlpha
             // **系统到底会不会自己淡？**（2026-11-15，见 [PROBE_MS]）
@@ -1568,6 +1583,8 @@ internal object AliveRenderer {
                         deskShown = true
                         // 桌面份接手：补一帧
                         if (screenOn()) forceDraw()
+                        // 桌面态：锁屏份也备好（进 AOD 时系统随时可能显示锁屏 leash）
+                        prepareLockForAod()
                     }
                 }
             }
@@ -1642,6 +1659,8 @@ internal object AliveRenderer {
                     swapToDesktopLayer(h) {
                         mirrorToDesk = false
                         unlocking = false
+                        // 桌面态：锁屏份也备好（进 AOD 时系统随时可能显示锁屏 leash）
+                        prepareLockForAod()
                     }
                 } else {
                     unlocking = false
@@ -1705,6 +1724,8 @@ internal object AliveRenderer {
                         swapToDesktopLayer(h) {
                         mirrorToDesk = false
                         unlocking = false
+                        // 桌面态：锁屏份也备好（进 AOD 时系统随时可能显示锁屏 leash）
+                        prepareLockForAod()
                     }
                     }
                 } else {
@@ -1716,6 +1737,8 @@ internal object AliveRenderer {
                     dirty = true
                     forceDraw()
                     unlocking = false
+                    // 桌面态：锁屏份也备好（进 AOD 时系统随时可能显示锁屏 leash）
+                    prepareLockForAod()
                 }
                 HookRuntime.log("$TAG 解锁完成（AOD→桌面，换层到桌面份，mode=$mode）")
             }, switchMs)
@@ -1763,6 +1786,8 @@ internal object AliveRenderer {
                         swapToDesktopLayer(h) {
                         mirrorToDesk = false
                         unlocking = false
+                        // 桌面态：锁屏份也备好（`swapToDesktopLayer` 刚把它压成 0）
+                        prepareLockForAod()
                     }
                     }
                 } else {
@@ -1776,6 +1801,8 @@ internal object AliveRenderer {
                     ratio[0] = 0f; ratio[1] = 0f; ratio[2] = 1f
                     dirty = true
                     forceDraw()
+                    // 桌面态：锁屏份也备好（进 AOD 时系统随时可能显示锁屏 leash）
+                    prepareLockForAod()
                 }
                 HookRuntime.log("$TAG 解锁交叉完成（${CROSS_MS}ms / $frames 帧，换层到桌面份）")
             }
@@ -2182,6 +2209,45 @@ internal object AliveRenderer {
     }
 
     /**
+     * **进入桌面态后，把锁屏份也准备成「桌面态全屏图」并抬到 alpha=1**
+     * （2026-11-16，修「桌面 → AOD 偶发闪系统锁屏壁纸」）。
+     *
+     * ## 为什么需要
+     *
+     * 桌面态时 `lockScs()` 的 alpha 是 0（解锁淡出留下的）。而进 AOD 时系统**先**把锁屏
+     * leash 变可见、我们**后**才在 `enterAodInternal` 里 `applyAlphaBoth(1f, 1f)` ——
+     * 中间要过 `handler.post` 一拍 + 一次两份绘制，实测 **2~3 帧**。
+     * 这几帧里露出的就是锁屏 leash 下面的**系统锁屏壁纸**（真机 15 次里约 3 次），
+     * 若那一刻桌面 leash 已撤、锁屏份又透明，则是纯黑（另约 3 次）。
+     *
+     * 与其"在正确的时刻抬 alpha"（永远有窗口），不如让它**一直是对的**：
+     * 桌面态就把锁屏份画成桌面态全屏图（`deskState` + `DESK_RATIO`）并抬到 1 ——
+     * 之后系统任何时候把锁屏 leash 显示出来，看到的就是当前桌面画面，进 AOD 零窗口。
+     * 同一思路见空间 / 光栅的「解锁镜像双画」（1.0 Beta4）。
+     *
+     * ⚠️ 一次性（壁纸静态，不必每帧刷）；**先画再抬**（抬起来的是刚画好的这一帧）。
+     * 共用 leash / 已在 AOD 时不适用。
+     */
+    private fun prepareLockForAod() {
+        if (sharedLeash || runningKey == null) return
+        if (aodActive || mode == 0) return
+        val locks = mounts.filter { it.locked }
+        if (locks.isEmpty()) return
+        val t0 = SystemClock.elapsedRealtime()
+        var ok = 0
+        for (m in locks) if (drawMount(m, forceDesk = true)) ok++
+        if (ok < locks.size) {
+            HookRuntime.log("$TAG 锁屏份准备失败（$ok/${locks.size}），保持 alpha 不变")
+            return
+        }
+        if (abs(currentAlpha - 1f) > 0.001f) applyAlpha(lockScs(), 1f)
+        HookRuntime.log(
+            "$TAG 桌面态：锁屏份已准备（桌面态全屏图 + alpha 1，进 AOD 零窗口，" +
+                "${SystemClock.elapsedRealtime() - t0}ms）",
+        )
+    }
+
+    /**
      * 主体 View 刚重建（`AliveOverlay.attach`）：让渲染器立刻补画一帧。
      *
      * 新 `SubjectView` 里 `pMatrix` / 几何全是默认值，而静止的锁屏帧循环已经停笔
@@ -2195,7 +2261,7 @@ internal object AliveRenderer {
         }
     }
 
-    private fun drawMount(m: Mount): Boolean {
+    private fun drawMount(m: Mount, forceDesk: Boolean = false): Boolean {
         val d = display ?: return false
         val c = context ?: return false
         val es = m.eglSurface ?: return false
@@ -2209,7 +2275,19 @@ internal object AliveRenderer {
         // 与官方 `MaskFrames.upload()==false` 时 `return` 一致：几何与遮罩共用一个采样。
         // 双画期间（解锁转场）桌面份也要走**锁屏份那套内容**（同一 lens / ratio），
         // 否则它停在 `deskState` 的终点图，与锁屏份对不上（见 [mirrorToDesk]）。
-        if (!drawScene(if (mirrorToDesk) true else m.locked)) return false
+        // ⚠️ **AOD 期间例外**（2026-11-16 用户报「桌面到 AOD 偶发闪烁」）：进 AOD 也置
+        // `mirrorToDesk`，但那时 `lens`/`ratio` 正在缩成球 —— 桌面份跟着画就成了「小圆 +
+        // 四周黑」，桌面 leash 只要可见就露系统桌面壁纸。AOD 里两份各按自己的状态画：
+        // 桌面份恒 `deskState`（全屏桌面图），锁屏份跟着球缩。
+        //
+        // `forceDesk`：让**锁屏份**也按桌面态画（[prepareLockForAod] 用）—— 那时 `lens`
+        // 已经是桌面态、`ratio` 是 `(0,0,1)` ⇒ 画出来与桌面份逐像素一致。
+        val asLocked = when {
+            forceDesk -> false
+            mirrorToDesk && !aodActive -> true
+            else -> m.locked
+        }
+        if (!drawScene(asLocked)) return false
         if (EGL14.eglSwapBuffers(d, es)) {
             if (m.locked) swapLock++ else swapDesk++
         } else {

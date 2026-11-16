@@ -85,7 +85,7 @@ import top.yukonga.miuix.kmp.basic.Button
  * 1. **图片卡**：无标题（用户指定），1:1 预览框 + 「选择/更换图片」「清空选择」**同一行**；
  * 2. **动作卡**：「生成深度缓存」+「立即替换」（后者用主题色，与视差页一致）；
  * 3. **参数调整**：卡外 `SmallTitle` + 一张卡两行 ——「**缓存推理分辨率**」（下拉栏，
- *    768 / 896 / 1024，默认 768，存 `MaskPrefs`）与「清除所有深度缓存」（右侧箭头、**无 summary**），
+ *    768 / 896 / 1024，默认 768，存 `MaskPrefs`）与「清除所有空间壁纸及缓存」（右侧箭头、**无 summary**），
  *    后者点击弹 `WindowDialog` 二次确认。
  */
 @Composable
@@ -120,7 +120,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     var shiftDir by remember { mutableFloatStateOf(0f) }
     var shiftFromPage by remember { mutableIntStateOf(-1) }
     var shiftToken by remember { mutableIntStateOf(0) }
-    // 「清除所有深度缓存」请求号（2026-11-07）：+1 交给卡片流播"全部缩小淡出 → 新建卡补位"。
+    // 「清除所有空间壁纸及缓存」请求号（2026-11-07）：+1 交给卡片流播"全部缩小淡出 → 新建卡补位"。
     var clearSeq by remember { mutableIntStateOf(0) }
 
     var shortSide by remember { mutableStateOf(prefs.spatialShortSide) }
@@ -510,7 +510,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     }
 
     /**
-     * 「清除所有深度缓存」的动画收尾（2026-11-07）：卡片流让所有非新建卡播完 200ms
+     * 「清除所有空间壁纸及缓存」的动画收尾（2026-11-07）：卡片流让所有非新建卡播完 200ms
      * 缩小淡出后回调这里。**必须在这一帧同步清空列表** —— 新建卡的补位进度就是按
      * `candidates` 变空的那一帧创建的，先做 IO 再清会看到它先瞬移到中间、再滑回来。
      *
@@ -613,7 +613,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                     }
                 },
                 onDeleteSettled = { commitDelete() },
-                // 「清除所有深度缓存」：卡片流负责让所有非新建卡缩小淡出、播完在这一帧回调。
+                // 「清除所有空间壁纸及缓存」：卡片流负责让所有非新建卡缩小淡出、播完在这一帧回调。
                 onClearSettled = { commitClearAll() },
                 // 推理期间**收起所有删除钮**（用户 2026-11-04）：一次 7~10s，
                 // 中途把正在算的那张删掉，结果就没处可写了。
@@ -849,7 +849,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                     }
                 },
             )
-            // 「缓存推理分辨率」（2026-10-22 用户要求，**排在「清除所有深度缓存」上面**）：
+            // 「缓存推理分辨率」（2026-10-22 用户要求，**排在「清除所有空间壁纸及缓存」上面**）：
             // 下拉栏 = 设置页「主题」那一套 `DropdownRow`（官方 `OverlayListPopup` 积木）。
             DropdownRow(
                 title = "缓存推理分辨率",
@@ -862,7 +862,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                     prefs.setSpatialShortSide(value)
                 },
             )
-            // 「空间壁纸生效范围」（2026-10-28 用户要求，**排在「清除所有深度缓存」上面**）：
+            // 「空间壁纸生效范围」（2026-10-28 用户要求，**排在「清除所有空间壁纸及缓存」上面**）：
             // 锁屏（默认）/ 桌面 / 全局。**无 summary**（用户指定）。
             // 只决定渲染器挂哪条壁纸 leash，**不影响层图生成** ⇒ 切换不需要重算缓存。
             // 两条 leash 完全独立（真机探针：挂锁屏那条时锁屏可见、桌面不可见）。
@@ -911,7 +911,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
             )
         }
 
-        // 「清除所有深度缓存」**独立成一张卡**（2026-10-30 用户要求）+ 语义红 + 无箭头。
+        // 「清除所有空间壁纸及缓存」**独立成一张卡**（2026-10-30 用户要求）+ 语义红 + 无箭头。
         // 颜色用 `MiuixTheme.colorScheme.error`（miuix 规范：浅 #E94634 / 深 #F12522），
         // 不自造色值 —— 它会跟着深浅主题自动切换。
         Card(
@@ -922,7 +922,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
             insideMargin = PaddingValues(0.dp),
         ) {
             BasicComponent(
-                title = "清除所有深度缓存",
+                title = "清除所有空间壁纸及缓存",
                 // **无 summary**（用户 2026-10-22 指定）。
                 summary = null,
                 titleColor = BasicComponentColors(
@@ -943,11 +943,11 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     ClearCacheDialog(
         show = showClearConfirm,
         summary = when {
-            serviceRunning -> "清除后，深度缓存需重新生成。当前空间壁纸正在运行，" +
+            serviceRunning -> "所有空间壁纸及缓存将被清除。当前空间壁纸正在运行，" +
                 "点击“清除”后将自动恢复到系统默认壁纸。"
-            activeKey.isNotEmpty() -> "清除后，深度缓存需重新生成。当前空间壁纸正在运行，" +
+            activeKey.isNotEmpty() -> "所有空间壁纸及缓存将被清除。当前空间壁纸正在运行，" +
                 "点击“清除”后将自动关闭替换。"
-            else -> "清除后，深度缓存需重新生成。"
+            else -> "所有空间壁纸及缓存将被清除。"
         },
         onDismissRequest = { showClearConfirm = false },
         onConfirm = {
@@ -973,7 +973,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
         },
     )
 
-    // 「删除此图片？」确认框（2026-11-04，照搬光栅页「删除此搭配？」的形态）：
+    // 「删除此图片？」确认框（2026-11-04，照搬光栅页「删除此组合？」的形态）：
     // 标题 + 正文 + 取消 / 确认（**确认键用警示色**）。确认后才播缩小淡出，播完真删。
     SpatialDeleteDialog(
         show = pendingDelete != null,
@@ -1033,7 +1033,7 @@ private fun scopeLabel(v: Int): String =
     SPATIAL_SCOPE_LABELS.getOrElse(v) { SPATIAL_SCOPE_LABELS[0] }
 
 /**
- * 「删除此图片？」确认框（2026-11-04，照搬光栅页「删除此搭配？」）。
+ * 「删除此图片？」确认框（2026-11-04，照搬光栅页「删除此组合？」）。
  *
  * 结构照 [ClearCacheDialog]：`WindowDialog` + `SpaceBetween` + 两个 `TextButtonLike`，
  * **确认键用 miuix 警示主题色**（`colorScheme.error` 底 + `onError` 字）。
@@ -1079,7 +1079,7 @@ private fun SpatialDeleteDialog(
 }
 
 /**
- * 「清除所有深度缓存」的二次确认弹窗。
+ * 「清除所有空间壁纸及缓存」的二次确认弹窗。
  *
  * **正文走 `WindowDialog` 的 `summary` 参数**（miuix 官方正文位，自带官方字号 / 颜色 / 与标题的间距），
  * 不要自己在 `content` 里塞 `Text` —— 那样字号、行距、对齐都跟官方不一致。
@@ -1120,7 +1120,7 @@ private fun ClearCacheDialog(
                 TextButtonLike(
                     text = "清除",
                     // 警示色（用户 2026-11-04）：清缓存是不可恢复的破坏性操作，
-                    // 与「删除此搭配」同一档配色（`colorScheme.error` 底 + `onError` 字）。
+                    // 与「删除此组合」同一档配色（`colorScheme.error` 底 + `onError` 字）。
                     danger = true,
                     onClick = {
                         onConfirm()

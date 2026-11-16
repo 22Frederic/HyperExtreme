@@ -71,7 +71,7 @@ import top.yukonga.miuix.kmp.window.WindowDialog
  * 1. **卡片流** —— 与光栅同一套 [CoverCarousel]，一张卡 = 一张照片，最左边是「新建」；
  * 2. **主按钮** —— 三态（无服务模式：`新图片` / `应用` / `取消应用`）；
  * 3. **参数占位卡** —— 用户 2026-11-07 明确「下面那些选项就改成一个卡片，内容占位就行」；
- * 4. **清除所有搭配** —— 红字危险卡 + 二次确认 + 卡片流清除动画（照光栅）。
+ * 4. **清除所有Alive壁纸组合** —— 红字危险卡 + 二次确认 + 卡片流清除动画（照光栅）。
  *
  * ## 和光栅的差别
  *
@@ -109,6 +109,8 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
     var showClearAll by remember { mutableStateOf(false) }
     var showConflict by remember { mutableStateOf(false) }
     var conflictOther by remember { mutableStateOf<RunningWallpaper?>(null) }
+    // AOD 没开时点「应用」弹的提示（2026-11-16，原来是 toast）
+    var showAodWarn by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     // （2026-11-14 删掉「壁纸重置提示」的三个状态：showWallpaperReset / pendingApply / resetting。
     //   该功能属误诊，已在 [apply] 的注释里说明。）
@@ -251,8 +253,9 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         // **AOD 没开就别应用**（2026-11-10 用户要求）：Alive 的两种样式（启航 / 留光）
         // 都是给息屏显示做的，AOD 关着应用上去等于什么都没发生，白让用户以为坏了。
         // 判据 = 系统「息屏显示」总开关（`doze_always_on`，见 [AodState]）。
+        // 2026-11-16：从 toast 改成弹窗（带一个「跳转」直达系统「息屏」一级页）。
         if (!AodState.enabled(ctx)) {
-            Toast.makeText(ctx, "AOD未开启，请先开启AOD再使用", Toast.LENGTH_LONG).show()
+            showAodWarn = true
             return
         }
         val other = WallpaperConflict.running(ctx, state, WallpaperChain.ALIVE)
@@ -307,7 +310,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         scope.launch {
             val n = withContext(Dispatchers.IO) { AliveStore.deleteAll(ctx) }
             reload++
-            Toast.makeText(ctx, "已清除 $n 项搭配", Toast.LENGTH_SHORT).show()
+            Toast.makeText(ctx, "已清除 $n 项组合", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -458,7 +461,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             )
         }
 
-        // 「清除所有搭配」独立成一张卡 + 语义红 + 无箭头（照光栅 / 空间）
+        // 「清除所有Alive壁纸组合」独立成一张卡 + 语义红 + 无箭头（照光栅 / 空间）
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -467,7 +470,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             insideMargin = PaddingValues(0.dp),
         ) {
             BasicComponent(
-                title = "清除所有搭配",
+                title = "清除所有Alive壁纸组合",
                 summary = null,
                 titleColor = BasicComponentColors(
                     color = MiuixTheme.colorScheme.error,
@@ -483,8 +486,8 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
 
     // 删除确认（常驻组合树、用 show 控制 —— 条件包裹会让 miuix 的退出动画播不出来）
     WindowDialog(
-        title = "删除此搭配？",
-        summary = "搭配内的图片缓存将被删除",
+        title = "删除此组合？",
+        summary = "组合内的图片缓存将被删除",
         show = pendingDelete != null,
         onDismissRequest = { pendingDelete = null },
     ) {
@@ -516,11 +519,11 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
     }
 
     WindowDialog(
-        title = "删除所有搭配？",
+        title = "请确认",
         summary = if (activeId.isNotEmpty()) {
-            "所有搭配内的图片缓存将被删除。当前 Alive壁纸正在运行，点击“清除”后将自动关闭替换。"
+            "所有Alive壁纸组合内的图片缓存将被清除。当前 Alive壁纸正在运行，点击“清除”后将自动关闭替换。"
         } else {
-            "所有搭配内的图片缓存将被删除。"
+            "所有Alive壁纸组合内的图片缓存将被清除。"
         },
         show = showClearAll,
         onDismissRequest = { showClearAll = false },
@@ -597,6 +600,19 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             showConflict = false
             conflictOther = null
             if (other != null) scope.launch { WallpaperConflict.disable(ctx, state, other) }
+        },
+    )
+
+    // AOD 未开启提示（2026-11-16）：原来是 toast，现在带「跳转」直达系统「息屏」一级页。
+    // 跳转后不自动重试应用（用户 2026-11-16 定）—— 回来再点一次即可。
+    AodRequiredDialog(
+        show = showAodWarn,
+        onDismissRequest = { showAodWarn = false },
+        onJump = {
+            showAodWarn = false
+            if (!AodState.openSettings(ctx)) {
+                Toast.makeText(ctx, "无法打开系统息屏设置，请手动前往", Toast.LENGTH_LONG).show()
+            }
         },
     )
 

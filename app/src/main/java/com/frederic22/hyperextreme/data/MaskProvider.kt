@@ -101,7 +101,15 @@ class MaskProvider : ContentProvider() {
             val slot = uri.pathSegments.getOrNull(2).orEmpty()
             // depth = 锁屏景深主体：优先 AICR 抠像，没有就用用户导入的遮罩/主体
             val name = when (slot) {
-                "desk" -> o?.optString("desktop").orEmpty()
+                // desk = 桌面图。**「桌面与锁屏一致」开着时返回空**（2026-11-16 修）：
+                // 从前这里无条件返回 `desktop` 字段 ⇒ 勾选「一致」后渲染器仍读到旧桌面图
+                // （`deskBmp != null` ⇒ `sameLayer=false` + `deskTex=旧图`）⇒ 桌面还是原来那张。
+                // 与 `aod` 槽同款语义：空串过不了白名单正则 ⇒ 404 ⇒ 渲染器回落锁屏图。
+                "desk" -> if (o?.optBoolean("followLock", false) == true) {
+                    ""
+                } else {
+                    o?.optString("desktop").orEmpty()
+                }
                 "depth" -> o?.optString("lockSubject").orEmpty()
                     .ifEmpty { o?.optString("lockMask").orEmpty() }
                 // aod = 用户自选的 AOD 图（2026-11-09）。**「AOD 与锁屏一致」开着时返回空**：

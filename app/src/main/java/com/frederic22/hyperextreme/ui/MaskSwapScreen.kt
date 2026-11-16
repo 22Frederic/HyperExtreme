@@ -33,6 +33,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
@@ -264,6 +266,38 @@ private fun MaskSwapShell(
         show = askRestartAod,
         onDismissRequest = { askRestartAod = false },
         onConfirm = { state.restartTargets(it) },
+    )
+
+    // 检查更新（2026-11-16）：**每天（北京时间）首次**进模块自动查一次。
+    // 这里是冷启动那条路；回前台 / 跨零点走 [MaskUiState.onResume]。
+    // 两处都受同一个日期闸门约束，重复调用直接返回（开关关着也直接返回）。
+    LaunchedEffect(Unit) { state.autoCheckUpdateOnce() }
+
+    // 更新相关三个弹窗 —— 与其它弹窗一样**常驻组合树、用 show 控制**
+    //（条件包裹会让 miuix 的退出动画播不出来）。
+    UpdateFoundDialog(
+        show = state.updateFound != null,
+        versionName = state.updateFound?.versionName.orEmpty(),
+        versionCode = state.updateFound?.versionCode ?: 0,
+        onDismissRequest = { state.updateFound = null },
+        onConfirm = {
+            state.updateFound = null
+            // 不直接跳转：再弹「选择平台」（大陆用户多半要走网盘）
+            state.showReleaseDialog = true
+        },
+    )
+    UpdateFailedDialog(
+        show = state.updateFailed,
+        onDismissRequest = { state.updateFailed = false },
+    )
+    PlatformDialog(
+        show = state.showReleaseDialog,
+        onDismissRequest = { state.showReleaseDialog = false },
+        onPick = { url ->
+            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                .onFailure { AppToast.show(context, "无法打开链接") }
+        },
+        entries = ReleaseEntries,
     )
 
     // 「屏幕灭亮提醒」也搬去 `MaskDetailActivity` 了：它只可能被二级页的「立即替换」触发
@@ -851,7 +885,7 @@ internal fun BigStatusCard(
                     Column {
                         Text(text = statusText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(1.dp))
-                        // `versionName` 是 "1.0 Beta4"（不带 v），界面统一拼一个 "v" 显示。
+                        // `versionName` 是 "1.0 Beta5"（不带 v），界面统一拼一个 "v" 显示。
                         Text(text = "v$version", fontSize = 15.sp)
                     }
                 }
@@ -925,7 +959,7 @@ internal fun deviceName(context: Context): String = runCatching {
  * [RestartDialog] 都在别的文件里用它。
  *
  * 2026-11-03 加 [danger]：**警示主题色**（`colorScheme.error` 底 + `onError` 字），
- * 给「删除此搭配？」这类不可恢复的确认用；默认 false，原有调用一个字都不用改。
+ * 给「删除此组合？」这类不可恢复的确认用；默认 false，原有调用一个字都不用改。
  */
 @Composable
 internal fun RowScope.TextButtonLike(

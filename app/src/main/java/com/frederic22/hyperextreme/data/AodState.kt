@@ -1,7 +1,9 @@
 package com.frederic22.hyperextreme.data
 
+import android.content.ComponentName
 import android.content.ContentResolver
 import android.content.Context
+import android.content.Intent
 import android.database.ContentObserver
 import android.net.Uri
 import android.os.Handler
@@ -53,6 +55,37 @@ object AodState {
     fun fullScreen(ctx: Context): Boolean = runCatching {
         Settings.Secure.getInt(ctx.contentResolver, KEY_FULL_SCREEN, 0) == 1
     }.getOrDefault(false)
+
+    /**
+     * 打开系统「息屏」**一级设置页**（2026-11-16）。
+     *
+     * 三个候选都在真机上试过：
+     *
+     * | 入口 | 实测落点 |
+     * |---|---|
+     * | `miui.aod.action.router` → `RouterActivity` | ❌ `Status: ok` 但路由到 **`com.android.settings/.MainSettings`**（设置首页） |
+     * | `com.miui.aod.Setting` → `AodShowModeSettingActivity` | ⚠️ 能到，但是**二级页「显示模式」** |
+     * | **`com.miui.aod.style_list` → `AodStyleCategoriesActivity`** | ✅ **一级页「息屏」**（息屏显示开关 / 息屏样式 / 显示模式 / 显示通知 / 息屏预览） |
+     *
+     * `AodStyleCategoriesActivity` 的 `exported=true`（读设备 manifest 核过），普通应用可直接启动。
+     *
+     * @return false = 起不来（调用方自己兜底提示），**不抛**。
+     */
+    fun openSettings(ctx: Context): Boolean {
+        val byAction = Intent(AOD_SETTINGS_ACTION).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (runCatching { ctx.startActivity(byAction) }.isSuccess) return true
+        // ROM 把 action 改掉时还能用：显式 component 再试一次
+        val byComponent = Intent().apply {
+            component = ComponentName(AOD_SETTINGS_PKG, AOD_SETTINGS_CLS)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching { ctx.startActivity(byComponent) }.isSuccess
+    }
+
+    /** 系统「息屏」一级页的入口（2026-11-16 实测，见 [openSettings]）。 */
+    private const val AOD_SETTINGS_ACTION = "com.miui.aod.style_list"
+    private const val AOD_SETTINGS_PKG = "com.miui.aod"
+    private const val AOD_SETTINGS_CLS = "com.miui.aod.settings.AodStyleCategoriesActivity"
 
     /**
      * 监听总开关变化（主线程回调）。

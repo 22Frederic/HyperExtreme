@@ -524,6 +524,24 @@ class MaskPrefs(context: Context) {
     val monetColor: Boolean
         get() = prefs.getBoolean(KEY_MONET_COLOR, false)
 
+    /**
+     * 「自动检测更新」（2026-11-16，**默认关**）。
+     *
+     * 开着时：**每天（北京时间）首次进入模块**会去 Gitee 拉一次 `config.json`，
+     * 一天最多一次请求（日期闸门见 [updateLastAutoDate]，逻辑在 `MaskUiState.autoCheckUpdateOnce`）。
+     * 关着时「立即检测更新」仍然可用 —— 那是一次性动作，不受本开关影响。
+     */
+    val autoUpdateCheck: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_UPDATE_CHECK, false)
+
+    /**
+     * 「自动检测」最后执行那天的日期（北京时间 `yyyy-MM-dd`，空 = 从没查过）。
+     *
+     * ⚠️ 必须落 prefs：v1040005 用的是进程内布尔，进程一重启就归零 ⇒ 一天开 10 次查 10 次。
+     */
+    val updateLastAutoDate: String
+        get() = prefs.getString(KEY_UPDATE_LAST_AUTO, "") ?: ""
+
     // ---------------------------------------------------------------- 视差壁纸效果（2026-10-12 加）
 
     /**
@@ -826,6 +844,14 @@ class MaskPrefs(context: Context) {
         prefs.edit().putBoolean(KEY_MONET_COLOR, value).commit()
     }
 
+    fun setAutoUpdateCheck(value: Boolean) {
+        prefs.edit().putBoolean(KEY_AUTO_UPDATE_CHECK, value).commit()
+    }
+
+    fun setUpdateLastAutoDate(value: String) {
+        prefs.edit().putString(KEY_UPDATE_LAST_AUTO, value).commit()
+    }
+
     /** 图片内容变化后调用，hook 侧靠它判断缓存是否过期。 */
     fun bumpRevision() {
         prefs.edit().putLong(KEY_REVISION, revision + 1L).commit()
@@ -1039,6 +1065,10 @@ class MaskPrefs(context: Context) {
         const val THEME_SYSTEM = "system"
         /** 「启用Monet颜色」（2026-11-07）：关 = miuix 自带配色，开 = 系统动态色。 */
         const val KEY_MONET_COLOR = "monet_color"
+        /** 「自动检测更新」（2026-11-16）：每天（北京时间）首次进模块查一次 Gitee，默认关。 */
+        const val KEY_AUTO_UPDATE_CHECK = "auto_update_check"
+        /** 自动检测最后执行那天的北京时间日期（`yyyy-MM-dd`），一天最多一次请求的闸门。 */
+        const val KEY_UPDATE_LAST_AUTO = "update_last_auto_date"
         const val KEY_INJECTED_WALLPAPER = "injected_wallpaper_md5"
         const val KEY_WALLPAPER_SIZE = "wallpaper_size"
         const val KEY_DISPLAY_WALLPAPER_SIZE = "display_wallpaper_size"

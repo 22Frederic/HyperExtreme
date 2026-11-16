@@ -1108,6 +1108,45 @@ internal fun SettingsTab(
             )
         }
 
+        // 「更新」（2026-11-16）：自动检测（**App 进程启动后第一次**）+ 手动检测 + 模块发布页。
+        // 数据源只有 Gitee 一个 GET（GitHub 只在 Gitee 失败时兜底），夸克网盘**只作跳转目标**。
+        SmallTitle(text = "更新")
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp),
+            insideMargin = PaddingValues(0.dp),
+        ) {
+            SwitchRow(
+                title = "自动检测更新",
+                summary = "在每天首次进入模块时自动检测",
+                checked = state.autoUpdateCheck,
+                onCheckedChange = { state.applyAutoUpdateCheck(it) },
+            )
+            BasicComponent(
+                title = "立即检测更新",
+                // **无 summary**（用户 2026-11-16 指定）。点击反馈改成 short toast
+                //「正在检测，请稍后」（见 `MaskUiState.checkUpdate` 入口）。
+                summary = null,
+                // ⚠️ `BasicComponent` **不自带箭头**（2026-11-16 用户报"选项右侧箭头呢"）——
+                // 必须显式给 `endActions`，与开发者卡 / 开源许可行共用同一个 [LinkArrow]。
+                endActions = { LinkArrow() },
+                onClick = {
+                    haptic()
+                    state.checkUpdate(manual = true)
+                },
+            )
+            BasicComponent(
+                title = "打开模块发布页",
+                summary = null,
+                endActions = { LinkArrow() },
+                onClick = {
+                    haptic()
+                    state.showReleaseDialog = true
+                },
+            )
+        }
+
         // 测试：这张卡片现在只剩「详细过程写入LSPosed日志」一个开关 ——
         // 「使用自定义背景」「显示自检与最近操作」2026-11-07 按用户要求整链删除
         //（排查改看 LSPosed 日志与 `run_log.txt`，用户发 log 即可，界面上不再留入口）。

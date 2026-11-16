@@ -50,21 +50,26 @@ private val PlatformEntries = listOf(
  *
  * 点某一项 = 关弹窗 + 打开链接，顺序与 [RestartDialog] 的确认一致：
  * 先 `onDismissRequest` 再 `dismissState.invoke()`，让退出动画正常播。
+ *
+ * 2026-11-16：[title] / [entries] 提成参数（**都有默认值**，现有调用一个字不用改）——
+ * 「发现新版本 → 确认」也用它，条目换成 [ReleaseEntries]（夸克网盘 / 百度网盘 / GitHub Release）。
  */
 @Composable
 internal fun PlatformDialog(
     show: Boolean,
     onDismissRequest: () -> Unit,
     onPick: (String) -> Unit,
+    title: String = "选择平台",
+    entries: List<Pair<String, String>> = PlatformEntries,
 ) {
     WindowDialog(
-        title = "选择平台",
+        title = title,
         show = show,
         onDismissRequest = onDismissRequest,
     ) {
         val dismissState = LocalDismissState.current
         Column(modifier = Modifier.fillMaxWidth()) {
-            PlatformEntries.forEach { (label, url) ->
+            entries.forEach { (label, url) ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
