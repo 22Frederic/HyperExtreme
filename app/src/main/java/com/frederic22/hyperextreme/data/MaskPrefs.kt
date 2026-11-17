@@ -130,6 +130,21 @@ class MaskPrefs(context: Context) {
     }
 
     /**
+     * Alive 壁纸生效范围（0 锁屏 / 2 全局）。
+     *
+     * 默认全局 = 加这个选项之前的行为（锁屏、桌面、AOD 都要有画面）。
+     * 与光栅的 [rasterScope] 同值域，但 Alive 不需要「仅桌面」—— AOD 只有锁屏 leash 可挂。
+     */
+    val aliveScope: Int
+        get() = prefs.getInt(KEY_ALIVE_SCOPE, SPATIAL_SCOPE_GLOBAL)
+            .takeIf { it == SPATIAL_SCOPE_LOCK || it == SPATIAL_SCOPE_GLOBAL }
+            ?: SPATIAL_SCOPE_GLOBAL
+
+    fun setAliveScope(value: Int) {
+        prefs.edit().putInt(KEY_ALIVE_SCOPE, value).commit()
+    }
+
+    /**
      * 光栅壁纸的**最大幅度角度**（度，15..60，默认 25）—— 2026-11-04 用户要求。
      *
      * 语义：从第一张擦到最后一张需要的**横向转角**。值越大越"钝"（要转更多才换一张）。
@@ -365,7 +380,7 @@ class MaskPrefs(context: Context) {
      *
      * 卡的内容不在这里（`files/alive/<id>/` 目录即真相，见 [AliveStore]），这里只留指针。
      * Alive **只有 LSPosed 一种挂载方式**（要 AOD 动画，系统壁纸服务那条路做不了），
-     * 所以没有挂载模式 / 生效范围两项。
+     * 所以没有挂载模式；生效范围见 [aliveScope]。
      */
     val aliveActiveId: String
         get() = prefs.getString(KEY_ALIVE_ACTIVE, "").orEmpty()
@@ -947,6 +962,7 @@ class MaskPrefs(context: Context) {
         const val KEY_RASTER_SCOPE = "raster_scope"
         const val KEY_RASTER_LOCK_DEPTH = "raster_lock_depth"
         const val KEY_ALIVE_LOCK_DEPTH = "alive_lock_depth"
+        const val KEY_ALIVE_SCOPE = "alive_scope"
         const val KEY_RASTER_MAX_ANGLE = "raster_max_angle"
         const val KEY_RASTER_TRANSITION = "raster_transition"
         const val KEY_RASTER_SETTLE = "raster_settle"

@@ -148,6 +148,19 @@ internal object AliveRenderer {
     @Volatile
     private var runningScope = -1
 
+    /** 本次运行的桌面份模式（[AliveFlag.DESK_FOLLOW] / [AliveFlag.DESK_OWN] / [AliveFlag.DESK_NONE]）。 */
+    @Volatile
+    private var runningDeskMode = -1
+
+    /**
+     * 桌面份是否**完全不参与**（仅锁屏档，或全局档桌面留空）。
+     *
+     * 不能按 `mounts` 反推：全局档在共用 leash 上也会主动丢掉桌面份，
+     * 那样会被误判成「没有桌面」，解锁后把 Alive 整份隐掉。
+     */
+    @Volatile
+    private var desktopHidden = false
+
     private var appCtx: Context? = null
     private var screenW = 0
     private var screenH = 0
@@ -446,15 +459,19 @@ internal object AliveRenderer {
 
     // ───────────────────────────── 启动 ─────────────────────────────
 
-    fun start(ctx: Context, key: String, scope: Int) {
+    fun start(ctx: Context, key: String, scope: Int, deskMode: Int) {
         val h = ensureHandler()
         // 样式也算「启动参数」：它只在 `startInternal` 里读一次属性，
         // 变了就必须重建（否则切了样式还在画上一种，2026-11-09 真机）。
         val wantStyle = HookRuntime.systemProperty(AliveFlag.PROP_STYLE)?.toIntOrNull() ?: 0
         h.post {
-            if (runningKey == key && runningScope == scope && aodStyle == wantStyle) return@post
+            if (runningKey == key && runningScope == scope && runningDeskMode == deskMode &&
+                aodStyle == wantStyle
+            ) {
+                return@post
+            }
             if (runningKey != null) stopInternal("重启")
-            runCatching { startInternal(ctx, key, scope) }
+            runCatching { startInternal(ctx, key, scope, deskMode) }
                 .onFailure {
                     HookRuntime.log("$TAG 启动失败：${it.javaClass.simpleName}: ${it.message}")
                     stopInternal("启动失败")
@@ -473,8 +490,10 @@ internal object AliveRenderer {
         return Handler(t.looper).also { handler = it }
     }
 
-    private fun startInternal(ctx: Context, key: String, scope: Int) {
+    private fun startInternal(ctx: Context, key: String, scope: Int, deskMode: Int) {
         val t0 = SystemClock.elapsedRealtime()
+        // 桌面份完全不参与：仅锁屏档，或全局档桌面留空（露系统默认桌面壁纸）。
+        val hiddenDesktop = scope == MaskPrefs.SPATIAL_SCOPE_LOCK || deskMode == AliveFlag.DESK_NONE
         appCtx = ctx.applicationContext ?: ctx
         // Choreographer 绑定**当前线程**的 Looper —— 这里已经在 GL 线程上（start 是 post 进来的）
         choreographer = runCatching { Choreographer.getInstance() }.getOrNull()
@@ -500,10 +519,16 @@ internal object AliveRenderer {
 
         // 一、读图（走 provider —— SystemUI 进程看不到模块私有目录）
         // 2026-11-08：锁屏 / 桌面是**两张图**；桌面缺失或「桌面与锁屏一致」时只用锁屏那张。
+        // 2026-11-17：桌面份不参与（仅锁屏 / 全局留空）时**不读桌面图** ——
+        // 既省显存，也保证这份渲染器里根本不存在桌面内容可露。
         val lockBmp = loadBitmap(ctx, key, "lock", screenW * 2)
         check(lockBmp != null) { "锁屏图读不出来（key=$key）" }
         photoAspect = lockBmp.width.toFloat() / lockBmp.height
-        val deskBmp = loadBitmap(ctx, key, "desk", screenW * 2)
+        val deskBmp = if (!hiddenDesktop && deskMode == AliveFlag.DESK_OWN) {
+            loadBitmap(ctx, key, "desk", screenW * 2)
+        } else {
+            null
+        }
         sameLayer = deskBmp == null
         if (deskBmp != null) {
             deskAspect = deskBmp.width.toFloat() / deskBmp.height
@@ -512,7 +537,12 @@ internal object AliveRenderer {
         }
         HookRuntime.log(
             "$TAG 照片：锁屏 ${lockBmp.width}×${lockBmp.height}" +
-                (if (deskBmp != null) " / 桌面 ${deskBmp.width}×${deskBmp.height}" else "（桌面同锁屏）"),
+                when {
+                    hiddenDesktop -> "（桌面份不参与）"
+                    deskBmp != null -> " / 桌面 ${deskBmp.width}×${deskBmp.height}"
+                    deskMode == AliveFlag.DESK_FOLLOW -> "（桌面同锁屏）"
+                    else -> "（桌面图读不出来，回落锁屏）"
+                },
         )
 
         // 二、EGL
@@ -539,7 +569,7 @@ internal object AliveRenderer {
 
         // 三、挂载目标（与光栅同一套：按 scope 建锁屏 / 桌面两条）
         val wantLock = scope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
-        val wantDesk = scope != MaskPrefs.SPATIAL_SCOPE_LOCK
+        val wantDesk = !hiddenDesktop
         for (locked in booleanArrayOf(true, false)) {
             if (locked && !wantLock) continue
             if (!locked && !wantDesk) continue
@@ -625,8 +655,10 @@ internal object AliveRenderer {
 
         // 五、初始态：按系统真值决定从锁屏还是桌面开始
         showingDesktop = readShowingDesktop(ctx)
-        deskShown = showingDesktop
-        mode = if (showingDesktop) 2 else 1
+        // 没有桌面份时「屏幕上在桌面」也不存在 Alive 的桌面画面 ⇒ lens 停在锁屏态，
+        // 避免带着桌面态进 AOD / 解锁。
+        deskShown = showingDesktop && !hiddenDesktop
+        mode = if (deskShown) 2 else 1
         AliveGlCore.stateFor(mode, expandedScale).copyInto(lens)
         // 桌面份的固定参数（永远按桌面稳态画，见 deskState 的注释）
         AliveGlCore.stateFor(2, expandedScale).copyInto(deskState)
@@ -652,6 +684,8 @@ internal object AliveRenderer {
 
         runningKey = key
         runningScope = scope
+        runningDeskMode = deskMode
+        desktopHidden = hiddenDesktop
 
         // 六、首帧：**所有**挂载目标都要画（没有 buffer ⇒ 不显示）
         drawEveryMount()
@@ -688,7 +722,7 @@ internal object AliveRenderer {
         musicFadeTick?.let { handler?.removeCallbacks(it) }
         musicFadeTick = null
         val lockA = if (showingDesktop) 0f else 1f
-        val deskA = if (showingDesktop) 1f else 0f
+        val deskA = if (deskShown) 1f else 0f
         currentAlpha = lockA
         deskAlpha = deskA
         applyAlphaBoth(lockA, deskA)
@@ -696,8 +730,8 @@ internal object AliveRenderer {
         // 锁屏份 0（露出封面）、桌面份 1（解锁时用）。
         if (Coexist.musicCoverOn) {
             musicYielded = true
-            applyAlphaBoth(0f, 1f)
-            HookRuntime.log("$TAG 启动时 MC 封面已在锁屏上 ⇒ 以让路态启动（锁屏份 0 / 桌面份 1）")
+            applyAlphaBoth(0f, deskA)
+            HookRuntime.log("$TAG 启动时 MC 封面已在锁屏上 ⇒ 以让路态启动（锁屏份 0 / 桌面份 ${f(deskA)}）")
         }
         // **景深主体必须在启动后主动重算**（v1.22.101）：MC 让路那一下
         // `Coexist.musicCoverOn` 先翻 false、渲染器还没起来 ⇒ `SpatialForegroundHider.handle()`
@@ -738,7 +772,9 @@ internal object AliveRenderer {
         leashes[true] = leashOf(true)
         leashes[false] = leashOf(false)
         val hasLockMount = mounts.any { it.locked }
-        val shared = leashes[false] == null && mounts.any { !it.locked } && leashes[true] != null
+        // 「仅锁屏」档也只有在一条 leash 时才会共用：系统桌面 / 锁屏壁纸不同时，
+        // `leashes[false]` 非空，两份各挂各的（不能要求必须有桌面份才算共用）。
+        val shared = leashes[false] == null && leashes[true] != null
         sharedLeash = shared
         val dropDesk = shared && hasLockMount
 
@@ -1306,6 +1342,8 @@ internal object AliveRenderer {
         HookRuntime.log(
             "$TAG AOD 进入（不压暗，dim=1.00，从=${if (fromDesktop) "桌面 tr=3" else "锁屏 tr=1"}）",
         )
+        // 进 AOD 后重算「只留一份时钟」（AOD 视图可能比转场晚挂上来）
+        runCatching { SpatialForegroundHider.onAodState() }
         changeMode(0, animate = true)
         dirty = true
         aodDiagLogged = false
@@ -1389,6 +1427,14 @@ internal object AliveRenderer {
             aodActive = false
             dim = 1f
         }
+        // **桌面无 Alive 份**：和 [fadeOutOnUnlock] 同一收口（scrim 的 UNLOCKED 走这条入口）。
+        if (hidesDesktop()) {
+            mirrorToDesk = false
+            showingDesktop = true
+            deskShown = false
+            if (abs(currentAlpha) > 0.001f) applyAlpha(lockScs(), 0f)
+            return
+        }
         // AOD 直接进桌面 ⇒ tr=2 球扩；两张图不同 ⇒ 0.25s 内容交叉
         if (mode == 0 || !sameLayer) {
             crossFadeOnUnlock(handler ?: return)
@@ -1427,7 +1473,15 @@ internal object AliveRenderer {
             aodMirrorOff?.let { handler?.removeCallbacks(it) }
             aodMirrorOff = null
             mirrorToDesk = false
-            if (abs(currentAlpha - 1f) > 0.001f) applyAlpha(lockScs(), 1f)
+            if (hidesDesktop() && queryKeyguardLocked() == false) {
+                // 桌面无 Alive 份 + 已经解锁到桌面：AOD 退出的这一帧别再抬回来（会盖住光栅）。
+                showingDesktop = true
+                deskShown = false
+                if (abs(currentAlpha) > 0.001f) applyAlpha(lockScs(), 0f)
+                HookRuntime.log("$TAG AOD 退出：桌面无 Alive 份且已解锁 ⇒ 保持隐藏")
+            } else if (abs(currentAlpha - 1f) > 0.001f) {
+                applyAlpha(lockScs(), 1f)
+            }
             // ⚠️ **不无条件收桌面份 alpha**（2026-11-16）：AOD 退出的转场里系统可能同时
             // 显示两条 leash，收 0 就直接露系统桌面壁纸。桌面份的去留交给
             // `crossFadeOnUnlock` / `resetAlpha` 这些"知道目标态"的路径。
@@ -1439,6 +1493,8 @@ internal object AliveRenderer {
             // ⇒ 没有动画（用户报的「aod 到锁屏丢动画」）。
             if (mode == 0) changeMode(1, animate = true)
             HookRuntime.log("$TAG AOD 退出（回锁屏，等 scrim 裁决）")
+            // 退出 AOD 后重算（亮屏时会在条件不成立时把 AOD 自带时钟还回去）
+            runCatching { SpatialForegroundHider.onAodHidden() }
             dirty = true
             forceDraw()
             scheduleFrame()
@@ -1470,6 +1526,17 @@ internal object AliveRenderer {
             runCatching { AliveOverlay.fadeOutOnUnlock() }
             if (!screenOn()) {
                 HookRuntime.log("$TAG 解锁淡出跳过（灭屏触发）")
+                return@post
+            }
+            // **桌面无 Alive 份**（仅锁屏 / 全局留空，2026-11-17）：桌面不该有 Alive ——
+            // 直接压掉锁屏份，桌面壁纸交给系统 / 共存的光栅（共用 leash 时它按桌面态抬 alpha）。
+            if (hidesDesktop()) {
+                mirrorToDesk = false
+                showingDesktop = true
+                deskShown = false
+                fadeDoneAt = SystemClock.elapsedRealtime()
+                if (abs(currentAlpha) > 0.001f) applyAlpha(lockScs(), 0f)
+                HookRuntime.log("$TAG 解锁：桌面无 Alive 份 → 隐去锁屏份，桌面交给系统 / 光栅")
                 return@post
             }
             // **AOD 直接进桌面**（2026-11-08）：取消「回锁屏」的延迟裁决，走 tr=2 球扩。
@@ -1605,6 +1672,14 @@ internal object AliveRenderer {
      */
     private fun crossFadeOnUnlock(h: Handler) {
         if (fadeTick != null || unlocking) return
+        // 桌面无 Alive 份：没有可交叉的目标，直接压掉锁屏份。
+        if (hidesDesktop()) {
+            showingDesktop = true
+            deskShown = false
+            if (abs(currentAlpha) > 0.001f) applyAlpha(lockScs(), 0f)
+            if (screenOn()) forceDraw()
+            return
+        }
         unlocking = true
         // **先把桌面份画成当前内容**（2026-11-14）：否则它停在启动时那一帧，
         // 交叉/抬 alpha 交接时露旧画面。见 [prewarmDesktop]。
@@ -1829,6 +1904,16 @@ internal object AliveRenderer {
             }
             // 进入可见：自检壁纸层（事件驱动看门狗，2026-11-14）
             checkLeashFresh("回到前台")
+            // **桌面无 Alive 份**：桌面态保持 alpha 0，回锁屏才抬回来（与光栅仅桌面档对称）；
+            // lens 不能切桌面态 —— 这份渲染器里没有桌面内容可画。
+            if (hidesDesktop()) {
+                val target = if (showingDesktop) 0f else 1f
+                if (abs(currentAlpha - target) > 0.001f) applyAlpha(lockScs(), target)
+                deskShown = false
+                if (!aodActive) changeMode(1, animate = true)
+                if (screenOn()) forceDraw()
+                return@post
+            }
             // **画面优先**（2026-11-09）：`isKeyguardLocked` 在「已解锁到桌面、面板还没收完」
             // 时会返回 true，照它 `changeMode(1)` 就把 `mode` 从 2 拉回 1 ——
             // 下一次桌面进 AOD 就退化成 tr=1 + ratio 从 `(0,1,0)` 起（先到锁屏态）。
@@ -2072,6 +2157,7 @@ internal object AliveRenderer {
                 when (i?.action) {
                     Intent.ACTION_SCREEN_ON -> {
                         HookRuntime.log("$TAG 亮屏")
+                        runCatching { SpatialForegroundHider.onScreenState(true) }
                         // 解锁转场（tr=2 / 交叉）期间不能插进来改 mode，否则会把转场切成硬切
                         if (!aodActive && !unlocking) {
                             val locked = queryKeyguardLocked()
@@ -2088,6 +2174,7 @@ internal object AliveRenderer {
                     Intent.ACTION_SCREEN_OFF -> {
                         // 灭屏不猜 AOD，等 doWallpaperBlackAnim 的真值
                         HookRuntime.log("$TAG 灭屏")
+                        runCatching { SpatialForegroundHider.onScreenState(false) }
                     }
                 }
             }
@@ -2160,10 +2247,15 @@ internal object AliveRenderer {
             drawEveryMount()
             return
         }
+        // 「桌面无 Alive 份」时桌面态没有可画的份：`.ifEmpty { mounts }` 会去写**不可见**的
+        // 锁屏 leash ⇒ `eglSwapBuffers` 阻塞整个 GL 线程（空间壁纸 2026-10-29 同款坑）。
+        if (!aodActive && showingDesktop && hidesDesktop()) return
         val wantLocked = activeMountIsLocked()
         val group = mounts.filter { it.locked == wantLocked }.ifEmpty { mounts }
         for (m in group) drawMount(m)
     }
+
+    private fun hidesDesktop(): Boolean = desktopHidden
 
     private fun drawEveryMount() {
         for (m in mounts) drawMount(m)
@@ -2230,6 +2322,9 @@ internal object AliveRenderer {
      */
     private fun prepareLockForAod() {
         if (sharedLeash || runningKey == null) return
+        // 桌面无 Alive 份：不能把锁屏份画成桌面态再抬到 1（那等于凭空造出一份 Alive 桌面图，
+        // 正是解锁时一闪而过的来源）。进 AOD 时锁屏份由 `enterAodInternal` 自己处理。
+        if (hidesDesktop()) return
         if (aodActive || mode == 0) return
         val locks = mounts.filter { it.locked }
         if (locks.isEmpty()) return
@@ -3166,6 +3261,8 @@ internal object AliveRenderer {
         val had = runningKey != null
         runningKey = null
         runningScope = -1
+        runningDeskMode = -1
+        desktopHidden = false
         aodActive = false
         unlocking = false
         fadeTick = null
@@ -3188,6 +3285,8 @@ internal object AliveRenderer {
         mirrorToDesk = false
         // 景深主体层：撤掉我们的图（层本身还给系统）
         runCatching { AliveOverlay.onDisabled() }
+        // AOD 期间压掉的重复时钟必须还回去（`runningKey` 已清空，重算会走归还分支）
+        runCatching { SpatialForegroundHider.onAodHidden() }
 
         runCatching {
             if (mounts.isNotEmpty()) {

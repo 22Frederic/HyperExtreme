@@ -51,8 +51,10 @@ object AliveControl {
         // ⚠️ 状态必须同步写：provider 的 call 跑在 binder 线程，晚写会让 aod 侧重复触发关闭。
         prefs.setAliveActiveId(null)
         prefs.setAliveWallpaperFp("")
-        AliveFlag.push(false, null, MaskPrefs.SPATIAL_SCOPE_GLOBAL)
-        if (restartProcess) restartWallpaperService()
+        AliveFlag.push(false, null, prefs.aliveScope)
+        // 与光栅共存时**不能杀壁纸进程**：光栅的层挂在同一条 leash 下，且它没有 leash 自检，
+        // 一杀就永久失效。残留的 Alive 子层在桌面态已按锁屏档收口（alpha=0），不会遮挡。
+        if (restartProcess && prefs.rasterActiveId.isEmpty()) restartWallpaperService()
         if (toastText != null) {
             if (Looper.myLooper() == null) {
                 Handler(Looper.getMainLooper()).post {

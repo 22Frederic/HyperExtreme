@@ -124,12 +124,13 @@ internal fun HomeTab(state: MaskUiState, onOpen: (DetailPage) -> Unit) {
 
     // 「当前运行」判据与冲突弹窗共用 [WallpaperConflict]（2026-11-08）——
     // 服务模式要查 `WallpaperManager`，所以在**进前台**时算一次，别塞进重组。
-    var running by remember { mutableStateOf(WallpaperConflict.current(context, state)) }
+    // 2026-11-17：允许共存的组合会同时返回两条，主页各显示一条。
+    var running by remember { mutableStateOf(WallpaperConflict.currentAll(context, state)) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                running = WallpaperConflict.current(context, state)
+                running = WallpaperConflict.currentAll(context, state)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -137,7 +138,7 @@ internal fun HomeTab(state: MaskUiState, onOpen: (DetailPage) -> Unit) {
     }
     // 视差是 State：在本页关掉它时不会走 ON_RESUME，单独跟一下。
     LaunchedEffect(state.parallaxActive) {
-        running = WallpaperConflict.current(context, state)
+        running = WallpaperConflict.currentAll(context, state)
     }
 
     TabColumn {
@@ -182,8 +183,8 @@ internal fun HomeTab(state: MaskUiState, onOpen: (DetailPage) -> Unit) {
             }
         }
 
-        // 「当前运行」卡（2026-11-08）：四链互斥，正常最多一条；没有就整卡不出现。
-        running?.let { current ->
+        // 「当前运行」卡（2026-11-08）：允许共存的组合各显示一条；没有就整卡不出现。
+        running.forEach { current ->
             RunningWallpaperCard(current = current, onOpen = onOpen)
         }
 
@@ -365,11 +366,27 @@ private fun RunningWallpaperCard(current: RunningWallpaper, onOpen: (DetailPage)
         WallpaperChain.RASTER -> DetailPage.RasterWallpaper
         WallpaperChain.ALIVE -> DetailPage.AliveWallpaper
     }
-    val summary = when (current.chain) {
+    // 共存时两条卡要能一眼看出各管哪一半：生效范围排在挂载模式前面。
+    val scopeLabel = when (current.chain) {
+        WallpaperChain.SPATIAL, WallpaperChain.RASTER -> when (current.scope) {
+            MaskPrefs.SPATIAL_SCOPE_LOCK -> "仅锁屏"
+            MaskPrefs.SPATIAL_SCOPE_DESKTOP -> "仅桌面"
+            else -> "全局"
+        }
+        WallpaperChain.ALIVE ->
+            if (current.deskEmpty) "全局（桌面留空）"
+            else if (current.scope == MaskPrefs.SPATIAL_SCOPE_LOCK) "仅锁屏" else "全局"
+        WallpaperChain.PARALLAX -> null
+    }
+    val mountLabel = when (current.chain) {
         WallpaperChain.SPATIAL, WallpaperChain.RASTER ->
             "挂载模式（${if (current.mode == WallpaperMode.SERVICE) "系统壁纸服务" else "LSPosed"}）"
         else -> null
     }
+    val summary = listOfNotNull(
+        scopeLabel?.let { "生效范围（$it）" },
+        mountLabel,
+    ).joinToString(" · ").takeIf { it.isNotEmpty() }
     Card(
         modifier = Modifier
             .fillMaxWidth()

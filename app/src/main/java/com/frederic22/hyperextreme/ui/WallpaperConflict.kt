@@ -2,8 +2,10 @@ package com.frederic22.hyperextreme.ui
 
 import android.content.Context
 import com.frederic22.hyperextreme.data.AliveControl
+import com.frederic22.hyperextreme.data.AliveFlag
 import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.data.RasterControl
+import com.frederic22.hyperextreme.data.RasterFlag
 import com.frederic22.hyperextreme.data.SpatialControl
 import com.frederic22.hyperextreme.wallpaper.RasterServiceTarget
 import com.frederic22.hyperextreme.wallpaper.RasterWallpaperService
@@ -16,7 +18,10 @@ import kotlinx.coroutines.withContext
 /**
  * 三条壁纸链（2026-11-04）。
  *
- * 三者**互斥**：都靠"盖住系统壁纸"工作，同时开就是互相遮挡 / 双份渲染。
+ * 默认**互斥**：都靠"盖住系统壁纸"工作，同时开就是互相遮挡 / 双份渲染。
+ * 允许的共存组合只有一种：**仅桌面的桌面链（光栅 / 空间）+ Alive 仅锁屏** ——
+ * 两条链各占一条 leash 的不同态。Alive「全局 + 桌面留空」桌面同样没有 Alive 份，
+ * 在 [detect] 里按仅锁屏归一，也能共存。
  */
 internal enum class WallpaperChain {
     PARALLAX,
@@ -31,10 +36,13 @@ internal enum class WallpaperMode {
     SERVICE,
 }
 
-/** 正在运行的那条链 + 它的挂载方式。 */
+/** 正在运行的那条链 + 它的挂载方式 / 生效范围。 */
 internal data class RunningWallpaper(
     val chain: WallpaperChain,
     val mode: WallpaperMode,
+    val scope: Int = MaskPrefs.SPATIAL_SCOPE_GLOBAL,
+    /** Alive 全局档桌面留空（`DESK_NONE`）：桌面没有 Alive 份，[scope] 已按仅锁屏归一。 */
+    val deskEmpty: Boolean = false,
 ) {
     /** 弹窗文案里用的名字（用户 2026-11-04：正在运行的名字要对）。 */
     val label: String
@@ -70,8 +78,8 @@ internal object WallpaperConflict {
     /**
      * 所有**真的在跑**的链（2026-11-08）。
      *
-     * 顺序就是优先级：视差 → 空间 → 光栅 → Alive。四链互斥，正常最多一条；
-     * 脏数据（比如手动改过 prefs）下按这个顺序取第一条。
+     * 顺序就是优先级：视差 → 空间 → 光栅 → Alive。默认互斥，允许的共存组合见 [coexist]；
+     * 脏数据（比如手动改过 prefs）下按这个顺序全部返回，由调用方决定怎么显示。
      */
     private fun detect(ctx: Context, state: MaskUiState): List<RunningWallpaper> {
         val prefs = MaskPrefs(ctx)
@@ -88,16 +96,50 @@ internal object WallpaperConflict {
         if (prefs.rasterMountMode == MaskPrefs.RASTER_MOUNT_LSPOSED &&
             prefs.rasterActiveId.isNotEmpty()
         ) {
-            out.add(RunningWallpaper(WallpaperChain.RASTER, WallpaperMode.HOOK))
+            out.add(
+                RunningWallpaper(
+                    WallpaperChain.RASTER,
+                    WallpaperMode.HOOK,
+                    runningScope(
+                        RasterFlag.PROP_ACTIVE, RasterFlag.PROP_SCOPE, prefs.rasterScope,
+                    ),
+                ),
+            )
         }
         if (SpatialServiceMode.isRunning(ctx, RasterWallpaperService::class.java)) {
             out.add(RunningWallpaper(WallpaperChain.RASTER, WallpaperMode.SERVICE))
         }
         // Alive 只有 HOOK 一条链（要 AOD 动画，系统壁纸服务那条路做不了）。
         if (prefs.aliveActiveId.isNotEmpty()) {
-            out.add(RunningWallpaper(WallpaperChain.ALIVE, WallpaperMode.HOOK))
+            // **全局档桌面留空**（2026-11-17）：桌面没有 Alive 份，按仅锁屏参与共存。
+            // 判据走属性通道（SystemUI 真正在用的 `deskMode`），拿不到就当全局、不放行。
+            val aliveScope = runningScope(
+                AliveFlag.PROP_ACTIVE, AliveFlag.PROP_SCOPE, prefs.aliveScope,
+            )
+            val deskEmpty = systemProperty(AliveFlag.PROP_ACTIVE)?.trim() == "1" &&
+                systemProperty(AliveFlag.PROP_DESK_MODE)?.trim()?.toIntOrNull() ==
+                AliveFlag.DESK_NONE
+            out.add(
+                RunningWallpaper(
+                    WallpaperChain.ALIVE,
+                    WallpaperMode.HOOK,
+                    if (deskEmpty) MaskPrefs.SPATIAL_SCOPE_LOCK else aliveScope,
+                    deskEmpty = deskEmpty,
+                ),
+            )
         }
         return out
+    }
+
+    /**
+     * 生效中的链在 SystemUI 里**真正用着的范围**（属性通道）。
+     *
+     * 页面上的下拉框会先写 prefs，要等下一次「应用」才 push —— 拿 prefs 会把
+     * 「刚改成仅桌面但还没重新应用」误判成已生效，从而错误放行共存。
+     */
+    private fun runningScope(activeProp: String, scopeProp: String, fallback: Int): Int {
+        if (systemProperty(activeProp)?.trim() != "1") return fallback
+        return systemProperty(scopeProp)?.trim()?.toIntOrNull()?.takeIf { it in 0..2 } ?: fallback
     }
 
     /**
@@ -105,16 +147,50 @@ internal object WallpaperConflict {
      *
      * 同一 chain 的两种模式一起排除 —— 页面自己不需要被自己拦住。
      */
-    fun running(ctx: Context, state: MaskUiState, self: WallpaperChain): RunningWallpaper? =
-        detect(ctx, state).firstOrNull { it.chain != self }
+    fun running(
+        ctx: Context,
+        state: MaskUiState,
+        self: WallpaperChain,
+        selfScope: Int = MaskPrefs.SPATIAL_SCOPE_GLOBAL,
+        selfMode: WallpaperMode = WallpaperMode.HOOK,
+    ): RunningWallpaper? = detect(ctx, state).firstOrNull {
+        it.chain != self && !coexist(self, selfScope, selfMode, it)
+    }
 
     /**
-     * **当前正在运行的那一条**（主页「当前运行」卡用，2026-11-08）。
+     * 允许的共存组合：**仅桌面的桌面链（光栅 / 空间）+ Alive 仅锁屏**（都是 LSPosed 挂载）。
+     *
+     * 两者的层分别挂在桌面 / 锁屏 leash 上；系统只有一条 leash 时由两个渲染器
+     * 按锁屏态互补 alpha（见 `RasterRenderer.setDeskOnlyAlpha` / `SpatialRenderer.setDeskOnlyAlpha`
+     * / `AliveRenderer` 的仅锁屏档）。Alive 全局档桌面留空在 [detect] 里已归一成仅锁屏。
+     */
+    private fun coexist(
+        self: WallpaperChain,
+        selfScope: Int,
+        selfMode: WallpaperMode,
+        other: RunningWallpaper,
+    ): Boolean {
+        if (selfMode != WallpaperMode.HOOK || other.mode != WallpaperMode.HOOK) return false
+        val selfDesktop = self == WallpaperChain.RASTER || self == WallpaperChain.SPATIAL
+        val otherDesktop =
+            other.chain == WallpaperChain.RASTER || other.chain == WallpaperChain.SPATIAL
+        return when {
+            selfDesktop && selfScope == MaskPrefs.SPATIAL_SCOPE_DESKTOP ->
+                other.chain == WallpaperChain.ALIVE && other.scope == MaskPrefs.SPATIAL_SCOPE_LOCK
+            self == WallpaperChain.ALIVE && selfScope == MaskPrefs.SPATIAL_SCOPE_LOCK ->
+                otherDesktop && other.scope == MaskPrefs.SPATIAL_SCOPE_DESKTOP
+            else -> false
+        }
+    }
+
+    /**
+     * **所有正在运行的那几条**（主页「当前运行」卡用，2026-11-17）。
      *
      * 与 [running] 共用同一份 [detect]：主页与冲突弹窗对「在不在跑」永远同一个答案。
+     * 允许共存的组合会返回两条。
      */
-    fun current(ctx: Context, state: MaskUiState): RunningWallpaper? =
-        detect(ctx, state).firstOrNull()
+    fun currentAll(ctx: Context, state: MaskUiState): List<RunningWallpaper> =
+        detect(ctx, state)
 
     /**
      * 关闭指定那条链（幂等）。

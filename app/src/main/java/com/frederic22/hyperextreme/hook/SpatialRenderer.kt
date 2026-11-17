@@ -253,6 +253,17 @@ internal object SpatialRenderer {
     /** 仅桌面档在共用 leash 上的当前 alpha（-1 = 还没设过，强制写一次）。 */
     private var deskOnlyAlpha = -1f
 
+    /** 仅桌面档在共用 leash 上的桌面 SC 快照（解锁时要在任意线程同步抬 alpha）。 */
+    @Volatile private var deskOnlyScs: List<android.view.SurfaceControl> = emptyList()
+
+    /**
+     * 仅桌面档的桌面份层号：**必须压在 Alive 的锁屏份之上**（与光栅同一口径）。
+     *
+     * 共存时两个 SC 是同一 leash 的兄弟；Alive 后挂上去就默认在上面，解锁瞬间它
+     * 还没淡完的锁屏画面会盖住我们的桌面图。
+     */
+    private const val DESK_ONLY_LAYER = 1_000_000
+
     /**
      * **锁屏那一份**的 SC —— 解锁淡出 / 复位只作用于它。
      *
@@ -350,8 +361,13 @@ internal object SpatialRenderer {
      * 判据是 [runningLockDepth]（启动时读的属性快照）**而不是**属性本身 ——
      * 语义同「生效范围」：生效中改开关要等下一次替换，这里必须跟着走，
      * 否则会出现"界面刚打开、前景层立刻被接管"但渲染器还没按新参数重建的半新半旧状态。
+     *
+     * **桌面档排除**（2026-11-17）：仅桌面没有锁屏份，`keyguard_foreground_layer` 不归它，
+     * 否则会和 Alive 仅锁屏抢同一层（照 `RasterRenderer.lockDepthOn` 同一口径）。
      */
-    internal fun lockDepthOn(): Boolean = runningKey != null && runningLockDepth
+    internal fun lockDepthOn(): Boolean =
+        runningKey != null && runningLockDepth &&
+            runningScope != com.frederic22.hyperextreme.data.MaskPrefs.SPATIAL_SCOPE_DESKTOP
 
     // ── 显示区域（2026-11-04）──
     //
@@ -602,6 +618,10 @@ internal object SpatialRenderer {
      * `isFadingAway()`，它的 `stateRef` 在 SystemUI 重启后可能恒 null）。
      */
     fun fadeOutOnUnlock() {
+        // **仅桌面档 + 共用 leash：解锁起点先同步抬起桌面份**（2026-11-17，照光栅）。
+        // 不能等 `handler.post`：Alive 的锁屏份可能在另一个线程同一时刻隐掉，
+        // 中间那几帧就是用户看到的「Alive 桌面图一闪」。层号已在挂载时压到 Alive 之上。
+        if (desktopOnlyShared && screenOn()) raiseDeskOnlyNow("解锁")
         val h = handler ?: return
         h.post {
             if (runningKey == null) return@post
@@ -710,6 +730,8 @@ internal object SpatialRenderer {
         h.post {
             if (runningKey == null) return@post
             aodActive = true
+            // **仅桌面档**：AOD 是锁屏态，桌面份必须让位（共用 leash 时它会盖在 Alive 的 AOD 上）。
+            setDeskOnlyAlpha(0f)
             // 进 AOD 只画锁屏份（AOD 里桌面 leash 不可见），把解锁镜像关掉
             mirrorToDesk = false
             // 归位期间必须能画，先把冻结解开（重复进 AOD / 连续两次调用也安全）
@@ -893,6 +915,9 @@ internal object SpatialRenderer {
      * 亮屏和解锁后都会传 true，会把刚淡出的 alpha 拉回来（2026-10-28 真机踩过）。
      */
     fun resetAlpha() {
+        // 现在由 `SpatialUnlockFade` 无条件调用（仅桌面档也要翻转 alpha）⇒ 没在跑时直接收口，
+        // 别去碰 `SpatialOverlay` / 显示态。
+        if (runningKey == null) return
         val h = handler ?: return
         h.post { requestRaiseLocked(h) }
     }
@@ -1203,6 +1228,28 @@ internal object SpatialRenderer {
     }
 
     /**
+     * 解锁起点**同步**抬起仅桌面档的 alpha（不排 GL 线程，照 `RasterRenderer` 同一口径）。
+     *
+     * 解锁回调与 Alive 隐去锁屏份是两个线程上的动作：等 `handler.post` 轮到时，
+     * Alive 那份可能已经先隐掉、露出底下的系统 / 旧画面。
+     */
+    private fun raiseDeskOnlyNow(reason: String) {
+        if (!desktopOnlyShared || deskOnlyAlpha >= 0.99f) return
+        val scs = deskOnlyScs
+        if (scs.isEmpty()) return
+        val tx = txAlpha ?: return
+        runCatching {
+            val obj = tx.first.getConstructor().newInstance()
+            scs.forEach { tx.second.invoke(obj, it, 1f) }
+            tx.third.invoke(obj)
+            deskOnlyAlpha = 1f
+            HookRuntime.log("SPATIAL 仅桌面 alpha=1.0（$reason 同步抬起）")
+        }.onFailure {
+            HookRuntime.log("SPATIAL 仅桌面同步抬 alpha 失败：${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
+    /**
      * **仅桌面档在共用 leash 上的可见性**（2026-11-05，问题一）。
      *
      * 这份层锁屏时也在屏幕上（系统只有一条 leash），所以锁屏 alpha 0、桌面 alpha 1。
@@ -1427,6 +1474,7 @@ internal object SpatialRenderer {
         sharedLeash = false
         desktopOnlyShared = false
         deskOnlyAlpha = -1f
+        deskOnlyScs = emptyList()
         check(drawEveryMount()) { "swapBuffers 失败" }
         HookRuntime.log(
             "SPATIAL 首帧：所有挂载目标各写一帧（当前视为${if (showingDesktop) "桌面" else "锁屏"}态）",
@@ -1455,6 +1503,11 @@ internal object SpatialRenderer {
             "reparent", android.view.SurfaceControl::class.java, android.view.SurfaceControl::class.java,
         )
         val show = txClass.getMethod("show", android.view.SurfaceControl::class.java)
+        val setLayer = txClass.getMethod(
+            "setLayer",
+            android.view.SurfaceControl::class.java,
+            Int::class.javaPrimitiveType,
+        )
         // ⚠️ **挂载时不设 alpha**（v1.22.100 回退 v1.22.97 的「先全透再淡入」）：
         // 那套淡入只对 `lockScs` 生效，桌面份（`locked=false`）设成 0 之后再没人抬
         // ⇒ 全局 / 桌面档在桌面上永远是空的。新建 SC 默认 alpha=1，正是 v1.22.95 的行为。
@@ -1497,6 +1550,10 @@ internal object SpatialRenderer {
             runCatching {
                 reparent.invoke(tx, m.sc, leash)
                 show.invoke(tx, m.sc)
+                // 仅桌面档与 Alive 共存时压在上面（与光栅同一口径）
+                if (desktopOnlyShared && !m.locked) {
+                    setLayer.invoke(tx, m.sc, DESK_ONLY_LAYER)
+                }
                 m.leash = leash as? android.view.SurfaceControl
                 mounted.add(m)
                 HookRuntime.log("SPATIAL 挂载：scope=$scope showWhenLocked=${m.locked} leash=@$hash")
@@ -1530,6 +1587,7 @@ internal object SpatialRenderer {
         }
         check(mounts.isNotEmpty()) { "全部目标挂载失败（scope=$scope）" }
         if (desktopOnlyShared) {
+            deskOnlyScs = mounts.filter { !it.locked }.map { it.sc }
             HookRuntime.log(
                 "SPATIAL 仅桌面档：挂到共用 leash 后按锁屏态设 alpha" +
                     "（当前=${if (showingDesktop) "桌面 1.0" else "锁屏 0.0"}）",
@@ -1895,6 +1953,7 @@ internal object SpatialRenderer {
         sharedLeash = false
         desktopOnlyShared = false
         deskOnlyAlpha = -1f
+        deskOnlyScs = emptyList()
         unfreezeTransition()
         // AOD 状态一起收口：归位 / 压暗两条 runnable 必须摘掉，否则会往已销毁的 GL 上 post。
         cancelAodHomeLocked()

@@ -521,6 +521,8 @@ class HookEntry : XposedModule() {
             // 样式一变必须重启，否则实机还画着上一种（2026-11-09 真机：
             // 「aod 不显示相卡，缩放完还有启航晃一下」= 还在按 style=0 画球）。
             var lastStyle = Int.MIN_VALUE
+            // 桌面份模式（跟随锁屏 / 自有图 / 不要桌面）：决定渲染器建不建桌面份
+            var lastDeskMode = Int.MIN_VALUE
             // 图片版本（2026-11-09）：换图不改 id，只靠 key/style 判不出变化 ⇒ 新图进不了 GL
             var lastVer: String? = null
             // MC 让路只淡锁屏份、不停渲染器（v1.22.105）；不置 lastKey=null，避免恢复时重建
@@ -576,13 +578,19 @@ class HookEntry : XposedModule() {
                     val style = HookRuntime.systemProperty(
                         com.frederic22.hyperextreme.data.AliveFlag.PROP_STYLE,
                     ).trim().toIntOrNull() ?: 0
+                    val deskMode = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.AliveFlag.PROP_DESK_MODE,
+                    ).trim().toIntOrNull()
+                        ?.takeIf { it in 0..2 }
+                        ?: com.frederic22.hyperextreme.data.AliveFlag.DESK_FOLLOW
                     val ver = HookRuntime.systemProperty(
                         com.frederic22.hyperextreme.data.AliveFlag.PROP_VER,
                     ).trim()
                     if (tick <= 3 || tick % 60 == 0) {
                         HookRuntime.log(
                             "ALIVE 轮询 tick=$tick active=$active key=$key scope=$scope " +
-                                "style=$style ver=$ver last=$lastKey/$lastScope/$lastStyle/$lastVer",
+                                "style=$style desk=$deskMode ver=$ver " +
+                                "last=$lastKey/$lastScope/$lastStyle/$lastDeskMode/$lastVer",
                         )
                     }
                     if (!aodOn) {
@@ -596,6 +604,7 @@ class HookEntry : XposedModule() {
                                 lastKey = null
                                 lastScope = Int.MIN_VALUE
                                 lastStyle = Int.MIN_VALUE
+                                lastDeskMode = Int.MIN_VALUE
                                 lastVer = null
                             }
                         }
@@ -632,21 +641,23 @@ class HookEntry : XposedModule() {
                                 lastKey = null
                                 lastScope = Int.MIN_VALUE
                                 lastStyle = Int.MIN_VALUE
+                                lastDeskMode = Int.MIN_VALUE
                                 lastVer = null
                             }
                             if (key != lastKey || scope != lastScope || style != lastStyle ||
-                                ver != lastVer
+                                deskMode != lastDeskMode || ver != lastVer
                             ) {
                                 val ctx = HookRuntime.appContext()
                                 if (ctx != null) {
                                     HookRuntime.log(
-                                        "ALIVE 开关=开 key=$key scope=$scope style=$style ver=$ver " +
-                                            "→ 启动渲染器",
+                                        "ALIVE 开关=开 key=$key scope=$scope style=$style " +
+                                            "desk=$deskMode ver=$ver → 启动渲染器",
                                     )
-                                    AliveRenderer.start(ctx, key, scope)
+                                    AliveRenderer.start(ctx, key, scope, deskMode)
                                     lastKey = key
                                     lastScope = scope
                                     lastStyle = style
+                                    lastDeskMode = deskMode
                                     lastVer = ver
                                     lastStartAt = System.currentTimeMillis()
                                 }
@@ -657,6 +668,7 @@ class HookEntry : XposedModule() {
                             lastKey = null
                             lastScope = Int.MIN_VALUE
                             lastStyle = Int.MIN_VALUE
+                            lastDeskMode = Int.MIN_VALUE
                             lastVer = null
                         }
                         }
@@ -1845,7 +1857,7 @@ class HookEntry : XposedModule() {
          * 起因：排查时连续几轮都只能看到旧的「已挂」日志，无法区分"没装新包"和"新逻辑没跑到"。
          * **每次改动都更新它。**
          */
-const val BUILD_TAG = "2026-11-16.18-36 / 1.0 Beta5 (1050000)（**版本号跨段，无代码改动**（用户 2026-11-16 定）：name `1.0 Beta4` → **`1.0 Beta5`**、code `1040006` → **`1050000`** —— Beta5 起改用 `105xxxx` 段（Beta4 的 `10400xx` 段封存），功能与 1040006 **完全一致**。⚠️ 发版后记得同步 Gitee 的 `config.json`（`versionCode` / `versionName`），否则检查更新永远判「已最新」。以下为 1040006 引入、本版原样带上的内容：**检查更新三修 + 数据源搬家**（用户 2026-11-16 定）：① **「立即检测更新」不再用 summary 显示状态** —— 删掉「检查中…」，改为点击时弹 **short toast「正在检测，请稍后」**（`AppToast` 默认就是 `LENGTH_SHORT`）；toast 放在 `updateChecking` 防连点**之前**，检测中再点一下也有反馈，不会像没点上；`updateChecking` 现在只作防连点，不再参与显示。② **自动检测从「每进程一次」改成「每天（北京时间）一次」** —— v1040005 用进程内布尔 `autoUpdateDone`，进程一重启就归零 ⇒ 一天开 10 次 App 查 10 次。改为 prefs 存 `update_last_auto_date`（`yyyy-MM-dd`），**`SimpleDateFormat` 的时区写死 `Asia/Shanghai`**（用设备默认时区会出现「同一天查两次 / 跳过一天」）；**先写日期再发请求** ⇒ 「一天最多一次」是硬约束，**失败也算今天查过**（自动失败本就静默，要结果可手动点）；**手动检测拿到结果（Newer / Latest）也写当天日期** —— 手动查完再进 App 不会被自动再打一次，失败则不占名额；**打开开关立刻自动查一次**（否则「开了什么都没发生」，得等到明天），走静默模式且同样受当天闸门约束；**触发点两处**（同一闸门，重复调用直接返回）：`MaskSwapScreen` 的 `LaunchedEffect`（冷启动）+ `MaskUiState#onResume`（回前台 / 跨零点 —— 只挂 LaunchedEffect 时，App 常驻后台跨过零点第二天回前台不会触发）。文案：标题「启用自动检测更新」→「**自动检测更新**」，summary「在每次进入模块时自动检测」→「**在每天首次进入模块时自动检测**」。③ **数据源搬家（旧地址已死）** —— 主源从 `HyperExtreme-Update` 库换到**镜像库根目录**：`gitee.com/Frederic22/HyperExtreme/raw/main/config.json`（**分支 `main`**、文件名**全小写**、在**仓库根目录**，三处任一写错都是 404）。原因：账号下只剩一个 92 字节 JSON、零代码，是典型的「App 更新分发渠道」风控画像 ⇒ 用户 2026-11-16 把整个 GitHub 代码库导入 Gitee 并删掉旧配置库，`config.json` 直接放在代码库根目录。⚠️ **`config.json` 是 Gitee 网页上直接加的、不在本地仓库** ⇒ 别用「重新导入」或 `push --force` 覆盖该库，否则文件被删、更新检查当场断（用户：「不同步不要紧，我也没打算同步」）。实测新地址：200 / 91 字节 / 合法 JSON / 302 到带签名的 `raw.giteeusercontent.com` / 连续 10 次全 200（0.47~0.67s）。上版 1040005：检查更新首发（Gitee 主 + GitHub 兜底、判据只看 code、夸克只跳转不探测）+ 两个选项补右箭头。）"
+const val BUILD_TAG = "2026-11-17.17-22 / 1.0 Beta5 (1050000)（AOD 双时钟：真机三态验证通过（锁屏直接灭屏 / 通知亮起 / 点击亮起均只有一份时间）——判据为面板时钟内部时钟的累计 alpha，只在它真的亮着时压 AOD 自带时钟；清理 AOD 双时钟的诊断日志与 View 树打印）以下为上一版内容：2026-11-17.17-05 / 1.0 Beta5 (1050000)（AOD 双时钟：判据改成看面板时钟**内部**那块时钟的累计 alpha（外层容器永远 alpha=1/isShown，通知·点击亮起的 AOD 里内部时钟 alpha=0）——只有面板时钟真的亮着才压 AOD 时钟；通知/点击态不再动手）以下为上一版内容：2026-11-17.16-50 / 1.0 Beta5 (1050000)（AOD 双时钟：诊断版，**先不压时钟**（系统原样、脉冲时会双份）——每次 AOD 显示打印两份时钟子树：子 View 的可见性/alpha/尺寸/屏幕坐标/文字、累计 alpha，用来判断系统到底在显示哪一份）以下为上一版内容：2026-11-17.16-32 / 1.0 Beta5 (1050000)（AOD 双时钟：加 View 树诊断——压时钟时打印两份时钟的节点路径与层级关系）以下为上一版内容：2026-11-17.16-26 / 1.0 Beta5 (1050000)（AOD 双时钟：每次 AOD 显示都重新允许压；面板时钟判据加上「本次显示前后真的被画过」，通知亮屏 / 点击亮屏都会重新压；隐藏 1.2s 结算只还时钟、不再封本轮；保留信号诊断）以下为上一版内容：2026-11-17.16-22 / 1.0 Beta5 (1050000)（AOD 双时钟：加诊断——每次重算记录面板/时钟的可见性、绘制时长、AOD 显示时刻；事件链显示/隐藏/亮灭屏也留痕。判据未改）以下为上一版内容：2026-11-17.16-07 / 1.0 Beta5 (1050000)（AOD 双时钟：改成听 AOD 自己的显示状态（DozeHost.setAodVisibility / DozeMachine）——通知脉冲也按“正在显示”处理，脉冲时不还时钟；隐藏要压住 1.2s 没再显示才算暂停、转场抖动不算；进程启动即允许压；暂停结算后本次息屏不再压）以下为上一版内容：2026-11-17.16-05 / 1.0 Beta5 (1050000)（AOD 双时钟：改成听 AOD 自己的显示状态（DozeHost.setAodVisibility / DozeMachine）——压过就在它隐藏时还回，暂停后再点亮不重新压；显示状态在本机 AOD 里一直是 OFF，按 DOZE 判断永远不成立）以下为上一版内容：2026-11-17.15-47 / 1.0 Beta5 (1050000)（AOD 双时钟：按显示状态判断 + 暂停后点亮不重新压；临时加「不压 / 面板不在场」诊断日志）以下为上一版内容：2026-11-17.15-43 / 1.0 Beta5 (1050000)（AOD 双时钟：只压 AOD 自带的那份时钟、面板时钟永不改动；改按显示状态判断：只有 DOZE 且面板时钟可见才压，离开 DOZE 一律还回，暂停后再点亮 AOD 只还不压；显示状态变化也参与重算）以下为上一版内容：2026-11-17.15-35 / 1.0 Beta5 (1050000)（AOD 双时钟：只压 AOD 自带的那份时钟、面板时钟永不改动；亮灭屏 / AOD 进·出 / scrim 状态变化都重算，灭屏后多点重试）以下为上一版内容：2026-11-17.15-20 / 1.0 Beta5 (1050000)（AOD 双时钟：不再动锁屏面板时钟，只在面板时钟可见时压掉 AOD 自带的重复时钟，进入/退出按同一条件重算）以下为上一版内容：2026-11-17.14-48 / 1.0 Beta5 (1050000)（AOD 双时钟修复改为留前景时钟容器、压普通时钟容器 + 主页共存显示 + Alive 全局桌面留空共存 + 空间仅桌面共存准备；以下为上一版内容：**版本号跨段，无代码改动**（用户 2026-11-16 定）：name `1.0 Beta4` → **`1.0 Beta5`**、code `1040006` → **`1050000`** —— Beta5 起改用 `105xxxx` 段（Beta4 的 `10400xx` 段封存），功能与 1040006 **完全一致**。⚠️ 发版后记得同步 Gitee 的 `config.json`（`versionCode` / `versionName`），否则检查更新永远判「已最新」。以下为 1040006 引入、本版原样带上的内容：**检查更新三修 + 数据源搬家**（用户 2026-11-16 定）：① **「立即检测更新」不再用 summary 显示状态** —— 删掉「检查中…」，改为点击时弹 **short toast「正在检测，请稍后」**（`AppToast` 默认就是 `LENGTH_SHORT`）；toast 放在 `updateChecking` 防连点**之前**，检测中再点一下也有反馈，不会像没点上；`updateChecking` 现在只作防连点，不再参与显示。② **自动检测从「每进程一次」改成「每天（北京时间）一次」** —— v1040005 用进程内布尔 `autoUpdateDone`，进程一重启就归零 ⇒ 一天开 10 次 App 查 10 次。改为 prefs 存 `update_last_auto_date`（`yyyy-MM-dd`），**`SimpleDateFormat` 的时区写死 `Asia/Shanghai`**（用设备默认时区会出现「同一天查两次 / 跳过一天」）；**先写日期再发请求** ⇒ 「一天最多一次」是硬约束，**失败也算今天查过**（自动失败本就静默，要结果可手动点）；**手动检测拿到结果（Newer / Latest）也写当天日期** —— 手动查完再进 App 不会被自动再打一次，失败则不占名额；**打开开关立刻自动查一次**（否则「开了什么都没发生」，得等到明天），走静默模式且同样受当天闸门约束；**触发点两处**（同一闸门，重复调用直接返回）：`MaskSwapScreen` 的 `LaunchedEffect`（冷启动）+ `MaskUiState#onResume`（回前台 / 跨零点 —— 只挂 LaunchedEffect 时，App 常驻后台跨过零点第二天回前台不会触发）。文案：标题「启用自动检测更新」→「**自动检测更新**」，summary「在每次进入模块时自动检测」→「**在每天首次进入模块时自动检测**」。③ **数据源搬家（旧地址已死）** —— 主源从 `HyperExtreme-Update` 库换到**镜像库根目录**：`gitee.com/Frederic22/HyperExtreme/raw/main/config.json`（**分支 `main`**、文件名**全小写**、在**仓库根目录**，三处任一写错都是 404）。原因：账号下只剩一个 92 字节 JSON、零代码，是典型的「App 更新分发渠道」风控画像 ⇒ 用户 2026-11-16 把整个 GitHub 代码库导入 Gitee 并删掉旧配置库，`config.json` 直接放在代码库根目录。⚠️ **`config.json` 是 Gitee 网页上直接加的、不在本地仓库** ⇒ 别用「重新导入」或 `push --force` 覆盖该库，否则文件被删、更新检查当场断（用户：「不同步不要紧，我也没打算同步」）。实测新地址：200 / 91 字节 / 合法 JSON / 302 到带签名的 `raw.giteeusercontent.com` / 连续 10 次全 200（0.47~0.67s）。上版 1040005：检查更新首发（Gitee 主 + GitHub 兜底、判据只看 code、夸克只跳转不探测）+ 两个选项补右箭头。）"
         /** 第二个作用域（2026-09-28 起）：只为了锁屏那个「自定义锁屏」按钮的层级。 */
         const val SYSTEM_UI_PACKAGE = "com.android.systemui"
 

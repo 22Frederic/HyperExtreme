@@ -77,7 +77,7 @@ import top.yukonga.miuix.kmp.window.WindowDialog
  *
  * * 没有编辑浮页（一张图没什么可编的），点卡只选中；
  * * 没有挂载模式（AOD 动画只能挂 SystemUI 的 leash，服务模式做不到）；
- * * 没有生效范围 / 锁屏景深 / 角度这些参数 —— 全部进占位卡。
+ * * 生效范围在下方下拉里选（仅锁屏 / 全局）；锁屏景深见下方开关。
  *
  * @author 22Frederic
  */
@@ -141,6 +141,10 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
     /** 当前这一次是「新建」—— 取消（或空着关）要把整组删掉。 */
     var creating by remember { mutableStateOf(false) }
 
+    // 「Alive壁纸生效范围」：浮页要按它置灰桌面槽，所以必须提到 Column 外面。
+    // 生效中改只写 prefs，下一次「应用」才下发。
+    var aliveScope by remember { mutableStateOf(prefs.aliveScope) }
+
     LaunchedEffect(reload) {
         // ⚠️ 2026-11-13（v1.22.86）：**编辑浮页关闭时不能按持久化 order 重排** ——
         // 用户可能刚应用过某张（order 已提到最前、页面列表还没动），一关浮页就重排
@@ -157,7 +161,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         if (active.isNotEmpty() && list.none { it.id == active }) {
             prefs.setAliveActiveId(null)
             prefs.setAliveWallpaperFp("")
-            AliveFlag.push(false, null)
+            AliveFlag.push(false, null, prefs.aliveScope)
             active = ""
             activeId = ""
         }
@@ -233,9 +237,11 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         val hasDepth = prefs.aliveLockDepth &&
             (item.lockSubject != null || item.lockMask != null)
         AliveFlag.push(
-            true, item.id, depth = hasDepth, style = item.style,
+            true, item.id, prefs.aliveScope, depth = hasDepth, style = item.style,
             // 换图不改 id ⇒ 必须带上图片版本，否则渲染器不重启、新图进不了 GL
             ver = item.imageVer,
+            // 桌面留空（全局档）= 不建 Alive 桌面份，桌面露系统默认壁纸
+            deskMode = item.deskMode,
         )
         // 记「壁纸基准」：aod 侧换壁纸检测拿它当比对值
         val app = ctx.applicationContext ?: ctx
@@ -245,7 +251,11 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
                 if (version.usable) prefs.setAliveWallpaperFp(version.value)
             }
         }.apply { isDaemon = true }.start()
-        Toast.makeText(ctx, "Alive壁纸已生效", Toast.LENGTH_LONG).show()
+        Toast.makeText(
+            ctx,
+            "Alive壁纸已生效（${aliveScopeLabel(prefs.aliveScope)}）",
+            Toast.LENGTH_LONG,
+        ).show()
     }
 
     fun apply(item: AliveItem) {
@@ -258,7 +268,23 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             showAodWarn = true
             return
         }
-        val other = WallpaperConflict.running(ctx, state, WallpaperChain.ALIVE)
+        // **全局档桌面留空 = 桌面没有 Alive 份**（2026-11-17）：按仅锁屏参与共存，
+        // 否则「空间 / 光栅仅桌面」会被误判成冲突。判据取自**这一组**的 deskMode，
+        // 与 `AliveRenderer.startInternal` 的 hiddenDesktop 同源。
+        val selfScope = if (
+            prefs.aliveScope == MaskPrefs.SPATIAL_SCOPE_GLOBAL &&
+            item.deskMode == AliveFlag.DESK_NONE
+        ) {
+            MaskPrefs.SPATIAL_SCOPE_LOCK
+        } else {
+            prefs.aliveScope
+        }
+        val other = WallpaperConflict.running(
+            ctx,
+            state,
+            WallpaperChain.ALIVE,
+            selfScope,
+        )
         if (other != null) {
             conflictOther = other
             showConflict = true
@@ -432,6 +458,33 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
 
         Spacer(Modifier.height(BLOCK_GAP))
 
+        // 「Alive壁纸生效范围」（2026-11-17）：选「仅锁屏」时可以与「光栅仅桌面」共存。
+        // 与光栅同一语义：生效中改只写 prefs，下一次「应用」才下发。
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp),
+            insideMargin = PaddingValues(0.dp),
+        ) {
+            DropdownRow(
+                title = "Alive壁纸生效范围",
+                options = ALIVE_SCOPE_LABELS,
+                selectedIndex = ALIVE_SCOPE_VALUES.indexOf(aliveScope).coerceAtLeast(0),
+                onSelect = { index ->
+                    val v = ALIVE_SCOPE_VALUES[index]
+                    aliveScope = v
+                    prefs.setAliveScope(v)
+                    if (activeId.isNotEmpty()) {
+                        Toast.makeText(
+                            ctx,
+                            "应用范围将在下一次应用时生效",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                },
+            )
+        }
+
         // 「启用 Alive 壁纸锁屏景深」（2026-11-08 用户要求：照光栅那项抄过来，取代参数占位卡）。
         // 语义完全一致：开 = 保留 `keyguard_foreground_layer` 并把我们的主体换上去；
         // 关 = 整层压掉（旧壁纸的人像不能浮在新图上）。
@@ -440,7 +493,8 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp),
+                .padding(horizontal = 12.dp)
+                .padding(top = 12.dp),
             insideMargin = PaddingValues(0.dp),
         ) {
             SwitchRow(
@@ -567,6 +621,8 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         show = sheetOpen,
         group = editing,
         isNew = creating,
+        // 仅锁屏时桌面槽置灰（桌面图留着但不生效）
+        lockOnly = aliveScope == MaskPrefs.SPATIAL_SCOPE_LOCK,
         onDismiss = {
             // 空组清理**交给浮页**（`AliveGroupSheet.close()`）—— 页面手里的 `editing`
             // 是打开时的快照，浮页里导入的图它看不到，按它判空会把刚导入的整组删掉
@@ -620,4 +676,17 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
     // 「锁屏份不可见」的前提不成立（锁屏态我们两份层都 flags:0 / alpha=1），
     // 那套 clear(both) 只会把用户壁纸换成系统默认。
     // 历史实现见 git 提交 `946b8da` 之前的 `ui/WallpaperResetDialog.kt`。
+}
+
+/** 「Alive壁纸生效范围」的选项：没有「仅桌面」—— AOD 只有锁屏 leash 可挂。 */
+private val ALIVE_SCOPE_LABELS = listOf("锁屏", "全局")
+private val ALIVE_SCOPE_VALUES = intArrayOf(
+    MaskPrefs.SPATIAL_SCOPE_LOCK,
+    MaskPrefs.SPATIAL_SCOPE_GLOBAL,
+)
+
+/** 取值 → 文案；越界时回退到「全局」（= 老版本行为）。 */
+private fun aliveScopeLabel(v: Int): String {
+    val i = ALIVE_SCOPE_VALUES.indexOf(v)
+    return ALIVE_SCOPE_LABELS.getOrElse(i) { ALIVE_SCOPE_LABELS.last() }
 }
