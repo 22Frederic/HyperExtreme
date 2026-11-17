@@ -81,6 +81,12 @@ internal object AliveAodHost {
     @Volatile private var aliveAt = 0L
     @Volatile private var aliveValue = false
 
+    private val mainHandler by lazy { android.os.Handler(android.os.Looper.getMainLooper()) }
+
+    /** 装 AOD 插件内部的状态 hook 时要用（插件类只有拿到 AODView 才能按名字加载）。 */
+    @Volatile private var module: XposedModule? = null
+    private var dozeHooksInstalled = false
+
     private val logged = java.util.Collections.synchronizedSet(HashSet<String>())
 
     /**
@@ -88,6 +94,7 @@ internal object AliveAodHost {
      * 只挂 `android.view.View` 上的方法，靠类名认 AODView，所以不需要插件 loader。
      */
     fun install(module: XposedModule, loader: ClassLoader): Boolean {
+        this.module = module
         val view = runCatching { Class.forName("android.view.View", false, loader) }.getOrNull()
         if (view == null) {
             HookRuntime.log("$TAG 找不到 android.view.View")
@@ -139,8 +146,85 @@ internal object AliveAodHost {
             "AODView 入窗：class=${view.javaClass.name} bg=${describe(view.background)} " +
                 "visibility=${view.visibility} alive=${isAlive()}",
         )
+        installDozeHooks(view.javaClass.classLoader)
         if (!isAlive()) return
         view.setBackgroundColor(0)
+    }
+
+    /**
+     * 挂 AOD 插件自己的「显示 / 隐藏」回调，用来把 [SpatialForegroundHider] 压掉的时钟还回去。
+     *
+     * 插件类在宿主 loader 里看不见（见类注释），只能从 AODView 实例拿到插件 loader 再按名字找。
+     *
+     * | hook | 为什么 |
+     * | --- | --- |
+     * | `DozeHost#setAodVisibility(Z)` | visible=false 表示 AOD 内容被藏起来了（暂停 / 退出） |
+     * | `DozeMachine#requestState(State)` | 离开 AOD 的状态（PAUSED / FINISH 等）同样要还 |
+     */
+    private fun installDozeHooks(loader: ClassLoader) {
+        if (dozeHooksInstalled) return
+        val module = module ?: return
+        dozeHooksInstalled = true
+        var count = 0
+
+        runCatching { Class.forName("com.miui.aod.DozeHost", false, loader) }.getOrNull()
+            ?.let { cls ->
+                for (m in cls.declaredMethods) {
+                    if (m.name != "setAodVisibility") continue
+                    if (m.parameterTypes.firstOrNull() != Boolean::class.javaPrimitiveType) continue
+                    count += hook(module, m) { chain ->
+                        val visible = chain.getArgs().filterIsInstance<Boolean>().firstOrNull()
+                        HookRuntime.log("$TAG DozeHost.setAodVisibility($visible)")
+                        if (visible == true) {
+                            mainHandler.post { SpatialForegroundHider.onAodShown() }
+                        } else if (visible == false) {
+                            mainHandler.post { SpatialForegroundHider.onAodHidden() }
+                        }
+                        chain.proceed()
+                    }
+                }
+            }
+
+        runCatching { Class.forName("com.miui.aod.doze.DozeMachine", false, loader) }.getOrNull()
+            ?.let { cls ->
+                for (m in cls.declaredMethods) {
+                    if (m.name != "requestState" || m.parameterCount != 1) continue
+                    count += hook(module, m) { chain ->
+                        val state = chain.getArgs().firstOrNull()?.toString()
+                        if (state != null) {
+                            HookRuntime.log("$TAG DozeMachine -> $state")
+                            // 通知脉冲（REQUEST_PULSE / PULSING / PULSE_DONE）屏上同样有画面、
+                            // 面板时钟会亮，这时也要继续压；只有真正离开 AOD 才还。
+                            val shown = state == "DOZE_AOD" || state.contains("PULS")
+                            mainHandler.post {
+                                if (shown) {
+                                    SpatialForegroundHider.onAodShown()
+                                } else {
+                                    SpatialForegroundHider.onAodHidden()
+                                }
+                            }
+                        }
+                        chain.proceed()
+                    }
+                }
+            }
+
+        HookRuntime.log("$TAG 已挂 $count 个 AOD 显示状态 hook（DozeHost / DozeMachine）")
+    }
+
+    private fun hook(
+        module: XposedModule,
+        method: java.lang.reflect.Method,
+        handler: (XposedInterface.Chain) -> Any?,
+    ): Int = runCatching {
+        method.isAccessible = true
+        module.hook(method).intercept(object : XposedInterface.Hooker {
+            override fun intercept(chain: XposedInterface.Chain): Any? = handler(chain)
+        })
+        1
+    }.getOrElse {
+        HookRuntime.log("$TAG 挂 ${method.name} 失败：${it.message}")
+        0
     }
 
     private fun isAodRoot(target: Any?): Boolean {

@@ -1342,6 +1342,8 @@ internal object AliveRenderer {
         HookRuntime.log(
             "$TAG AOD 进入（不压暗，dim=1.00，从=${if (fromDesktop) "桌面 tr=3" else "锁屏 tr=1"}）",
         )
+        // 进 AOD 后重算「只留一份时钟」（AOD 视图可能比转场晚挂上来）
+        runCatching { SpatialForegroundHider.onAodState() }
         changeMode(0, animate = true)
         dirty = true
         aodDiagLogged = false
@@ -1491,6 +1493,8 @@ internal object AliveRenderer {
             // ⇒ 没有动画（用户报的「aod 到锁屏丢动画」）。
             if (mode == 0) changeMode(1, animate = true)
             HookRuntime.log("$TAG AOD 退出（回锁屏，等 scrim 裁决）")
+            // 退出 AOD 后重算（亮屏时会在条件不成立时把 AOD 自带时钟还回去）
+            runCatching { SpatialForegroundHider.onAodHidden() }
             dirty = true
             forceDraw()
             scheduleFrame()
@@ -2153,6 +2157,7 @@ internal object AliveRenderer {
                 when (i?.action) {
                     Intent.ACTION_SCREEN_ON -> {
                         HookRuntime.log("$TAG 亮屏")
+                        runCatching { SpatialForegroundHider.onScreenState(true) }
                         // 解锁转场（tr=2 / 交叉）期间不能插进来改 mode，否则会把转场切成硬切
                         if (!aodActive && !unlocking) {
                             val locked = queryKeyguardLocked()
@@ -2169,6 +2174,7 @@ internal object AliveRenderer {
                     Intent.ACTION_SCREEN_OFF -> {
                         // 灭屏不猜 AOD，等 doWallpaperBlackAnim 的真值
                         HookRuntime.log("$TAG 灭屏")
+                        runCatching { SpatialForegroundHider.onScreenState(false) }
                     }
                 }
             }
@@ -3279,8 +3285,8 @@ internal object AliveRenderer {
         mirrorToDesk = false
         // 景深主体层：撤掉我们的图（层本身还给系统）
         runCatching { AliveOverlay.onDisabled() }
-        // AOD 期间被收起的锁屏时钟必须还回去（否则关掉 Alive 后锁屏没有时钟）
-        runCatching { SpatialForegroundHider.onAodState(false) }
+        // AOD 期间压掉的重复时钟必须还回去（`runningKey` 已清空，重算会走归还分支）
+        runCatching { SpatialForegroundHider.onAodHidden() }
 
         runCatching {
             if (mounts.isNotEmpty()) {

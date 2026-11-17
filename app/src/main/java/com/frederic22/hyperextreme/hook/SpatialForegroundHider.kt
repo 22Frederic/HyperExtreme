@@ -73,16 +73,13 @@ internal object SpatialForegroundHider {
     private var coexistHookInstalled = false
 
     /**
-     * 当前是不是 AOD（由 [AliveScrim] 的 scrim 状态驱动）。
-     *
-     * Alive 的 AOD 会把 `AODView` 背景改透明来透出壁纸（[AliveAodHost]），
-     * 若此刻锁屏面板还留在下面，它的时钟会透出来 ⇒ 屏上两条时间 + 日期。
-     * 这里在 AOD 期间把锁屏时钟容器收起，退出时原样还回去。
+     * 锁屏/息屏时钟（`hour_view` 在它里面，`minutes` + 日期嵌在它下面的前景容器里）。
+     * **只用来判断「面板时钟在不在场」，永远不改它。**
      */
-    @Volatile private var aodActive = false
+    private const val ID_PANEL_CLOCK = "miui_keyguard_clock_container"
 
-    /** AOD 期间被我们藏起来的锁屏时钟（原 visibility）。只在主线程读写。 */
-    private val hiddenClocks = java.util.WeakHashMap<View, Int>()
+    /** AOD 自己那份联动时钟；只有面板时钟也在场时才压它。 */
+    private const val ID_AOD_CLOCK = "linkage_clock_container"
 
     // ── 开关读取（300ms 缓存：方法调用频繁，属性反射不宜每次付） ──
     @Volatile private var cacheAt = 0L
@@ -223,55 +220,208 @@ internal object SpatialForegroundHider {
     }
 
     /**
-     * **AOD 期间收起锁屏时钟**（2026-11-17，用户报「息屏里两条时间 + 日期」）。
+     * **AOD 期间只留一份时钟**。
      *
-     * 判据只有「Alive 在跑 + 当前是 AOD」：Alive 的 AOD 背景是透明的，锁屏面板里
-     * 那两个时钟容器会透出来，和 AOD 自己的时钟叠成两条。退出 AOD（KEYGUARD /
-     * UNLOCKED）必须原样还回去 —— 不能用 GONE，避免影响锁屏布局。
+     * 锁屏/息屏的时钟由面板里的 `miui_keyguard_clock_container` 提供：`hour_view` 在它里面，
+     * `miui_keyguard_foreground_clock_container`（`minute_view` + 日期）又嵌在它下面 ——
+     * **动它就等于动整块时钟**，之前压这里直接导致时钟不全或消失，锁屏也一样。
      *
-     * 由 [AliveScrim] 的 `ScrimController#updateScrims` 三态驱动；[handle] 里也会补调一次，
-     * 防止 scrim 状态先到、面板后挂的时序问题。
+     * 所以这里只压 **AOD 自己的那份**（`com.miui.aod:id/linkage_clock_container`）。
+     * 判据是面板时钟**内部**那块时钟真的亮着（见 [panelShownNow]）：从锁屏直接灭屏时它亮，
+     * 两份重叠；从桌面进 AOD、通知 / 点击亮起时它被系统淡到 0，AOD 这份就是唯一的时钟，不能动。
+     *
+     * ⚠️ **每次 AOD 显示都重新允许压**：通知亮屏 / 点击亮屏都会先报隐藏、再报显示，
+     * 面板时钟这一次亮屏里是否在场要单独判断，不能沿用上一轮的结论。
      */
-    fun onAodState(aod: Boolean) {
-        if (aod == aodActive) return
-        aodActive = aod
-        val self = lastSelf ?: return
-        mainHandler.post { runCatching { applyAodClocks(self) } }
+    fun onAodState() {
+        allowHide = true
+        scheduleSync()
     }
 
-    private fun applyAodClocks(self: Any) {
+    /**
+     * AOD 真的重新显示出来了（`DozeHost.setAodVisibility(true)` / `DozeMachine → DOZE_AOD`）。
+     *
+     * 用来抵消 [onAodHidden] 的延迟结算：进 AOD 的转场里系统会先报隐藏、再报显示，
+     * 这个先后不代表「暂停后重新点亮」，不能因此结束本轮。
+     */
+    fun onAodShown() {
+        hideSeq++
+        allowHide = true
+        scheduleSync()
+    }
+
+    /**
+     * AOD 自己把内容藏起来了（`DozeHost.setAodVisibility(false)` / 离开 AOD）：延迟结算。
+     *
+     * 转场里系统会先报隐藏、再报显示，这个先后不代表真的不显示了；压住 [HIDE_SETTLE_MS]
+     * 没再收到显示事件，才还回时钟。之后再显示会重新按判据评估，不会一直压着。
+     * 没压过就忽略。
+     */
+    fun onAodHidden() {
+        if (hiddenAodClock == null) return
+        val seq = ++hideSeq
+        val self = lastSelf ?: return
+        mainHandler.postDelayed({
+            if (seq != hideSeq) return@postDelayed
+            allowHide = false
+            log("Alive AOD：AOD 已隐藏 ⇒ 还回时钟")
+            runCatching { syncAodDuplicate(self, force = true) }
+        }, HIDE_SETTLE_MS)
+    }
+
+    /**
+     * 亮灭屏时重算（`AliveRenderer` 的屏幕广播调用）。
+     *
+     * AOD 视图在灭屏后要等一段动画才挂上来，所以灭屏后隔几个点重算。
+     */
+    fun onScreenState(on: Boolean) {
+        val self = lastSelf ?: return
+        hideSeq++
+        if (on) {
+            allowHide = false
+            mainHandler.post { runCatching { syncAodDuplicate(self, force = true) } }
+            return
+        }
+        allowHide = true
+        scheduleSync()
+    }
+
+    /** AOD 时钟可能在转场里晚一步挂上来 ⇒ 几个时间点各算一次。 */
+    private fun scheduleSync() {
+        val self = lastSelf ?: return
+        for (delay in AOD_SYNC_DELAYS) {
+            mainHandler.postDelayed({
+                runCatching { syncAodDuplicate(lastSelf ?: self, force = true) }
+            }, delay)
+        }
+    }
+
+    private val AOD_SYNC_DELAYS = longArrayOf(0L, 200L, 600L, 1500L, 3000L)
+
+    /** 一次「隐藏」要压住多久没再显示，才算暂停 / 退出（更短的当成转场抖动）。 */
+    private const val HIDE_SETTLE_MS = 1200L
+
+    /**
+     * 本轮 AOD 是否允许压掉 AOD 时钟。
+     *
+     * AOD 显示事件 / 灭屏会重新允许；确认隐藏（[HIDE_SETTLE_MS] 内没再显示）或亮屏会结束。
+     * 重新允许后仍要看 [panelShownNow]：面板时钟真的在画才压。
+     */
+    @Volatile private var allowHide = false
+
+    /** 隐藏 / 显示的先后序号：延迟结算发现又显示过就放弃。 */
+    @Volatile private var hideSeq = 0
+
+    /** 当前被我们压掉的 AOD 自带时钟 + 它原来的 alpha。只在主线程读写。 */
+    private var hiddenAodClock: View? = null
+    private var savedAodClockAlpha = 1f
+
+    /** `handle()` 调用很频繁，非强制路径按这个间隔节流。 */
+    private var lastSyncAt = 0L
+    private const val SYNC_MIN_MS = 400L
+
+    private var panelClockRef: java.lang.ref.WeakReference<View>? = null
+    private var aodClockRef: java.lang.ref.WeakReference<View>? = null
+
+    private fun syncAodDuplicate(self: Any, force: Boolean) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (!force && now - lastSyncAt < SYNC_MIN_MS) return
+        lastSyncAt = now
         val layer = runCatching {
             self.javaClass.getDeclaredField(FIELD_FOREGROUND).apply { isAccessible = true }
                 .get(self) as? android.view.ViewGroup
         }.getOrNull() ?: return
-        val parent = layer.parent as? android.view.ViewGroup ?: return
-        val hide = aodActive && AliveRenderer.isRunning()
-        for (i in 0 until parent.childCount) {
-            val child = parent.getChildAt(i) ?: continue
-            if (child === layer || !isClockContainer(child)) continue
-            if (hide) {
-                if (!hiddenClocks.containsKey(child)) hiddenClocks[child] = child.visibility
-                if (child.visibility != View.INVISIBLE) child.visibility = View.INVISIBLE
-            } else {
-                val saved = hiddenClocks.remove(child) ?: continue
-                if (child.visibility != saved) child.visibility = saved
+        val panel = layer.parent as? android.view.ViewGroup ?: return
+        val root = panel.rootView
+        val panelClock = panelClock(root)
+        val panelShown = panelShownNow(panel, panelClock)
+        if (!allowHide || !AliveRenderer.isRunning()) {
+            restoreAodClock()
+            return
+        }
+        val aodClock = if (panelShown) findAodClock(root) else null
+        if (aodClock == null) {
+            restoreAodClock()
+            return
+        }
+        if (hiddenAodClock !== aodClock) {
+            restoreAodClock()
+            hiddenAodClock = aodClock
+            savedAodClockAlpha = aodClock.alpha
+            log(
+                "Alive AOD：面板时钟在场，压掉 AOD 自带的重复时钟" +
+                    "（${idName(aodClock) ?: aodClock.javaClass.simpleName}）",
+            )
+        }
+        if (aodClock.alpha != 0f) aodClock.alpha = 0f
+    }
+
+    private fun restoreAodClock() {
+        val v = hiddenAodClock ?: return
+        hiddenAodClock = null
+        if (v.alpha == 0f) v.alpha = savedAodClockAlpha
+        log("Alive AOD：还回 AOD 自带时钟（alpha=$savedAodClockAlpha）")
+    }
+
+    private fun alive(ref: java.lang.ref.WeakReference<View>?): View? =
+        ref?.get()?.takeIf { it.isAttachedToWindow }
+
+    private fun panelClock(root: View): View? {
+        alive(panelClockRef)?.let { return it }
+        val v = findView(root, 0) { idName(it) == ID_PANEL_CLOCK } ?: return null
+        panelClockRef = java.lang.ref.WeakReference(v)
+        return v
+    }
+
+    /**
+     * 面板时钟是否**真的**在这次 AOD 亮屏里。
+     *
+     * 外层的 `miui_keyguard_clock_container` 任何状态下都是 alpha=1 / isShown，
+     * 系统把里面那块时钟（`AllInOneHourClock`）淡到 0 来藏它（通知 / 点击亮起的 AOD
+     * 实测 alpha=0.0），所以只能看内部节点的**累计 alpha**。
+     */
+    private fun panelShownNow(panel: android.view.ViewGroup, clock: View?): Boolean {
+        if (!panel.isShown || panel.alpha <= 0f) return false
+        if (clock == null || !clock.isShown || clock.alpha <= 0f || clock.width <= 0) return false
+        return innerClockAlpha(clock) > 0.02f
+    }
+
+    /** 面板时钟子树里最亮的那个可见节点（累计 alpha，父级淡出也算），外层容器不算。 */
+    private fun innerClockAlpha(clock: View): Float {
+        var best = 0f
+        fun walk(node: View, parentAlpha: Float, depth: Int) {
+            if (depth > 8) return
+            val acc = if (node === clock) parentAlpha else parentAlpha * node.alpha
+            if (node !== clock && node.width > 0 && node.height > 0 && acc > best) best = acc
+            if (node is android.view.ViewGroup) {
+                for (i in 0 until node.childCount) walk(node.getChildAt(i), acc, depth + 1)
             }
         }
-        if (hide && hiddenClocks.isNotEmpty()) logOnceAodClock()
+        walk(clock, 1f, 0)
+        return best
     }
 
-    /** 锁屏面板里的时钟容器（`miui_keyguard_clock_container` 等）。 */
-    private fun isClockContainer(v: View): Boolean {
-        val idName = runCatching { v.resources.getResourceEntryName(v.id) }.getOrNull()
-        return idName?.contains("clock", ignoreCase = true) == true ||
-            v.javaClass.simpleName.contains("Clock", ignoreCase = true)
+    /** AOD 的 View 树用插件资源，id 名要按各 View 自己的 `resources` 解，不能从窗口根查。 */
+    private fun findAodClock(root: View): View? {
+        alive(aodClockRef)?.let { return it }
+        val v = findView(root, 0) { idName(it) == ID_AOD_CLOCK } ?: return null
+        aodClockRef = java.lang.ref.WeakReference(v)
+        return v
     }
 
-    private fun logOnceAodClock() {
-        if (logged.putIfAbsent("aod-clock", true) == null) {
-            log("Alive AOD：收起锁屏时钟容器（避免与息屏时钟叠成两条）")
+    private fun findView(v: View, depth: Int, pred: (View) -> Boolean): View? {
+        if (depth > 48) return null
+        if (v.id != View.NO_ID && v.id != 0 && pred(v)) return v
+        if (v is android.view.ViewGroup) {
+            for (i in 0 until v.childCount) {
+                findView(v.getChildAt(i), depth + 1, pred)?.let { return it }
+            }
         }
+        return null
     }
+
+    private fun idName(v: View): String? =
+        runCatching { v.resources.getResourceEntryName(v.id) }.getOrNull()
 
     /**
      * 处理前景层：**两种模式**（2026-10-29）。
@@ -292,7 +442,11 @@ internal object SpatialForegroundHider {
         val field = self.javaClass.getDeclaredField(FIELD_FOREGROUND).apply { isAccessible = true }
         val layer = field.get(self) as? android.view.ViewGroup ?: return
         lastSelf = self
-        applyAodClocks(self)
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            runCatching { syncAodDuplicate(self, force = false) }
+        } else {
+            mainHandler.post { runCatching { syncAodDuplicate(self, force = false) } }
+        }
         // ⚠️ 顺序很关键（2026-11-14）：这一层平时被我们压成 INVISIBLE，
         // 若把 MC 封面判断放在下面的 visibility 闸门之后，封面出现时闸门直接 return
         // ⇒ 永远走不到放行分支，MC 的歌词 / 封面也就永远被压着。**先判封面，再判可见性**。

@@ -57,13 +57,9 @@ internal object AliveScrim {
                             // `sCoverMode` 在解锁后仍是 true，桌面态必须**不让路**。
                             runCatching { Coexist.noteScrim(st) }
                             runCatching { AliveRenderer.onScrimState(st) }
-                            // AOD 时收起锁屏时钟（2026-11-17）：Alive 的 AOD 背景透明，
-                            // 不收起会和息屏时钟叠成两条时间 + 日期。
-                            runCatching {
-                                SpatialForegroundHider.onAodState(
-                                    st.contains("AOD") || st.contains("PULSING"),
-                                )
-                            }
+                            // AOD 背景透明后，锁屏面板时钟会和息屏时钟叠成两条时间 + 日期；
+                            // 状态一变就重算「只留一份」（2026-11-17）。
+                            runCatching { SpatialForegroundHider.onAodState() }
                         }
                         return r
                     }
