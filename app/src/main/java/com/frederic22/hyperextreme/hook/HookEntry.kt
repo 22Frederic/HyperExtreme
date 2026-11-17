@@ -521,6 +521,8 @@ class HookEntry : XposedModule() {
             // 样式一变必须重启，否则实机还画着上一种（2026-11-09 真机：
             // 「aod 不显示相卡，缩放完还有启航晃一下」= 还在按 style=0 画球）。
             var lastStyle = Int.MIN_VALUE
+            // 桌面份模式（跟随锁屏 / 自有图 / 不要桌面）：决定渲染器建不建桌面份
+            var lastDeskMode = Int.MIN_VALUE
             // 图片版本（2026-11-09）：换图不改 id，只靠 key/style 判不出变化 ⇒ 新图进不了 GL
             var lastVer: String? = null
             // MC 让路只淡锁屏份、不停渲染器（v1.22.105）；不置 lastKey=null，避免恢复时重建
@@ -576,13 +578,19 @@ class HookEntry : XposedModule() {
                     val style = HookRuntime.systemProperty(
                         com.frederic22.hyperextreme.data.AliveFlag.PROP_STYLE,
                     ).trim().toIntOrNull() ?: 0
+                    val deskMode = HookRuntime.systemProperty(
+                        com.frederic22.hyperextreme.data.AliveFlag.PROP_DESK_MODE,
+                    ).trim().toIntOrNull()
+                        ?.takeIf { it in 0..2 }
+                        ?: com.frederic22.hyperextreme.data.AliveFlag.DESK_FOLLOW
                     val ver = HookRuntime.systemProperty(
                         com.frederic22.hyperextreme.data.AliveFlag.PROP_VER,
                     ).trim()
                     if (tick <= 3 || tick % 60 == 0) {
                         HookRuntime.log(
                             "ALIVE 轮询 tick=$tick active=$active key=$key scope=$scope " +
-                                "style=$style ver=$ver last=$lastKey/$lastScope/$lastStyle/$lastVer",
+                                "style=$style desk=$deskMode ver=$ver " +
+                                "last=$lastKey/$lastScope/$lastStyle/$lastDeskMode/$lastVer",
                         )
                     }
                     if (!aodOn) {
@@ -596,6 +604,7 @@ class HookEntry : XposedModule() {
                                 lastKey = null
                                 lastScope = Int.MIN_VALUE
                                 lastStyle = Int.MIN_VALUE
+                                lastDeskMode = Int.MIN_VALUE
                                 lastVer = null
                             }
                         }
@@ -632,21 +641,23 @@ class HookEntry : XposedModule() {
                                 lastKey = null
                                 lastScope = Int.MIN_VALUE
                                 lastStyle = Int.MIN_VALUE
+                                lastDeskMode = Int.MIN_VALUE
                                 lastVer = null
                             }
                             if (key != lastKey || scope != lastScope || style != lastStyle ||
-                                ver != lastVer
+                                deskMode != lastDeskMode || ver != lastVer
                             ) {
                                 val ctx = HookRuntime.appContext()
                                 if (ctx != null) {
                                     HookRuntime.log(
-                                        "ALIVE 开关=开 key=$key scope=$scope style=$style ver=$ver " +
-                                            "→ 启动渲染器",
+                                        "ALIVE 开关=开 key=$key scope=$scope style=$style " +
+                                            "desk=$deskMode ver=$ver → 启动渲染器",
                                     )
-                                    AliveRenderer.start(ctx, key, scope)
+                                    AliveRenderer.start(ctx, key, scope, deskMode)
                                     lastKey = key
                                     lastScope = scope
                                     lastStyle = style
+                                    lastDeskMode = deskMode
                                     lastVer = ver
                                     lastStartAt = System.currentTimeMillis()
                                 }
@@ -657,6 +668,7 @@ class HookEntry : XposedModule() {
                             lastKey = null
                             lastScope = Int.MIN_VALUE
                             lastStyle = Int.MIN_VALUE
+                            lastDeskMode = Int.MIN_VALUE
                             lastVer = null
                         }
                         }

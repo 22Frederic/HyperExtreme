@@ -104,9 +104,10 @@ internal object SpatialAod {
                     // 我们的 SC 挂在壁纸 leash 下，会被一起压暗 ⇒ AOD 里只剩黑屏，
                     // 「启航」的小球根本看不见（真机日志 black=1.00 / dim=0.00 已证实）。
                     //
-                    // 只拦 Alive 这一条：四条壁纸链互斥，此刻空间 / 光栅不可能在跑；
-                    // 而 Alive 需要 AOD 持续自转，本来就不能让系统把壁纸压没。
+                    // 只拦 Alive 这一条：Alive 需要 AOD 持续自转，本来就不能让系统把壁纸压没。
+                    // 光栅「仅桌面」现在可以与 Alive 共存 ⇒ 这里也要把时机转给它（隐藏桌面份）。
                     if (show == false && AliveRenderer.isRunning()) {
+                        runCatching { RasterRenderer.onEnterAod(black ?: 1f) }
                         runCatching { AliveRenderer.onEnterAod(black ?: 1f) }
                         log(
                             "Alive 在跑 ⇒ 拦下 doWallpaperBlackAnim（不压黑，" +

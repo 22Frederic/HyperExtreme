@@ -134,12 +134,13 @@ class App : Application() {
             AliveFlag.push(
                 aliveId.isNotEmpty(),
                 aliveId.takeIf { it.isNotEmpty() },
-                MaskPrefs.SPATIAL_SCOPE_GLOBAL,
+                prefs.aliveScope,
                 // 开关关掉时即使有主体也不保留景深层（与页面「应用」同一判据）
                 depth = prefs.aliveLockDepth &&
                     (aliveItem?.lockSubject != null || aliveItem?.lockMask != null),
                 style = aliveItem?.style ?: com.frederic22.hyperextreme.data.AliveStore.STYLE_QIHANG,
                 ver = aliveItem?.imageVer.orEmpty(),
+                deskMode = aliveItem?.deskMode ?: AliveFlag.DESK_FOLLOW,
             )
             // AOD 在「运行中被关掉」：App 进程活着时这里能立刻响应；
             // 进程不在时由 SystemUI 侧的 ALIVE 轮询兜底（先停渲染，下次进 App 由上面的自检收敛）。

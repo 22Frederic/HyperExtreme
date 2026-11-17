@@ -15,7 +15,7 @@ import java.security.MessageDigest
  * | 槽 | 用途 | 来源 |
  * |---|---|---|
  * | [lock] | 锁屏画面，同时是 AOD 层的照片源 | 用户导入 |
- * | [desktop] | 桌面画面 | 用户导入（`followLock` 时忽略） |
+ * | [desktop] | 桌面画面 | 用户导入（`followLock` 时忽略；全局档可留空 = 系统默认桌面） |
  * | [aod] | AOD 预览图（整屏比例，球心 y = 0.5） | 由 [lock] 算出来，自动生成 |
  *
  * 另有两条景深附属文件：[lockSubject]（AICR 抠像）与 [lockMask]（用户导入的遮罩/主体）。
@@ -50,7 +50,20 @@ internal data class AliveItem(
     val coverFile: File? get() = lock ?: desktop
 
     /** 实际生效的桌面图：开了「桌面与锁屏一致」就是锁屏那张。 */
-    val effectiveDesktop: File? get() = if (followLock) lock else (desktop ?: lock)
+    val effectiveDesktop: File? get() = if (followLock) lock else desktop
+
+    /**
+     * 桌面份的渲染方式（推给 SystemUI 的 [AliveFlag.PROP_DESK_MODE]）。
+     *
+     * 「跟随锁屏」与「没设桌面图」都对应空图，但语义相反：前者桌面要画锁屏图，
+     * 后者桌面交给系统默认壁纸（全局档留空，2026-11-17 用户定）。
+     */
+    val deskMode: Int
+        get() = when {
+            followLock -> AliveFlag.DESK_FOLLOW
+            desktop == null -> AliveFlag.DESK_NONE
+            else -> AliveFlag.DESK_OWN
+        }
 
     /**
      * AOD 实际用哪张图算预览。

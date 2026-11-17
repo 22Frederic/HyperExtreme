@@ -86,7 +86,9 @@ internal object RasterRenderer {
     private var runningLockDepth = false
 
     /** 景深层是否**真的**开着（读启动快照，不是属性本身 —— 与 `SpatialRenderer.lockDepthOn` 同义）。 */
-    internal fun lockDepthOn(): Boolean = runningKey != null && runningLockDepth
+    internal fun lockDepthOn(): Boolean =
+        runningKey != null && runningLockDepth &&
+            runningScope != MaskPrefs.SPATIAL_SCOPE_DESKTOP
 
     /**
      * 本次运行的**满量程角**（弧度）—— 2026-11-04 起由 `MaskPrefs.rasterMaxAngle`（15~45°）决定。
@@ -394,7 +396,19 @@ internal object RasterRenderer {
     @Volatile private var desktopOnlyShared = false
 
     /** 仅桌面档在共用 leash 上的当前 alpha（-1 = 还没设过，强制写一次）。 */
-    private var deskOnlyAlpha = -1f
+    @Volatile private var deskOnlyAlpha = -1f
+
+    /** 仅桌面档在共用 leash 上的桌面 SC 快照（解锁时要在任意线程同步抬 alpha）。 */
+    @Volatile private var deskOnlyScs: List<android.view.SurfaceControl> = emptyList()
+
+    /**
+     * 仅桌面档的桌面份层号：**必须压在 Alive 的锁屏份之上**。
+     *
+     * 共存时两个 SC 是同一 leash 的兄弟；Alive 后挂上去就默认在上面，解锁瞬间它
+     * 还没淡完的锁屏画面会盖住我们的桌面图（用户真机看到的「Alive 桌面图一闪」）。
+     * 层号只在兄弟间比较，给一个明显更大的值即可。
+     */
+    private const val DESK_ONLY_LAYER = 1_000_000
 
     /**
      * **当前该画桌面份吗**（与 `SpatialRenderer.showingDesktop` 同义）。
@@ -567,6 +581,7 @@ internal object RasterRenderer {
         sharedLeash = false
         desktopOnlyShared = false
         deskOnlyAlpha = -1f
+        deskOnlyScs = emptyList()
         unfreezeTransition()
         fadeDoneAt = 0L
         pendingRaise = false
@@ -680,6 +695,11 @@ internal object RasterRenderer {
             "reparent", android.view.SurfaceControl::class.java, android.view.SurfaceControl::class.java,
         )
         val show = txClass.getMethod("show", android.view.SurfaceControl::class.java)
+        val setLayer = txClass.getMethod(
+            "setLayer",
+            android.view.SurfaceControl::class.java,
+            Int::class.javaPrimitiveType,
+        )
         // ⚠️ **挂载时不设 alpha**（v1.22.100 回退 v1.22.97 的「先全透再淡入」）：
         // 那套淡入只对 `lockScs` 生效，桌面份（`locked=false`）设成 0 之后再没人抬
         // ⇒ 全局 / 桌面档在桌面上永远是空的。新建 SC 默认 alpha=1，正是 v1.22.95 的行为。
@@ -715,6 +735,10 @@ internal object RasterRenderer {
             runCatching {
                 reparent.invoke(tx, m.sc, leash)
                 show.invoke(tx, m.sc)
+                // 与 Alive 共存时压在上面（见 [DESK_ONLY_LAYER]）
+                if (desktopOnlyShared && !m.locked) {
+                    setLayer.invoke(tx, m.sc, DESK_ONLY_LAYER)
+                }
                 kept.add(m)
                 HookRuntime.log(
                     "RASTER 挂载：showWhenLocked=${m.locked} leash=@" +
@@ -732,6 +756,7 @@ internal object RasterRenderer {
                 "RASTER 共用 leash：仅桌面档 → 保留桌面份挂到唯一 leash，" +
                     "按锁屏态设 alpha（当前=${if (showingDesktop) "桌面 1.0" else "锁屏 0.0"}）",
             )
+            deskOnlyScs = kept.filter { !it.locked }.map { it.sc }
             setDeskOnlyAlpha(if (showingDesktop) 1f else 0f, force = true)
         }
         if (kept.size != mounts.size && kept.isNotEmpty()) {
@@ -870,6 +895,7 @@ internal object RasterRenderer {
         sharedLeash = false
         desktopOnlyShared = false
         deskOnlyAlpha = -1f
+        deskOnlyScs = emptyList()
         unfreezeTransition()
         // 下次 startInternal 会用系统锁屏态重新初始化；这里只保证"停止后不残留旧的显示态"。
         showingDesktop = false
@@ -1302,6 +1328,8 @@ internal object RasterRenderer {
         handler?.post {
             if (runningKey == null) return@post
             aodActive = true
+            // **仅桌面档**：AOD 是锁屏态，桌面份必须让位（共用 leash 时它会盖在 Alive 的 AOD 上）。
+            setDeskOnlyAlpha(0f)
             // 进 AOD 只画锁屏份（桌面 leash 不可见），把解锁镜像关掉
             mirrorToDesk = false
             dim = (1f - black.coerceIn(0f, 1f))
@@ -1421,6 +1449,8 @@ internal object RasterRenderer {
             )
             // 景深主体淡回 1（幂等兜底，与空间壁纸同一处）。
             runCatching { RasterOverlay.onExitAod() }
+            // **仅桌面档**：出 AOD 先停在锁屏态，等解锁淡出再抬桌面份。
+            setDeskOnlyAlpha(0f)
             lastGyroAt = 0L
             gyroRate = 0f
             // 灭屏时系统会停掉这个非 wake-up 传感器，不重注册就一直静止（空间壁纸 2026-10-29 实证）。
@@ -1462,6 +1492,10 @@ internal object RasterRenderer {
      * 收尾只剩「翻显示态 + 停镜像」，判据三选一（`isFadingAway()` 可能恒 null，见 v1.22.112）。
      */
     fun fadeOutOnUnlock() {
+        // **仅桌面档 + 共用 leash：解锁起点先同步抬起桌面份**（2026-11-17）。
+        // 不能等 `handler.post`：Alive 的锁屏份可能在另一个线程同一时刻隐掉，
+        // 中间那几帧就是用户看到的「Alive 桌面图一闪」。层号已在挂载时压到 Alive 之上。
+        if (desktopOnlyShared && screenOn()) raiseDeskOnlyNow("解锁")
         val h = handler ?: return
         h.post {
             if (runningKey == null) return@post
@@ -1833,6 +1867,29 @@ internal object RasterRenderer {
     }
 
     /**
+     * 解锁起点**同步**抬起仅桌面档的 alpha（不排 GL 线程）。
+     *
+     * 解锁回调与 Alive 隐去锁屏份是两个线程上的动作：等 `handler.post` 轮到时，
+     * Alive 那份可能已经先隐掉、露出底下的系统 / 旧画面（用户真机「一闪」）。
+     * 这里用挂载时缓存的 SC 快照直接 apply，保证我们的桌面份在任何一帧之前就在上面。
+     */
+    private fun raiseDeskOnlyNow(reason: String) {
+        if (!desktopOnlyShared || deskOnlyAlpha >= 0.99f) return
+        val scs = deskOnlyScs
+        if (scs.isEmpty()) return
+        val tx = txAlpha ?: return
+        runCatching {
+            val obj = tx.first.getConstructor().newInstance()
+            scs.forEach { tx.second.invoke(obj, it, 1f) }
+            tx.third.invoke(obj)
+            deskOnlyAlpha = 1f
+            HookRuntime.log("RASTER 仅桌面 alpha=1.0（$reason 同步抬起）")
+        }.onFailure {
+            HookRuntime.log("RASTER 仅桌面同步抬 alpha 失败：${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
+    /**
      * **仅桌面档在共用 leash 上的可见性**（2026-11-05，问题一）。
      *
      * 这份层锁屏时也在屏幕上（系统只有一条 leash），所以锁屏必须 alpha 0、桌面 alpha 1。
@@ -1912,6 +1969,8 @@ internal object RasterRenderer {
 
     /** 画当前组（共用 leash / 单档只有 1 份；全局非共用时也只有 1 份可见）。 */
     private fun drawAllFrames(): Boolean {
+        // **仅桌面档**：AOD 只有锁屏 leash 可见，桌面份既不该画（swap 会阻塞）也没内容可画。
+        if (aodActive && runningScope == MaskPrefs.SPATIAL_SCOPE_DESKTOP) return false
         // **解锁镜像**（2026-11-15，照 Alive）：所有挂载目标都画，同一套参数。
         if (mirrorToDesk) return drawEveryMount()
         val wantLocked = activeMountIsLocked()

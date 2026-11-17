@@ -20,12 +20,30 @@ object AliveFlag {
     const val PROP_KEY = "debug.hyperextreme.alive_key"
 
     /**
-     * 生效范围：与空间 / 光栅同值域（0 锁屏 / 1 桌面 / 2 全局）。
+     * 生效范围：与空间 / 光栅同值域（0 锁屏 / 2 全局）。
      *
-     * Alive 目前**没有界面开关**，固定推 [MaskPrefs.SPATIAL_SCOPE_GLOBAL]：
-     * 锁屏、桌面、AOD 都要有画面，缺任何一条都会在切换时露系统壁纸。
+     * 默认 [MaskPrefs.SPATIAL_SCOPE_GLOBAL]（锁屏、桌面、AOD 都要有画面，缺任何一条
+     * 都会在切换时露系统壁纸）；选「仅锁屏」时与光栅「仅桌面」可以共存。
      */
     const val PROP_SCOPE = "debug.hyperextreme.alive_scope"
+
+    /**
+     * 桌面份怎么出：见 [DESK_FOLLOW] / [DESK_OWN] / [DESK_NONE]。
+     *
+     * 不能只看 `desk` 槽读不读得到图：空槽有两种语义 ——「跟随锁屏」（桌面画锁屏那张）
+     * 与「不用 Alive 桌面」（露系统默认桌面壁纸）。渲染器要靠它决定**要不要建桌面份**，
+     * 单看空图会把后者也画成锁屏图。
+     */
+    const val PROP_DESK_MODE = "debug.hyperextreme.alive_desk_mode"
+
+    /** 桌面与锁屏一致：桌面份画锁屏图。 */
+    const val DESK_FOLLOW = 0
+
+    /** 桌面有自己的图。 */
+    const val DESK_OWN = 1
+
+    /** 不用 Alive 桌面份：全局档留空时桌面露系统默认壁纸，仅锁屏档同理。 */
+    const val DESK_NONE = 2
 
     /**
      * 息屏样式：0 = 启航（圆球）、1 = 留光（相片）。见 `AliveStore.STYLE_*`。
@@ -64,13 +82,15 @@ object AliveFlag {
         depth: Boolean = false,
         style: Int = AliveStore.STYLE_QIHANG,
         ver: String = "",
+        deskMode: Int = DESK_FOLLOW,
     ) {
         val script = "setprop $PROP_ACTIVE ${if (active) 1 else 0}; " +
             "setprop $PROP_KEY ${key.orEmpty()}; " +
             "setprop $PROP_SCOPE $scope; " +
             "setprop $PROP_DEPTH ${if (active && depth) 1 else 0}; " +
             "setprop $PROP_STYLE ${if (active) style else 0}; " +
-            "setprop $PROP_VER ${if (active) ver else ""}"
+            "setprop $PROP_VER ${if (active) ver else ""}; " +
+            "setprop $PROP_DESK_MODE ${if (active) deskMode else DESK_FOLLOW}"
         Thread {
             val r = runCatching { RootShell.run(script) }.getOrNull()
             if (r == null || !r.ok) {

@@ -104,8 +104,10 @@ private val ALIVE_CARD_RADIUS = 16.dp
  * * **AOD 卡**不可点 —— 它的内容是锁屏图算出来的预览（球心固定屏幕 0.5）；
  * * **锁屏卡**点击导图，导入后立刻重算 AOD 预览；
  * * **桌面卡**点击导图；开了「桌面与锁屏一致」就置灰、直接显示锁屏那张。
+ *   全局档可以留空（留空 = 使用系统默认桌面壁纸）；「仅锁屏」档整槽置灰、不生效，
+ *   但已有设置会保留。
  *
- * 保存条件：锁屏与桌面都有图（或开了「一致」）。
+ * 保存条件：锁屏必须有图（桌面可留空；开了「一致」则桌面跟随锁屏）。
  */
 @Composable
 internal fun AliveGroupSheet(
@@ -118,6 +120,14 @@ internal fun AliveGroupSheet(
      * 那样标题永远是「编辑」（2026-11-08 用户指出）。
      */
     isNew: Boolean = false,
+    /**
+     * 当前生效范围是不是「仅锁屏」。
+     *
+     * 仅锁屏时桌面槽置灰：图可以留着（切回全局还在），但这次不会生效。
+     * 判据用页面上的当前选择，不用「已应用那次的 scope」—— 用户先改选项再看组合时，
+     * 这里就该跟着变。
+     */
+    lockOnly: Boolean = false,
     onDismiss: () -> Unit,
 ) {
     val ctx = LocalContext.current
@@ -408,12 +418,12 @@ internal fun AliveGroupSheet(
      *
      * 校验口径（2026-11-09 用户要求「按实际状态提示」）：
      * * 锁屏：**永远必填**（AOD 层与转场都以它为源）；
-     * * 桌面：开「桌面与锁屏一致」时跟随锁屏、不算缺；否则必填；
+     * * 桌面：**可以留空**（2026-11-17 用户定）—— 全局档留空 = 桌面用系统默认壁纸；
+     *   「仅锁屏」档本来就不用桌面；开了「一致」时跟随锁屏；
      * * AOD：只有「留光 + 关『AOD 与锁屏一致』」才算一槽（`aodPickable`），此时必填；
      *   其它情况 AOD 是用锁屏图算出来的，不参与校验。
      *
-     * 文案统一成「AOD/锁屏/桌面还没有选择图片」，缺几项报几项（顺序 AOD → 锁屏 → 桌面）。
-     * 原来那两条「锁屏和桌面都要选图」「至少给锁屏选一张图」已删 —— 它们说不出到底缺哪张。
+     * 文案统一成「AOD/锁屏还没有选择图片」，缺几项报几项。
      */
     fun finish() {
         val g = working
@@ -421,7 +431,6 @@ internal fun AliveGroupSheet(
             val missing = buildList {
                 if (g.aodPickable && g.aodSrc == null) add("AOD")
                 if (g.lock == null) add("锁屏")
-                if (!g.followLock && g.desktop == null) add("桌面")
             }
             if (missing.isNotEmpty()) {
                 AppToast.show(ctx, "${missing.joinToString("/")}还没有选择图片")
@@ -539,15 +548,23 @@ internal fun AliveGroupSheet(
                         )
                     },
                 )
-                // 桌面：导入；开了「一致」就置灰
+                // 桌面：导入；开了「一致」就置灰；「仅锁屏」档整槽置灰且不生效。
+                // 已设置的桌面图保留显示（切回全局还能用），只是不让点 / 不让删。
                 AliveSlot(
                     title = "桌面",
                     bitmap = deskBmp,
-                    enabled = idle && g?.followLock != true,
+                    enabled = idle && g?.followLock != true && !lockOnly,
+                    dimmed = lockOnly,
+                    hint = when {
+                        lockOnly -> "仅锁屏不使用桌面图"
+                        g != null && !g.followLock && g.desktop == null ->
+                            "留空时使用系统默认桌面壁纸"
+                        else -> null
+                    },
                     width = slotW,
                     height = slotH,
-                    // 开「一致」时桌面显示的是锁屏那张，删除钮属于锁屏卡
-                    onRemove = if (deskBmp != null && g?.followLock != true) {
+                    // 开「一致」时桌面显示的是锁屏那张，删除钮属于锁屏卡；仅锁屏档也不给删
+                    onRemove = if (deskBmp != null && g?.followLock != true && !lockOnly) {
                         ({ removeSlot(AliveStore.Slot.DESKTOP) })
                     } else {
                         null
@@ -912,6 +929,10 @@ private fun AliveSlot(
     width: Dp,
     height: Dp,
     busy: Boolean = false,
+    /** 整张卡压暗（「仅锁屏」档的桌面槽：设置留着但不生效）。 */
+    dimmed: Boolean = false,
+    /** 标题下的一行说明（桌面槽：仅锁屏不使用 / 全局留空用系统默认壁纸）。 */
+    hint: String? = null,
     /** 有图时右上角出现删除钮（照光栅 `PickCard` 的 `RemoveBadge`）；null = 这个槽不能删。 */
     onRemove: (() -> Unit)? = null,
     onClick: () -> Unit,
@@ -930,7 +951,11 @@ private fun AliveSlot(
     ) {
         // ⚠️ **外层不裁**（照光栅 `PickCard` 的注释）：删除钮用 `offset` 探出卡角，
         //    `squircleClip` 必须留在内层，否则钮探出去的那半颗会被一起裁成半圆。
-        Box(modifier = Modifier.size(width, height)) {
+        Box(
+            modifier = Modifier
+                .size(width, height)
+                .graphicsLayer { alpha = if (dimmed) 0.4f else 1f },
+        ) {
             Box(
                 modifier = Modifier
                     .size(width, height)
@@ -1030,6 +1055,16 @@ private fun AliveSlot(
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth(),
         )
+        if (hint != null) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = hint,
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.disabledOnSurface,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 }
 
