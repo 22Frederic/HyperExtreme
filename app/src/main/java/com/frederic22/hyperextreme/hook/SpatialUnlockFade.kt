@@ -52,7 +52,9 @@ import java.util.concurrent.ConcurrentHashMap
  * ## 开关
  *
  * `SpatialFlag.PROP_ACTIVE == 1` **且** `PROP_SCOPE != SPATIAL_SCOPE_DESKTOP`
- * —— 只有「锁屏 / 全局」档才需要，桌面档我们的图在桌面 leash 上、解锁根本不动它。
+ * —— 只有「锁屏 / 全局」档才需要 `PROP_KEYGUARD` 与前景主体那两段。
+ * **仅桌面档仍要翻转渲染器 alpha**（共用 leash 上按锁屏态显隐，2026-11-17），
+ * 所以 `SpatialRenderer.fadeOutOnUnlock` / `resetAlpha` 不再受这个判据拦截。
  * 与视差完全独立：不读不写任何 `parallax*` 字段。
  */
 internal object SpatialUnlockFade {
@@ -173,10 +175,10 @@ internal object SpatialUnlockFade {
                     RasterRenderer.fadeOutOnUnlock()
                     // Alive 壁纸同理。
                     AliveRenderer.fadeOutOnUnlock()
-                    if (enabled()) {
-                        logOnce("fade-exit", "解锁退场动画开始 → 启动解锁淡出")
-                        SpatialRenderer.fadeOutOnUnlock()
-                    }
+                    // 空间壁纸同理：**仅桌面档也需要**它抬桌面份 alpha（2026-11-17），
+                    // 不能再用 [enabled] 拦住（那个判据只对锁屏 / 全局档成立）。
+                    SpatialRenderer.fadeOutOnUnlock()
+                    if (enabled()) logOnce("fade-exit", "解锁退场动画开始 → 启动解锁淡出")
                     return chain.proceed()
                 }
             })
@@ -231,18 +233,18 @@ internal object SpatialUnlockFade {
                         if (showing) RasterRenderer.resetAlpha() else RasterRenderer.fadeOutOnUnlock()
                         // Alive 壁纸同一条时机
                         if (showing) AliveRenderer.resetAlpha() else AliveRenderer.fadeOutOnUnlock()
+                        // 空间壁纸：**仅桌面档也要**翻转共用 leash 上桌面份的 alpha（2026-11-17）。
+                        if (showing) SpatialRenderer.resetAlpha() else SpatialRenderer.fadeOutOnUnlock()
                     }
                     if (!enabled()) return result
                     when {
                         showing && !was -> {
                             setFlag(com.frederic22.hyperextreme.data.SpatialFlag.PROP_KEYGUARD, "1")
                             logOnce("reset", "锁屏出现（showing false→true）→ alpha 复位 1")
-                            SpatialRenderer.resetAlpha()
                         }
                         !showing && was -> {
                             setFlag(com.frederic22.hyperextreme.data.SpatialFlag.PROP_KEYGUARD, "0")
                             logOnce("fade", "锁屏消失（showing true→false）→ 启动解锁淡出")
-                            SpatialRenderer.fadeOutOnUnlock()
                         }
                     }
                     return result
@@ -278,10 +280,10 @@ internal object SpatialUnlockFade {
                     if (chain.getArgs().filterIsInstance<Boolean>().firstOrNull() == true) {
                         RasterRenderer.resetAlpha()
                         AliveRenderer.resetAlpha()
-                    }
-                    if (chain.getArgs().filterIsInstance<Boolean>().firstOrNull() == true && enabled()) {
-                        logOnce("reset-on", "亮屏 → alpha 复位 1")
+                        // 仅桌面档也吃这个兜底（2026-11-17）：灭屏时桌面份会被压到 0，
+                        // 亮屏回桌面若没有锁屏状态跳变就没人把它抬回来。
                         SpatialRenderer.resetAlpha()
+                        if (enabled()) logOnce("reset-on", "亮屏 → alpha 复位 1")
                     }
                     return chain.proceed()
                 }

@@ -744,8 +744,10 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                                 }
                             } else {
                                 // 功能冲突（三侧统一）：跳系统页会把系统壁纸换掉 ⇒ 先关对方。
+                                // 仅桌面档可以和 Alive 仅锁屏共存（2026-11-17），范围必须一起传。
                                 val other = WallpaperConflict.running(
                                     ctx, state, WallpaperChain.SPATIAL,
+                                    prefs.spatialScope, WallpaperMode.SERVICE,
                                 )
                                 when {
                                     other != null -> {
@@ -791,6 +793,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                                 } else {
                                     val other = WallpaperConflict.running(
                                         ctx, state, WallpaperChain.SPATIAL,
+                                        prefs.spatialScope,
                                     )
                                     if (other != null) {
                                         conflictOther = other

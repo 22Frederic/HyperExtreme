@@ -268,11 +268,22 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             showAodWarn = true
             return
         }
+        // **全局档桌面留空 = 桌面没有 Alive 份**（2026-11-17）：按仅锁屏参与共存，
+        // 否则「空间 / 光栅仅桌面」会被误判成冲突。判据取自**这一组**的 deskMode，
+        // 与 `AliveRenderer.startInternal` 的 hiddenDesktop 同源。
+        val selfScope = if (
+            prefs.aliveScope == MaskPrefs.SPATIAL_SCOPE_GLOBAL &&
+            item.deskMode == AliveFlag.DESK_NONE
+        ) {
+            MaskPrefs.SPATIAL_SCOPE_LOCK
+        } else {
+            prefs.aliveScope
+        }
         val other = WallpaperConflict.running(
             ctx,
             state,
             WallpaperChain.ALIVE,
-            prefs.aliveScope,
+            selfScope,
         )
         if (other != null) {
             conflictOther = other

@@ -3279,6 +3279,8 @@ internal object AliveRenderer {
         mirrorToDesk = false
         // 景深主体层：撤掉我们的图（层本身还给系统）
         runCatching { AliveOverlay.onDisabled() }
+        // AOD 期间被收起的锁屏时钟必须还回去（否则关掉 Alive 后锁屏没有时钟）
+        runCatching { SpatialForegroundHider.onAodState(false) }
 
         runCatching {
             if (mounts.isNotEmpty()) {
