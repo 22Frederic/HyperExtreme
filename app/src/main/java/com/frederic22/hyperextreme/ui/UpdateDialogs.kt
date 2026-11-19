@@ -12,7 +12,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.frederic22.hyperextreme.data.UpdateChecker
 import top.yukonga.miuix.kmp.theme.LocalDismissState
-import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 「模块发布页」的三项（顺序 = 弹窗里的显示顺序，用户 2026-11-16 指定）。
@@ -44,7 +43,7 @@ internal fun UpdateFoundDialog(
     onDismissRequest: () -> Unit,
     onConfirm: () -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "发现新版本",
         summary = "v$versionName($versionCode)已发布，点击“确认”打开模块发布页。",
         show = show,
@@ -93,7 +92,7 @@ internal fun UpdateFailedDialog(
     show: Boolean,
     onDismissRequest: () -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "检测更新失败",
         show = show,
         onDismissRequest = onDismissRequest,

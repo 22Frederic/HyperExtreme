@@ -519,6 +519,18 @@ internal object SpatialOverlay {
      * 2. `SpatialForegroundHider` 在**闸门之前**（属性 active=0 时 `handle()` 根本不会进）；
      * 3. 开关从开到关、但渲染器还没重建的那一次 `updateKeyguardElementsVisibility`。
      */
+    /**
+     * 锁屏状态变了（2026-11-19）：重绘一帧，让 [SubjectView.onDraw] 的闸门真正生效。
+     *
+     * 为什么必须主动 invalidate：`onDraw` 只在"需要重绘"时才跑。解锁时若没人 invalidate，
+     * 上一帧（锁屏主体）就留在 RenderNode 里，通知中心的捕获管线照样取得到 ——
+     * 闸门写在 `onDraw` 里也只是"下次重绘时"才起作用。
+     */
+    fun onContentGateChanged() {
+        val v = view ?: return
+        mainHandler.post { runCatching { v.invalidate() } }
+    }
+
     fun onDisabled() {
         if (view == null && installedKey.isEmpty() && systemSubject == null) return
         if (Looper.myLooper() == Looper.getMainLooper()) disabledOnMain()
@@ -622,6 +634,10 @@ internal object SpatialOverlay {
         }
 
         override fun onDraw(canvas: Canvas) {
+            // 内容闸门（2026-11-19）：解锁后通知中心的"包含下方"捕获**不尊重可见性**，
+            // 主体留在 RenderNode 里就会被连同背景一起取走（观感 = 通知中心出现主体层）。
+            // 非锁屏态一律不画，让这一帧的 RenderNode 是空的。见 [KeyguardContentGate]。
+            if (!KeyguardContentGate.allowDraw(this)) return
             val tex = texShader ?: return
             val dep = depthShader ?: return
             val g = SpatialRenderer.geometry() ?: return

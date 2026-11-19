@@ -20,6 +20,9 @@
     <queries>
         <package android:name="com.miui.aod" />
         <package android:name="com.android.systemui" />
+        <!-- 景深主体抠图（AicrVision）：隐式 ACTION 绑定需要目标包可见（Android 11+）。
+             2026-11-19（issue #4）：显式 ComponentName 已先试，这条是回退路径的保险。 -->
+        <package android:name="com.xiaomi.aicr" />
         <package android:name="org.lsposed.manager" />
     </queries>
 
@@ -46,6 +49,20 @@
         android:largeHeap="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.MaskSwap">
+
+        <!--
+          AICR 广播通道的文件交换站（2026-11-19，issue #4 续）。
+          广播 extras 被 framework 禁掉了 fd（`setAllowFds(false)`），只能传 content:// Uri：
+          接收方（com.xiaomi.aicr）靠广播带的 FLAG_GRANT_READ/WRITE_URI_PERMISSION 临时拿到
+          单个文件的读写权，自己 openFileDescriptor / openOutputStream。
+          `exported=false` + `grantUriPermissions=true` 是这套用法的标准配置：
+          不对外暴露，但可以按 Uri 单次授权。范围仅 cacheDir/aicr/ 一层。
+        -->
+        <provider
+            android:name=".aicr.AicrFileProvider"
+            android:authorities="com.frederic22.hyperextreme.aicr"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
         <!--
           启动遮罩（2026-10-29）：**没有 setContentView** 的空 Activity，窗口内容就是

@@ -66,7 +66,6 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.squircle.squircleClip
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowDialog
 import kotlin.math.roundToInt
 
 /**
@@ -1025,7 +1024,7 @@ private fun DeleteRasterDialog(
     onDismissRequest: () -> Unit,
     onConfirm: () -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "删除此组合？",
         summary = "组合内的图片缓存将被删除",
         show = show,
@@ -1075,7 +1074,7 @@ private fun RasterClearAllDialog(
     onDismissRequest: () -> Unit,
     onConfirm: () -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "请确认",
         summary = summary,
         show = show,

@@ -5,14 +5,21 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.graphics.Bitmap
-import android.os.Binder
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.Parcel
 import android.os.ParcelFileDescriptor
 import android.os.Parcelable
+import android.os.ResultReceiver
 import android.util.Log
+import com.frederic22.hyperextreme.data.RunLog
 import java.io.File
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -60,19 +67,19 @@ internal object AicrVision {
 
     private const val PKG = "com.xiaomi.aicr"
     private const val ACTION = "com.xiaomi.aicr.access.AICR_ENGINE"
-    private const val IFACE_CORE = "com.xiaomi.aicr.IAiCrCoreService"
-    private const val IFACE_SEGMENT = "com.xiaomi.aicr.plugin.IImageSegmentService"
-    private const val PLUGIN_VERSION = "5.0"
 
-    private const val CODE_GET_PLUGIN = 1
-    private const val CODE_SEGMENT_BY_FD = 5
+    /**
+     * `AICR_ENGINE` 的实际实现组件（`dumpsys package com.xiaomi.aicr` 核对过：
+     * `com.xiaomi.aicr/.access.AiCrCoreService`）。
+     *
+     * 2026-11-19（issue #4）：绑定改成**先显式、失败回退隐式**。Android 11+ 的包可见性过滤
+     * 只作用于**隐式** Intent 的解析，显式 ComponentName 不走那条路 —— 用户「绑不上」的
+     * 第一嫌疑就是包可见性（K80 Pro / HyperOS 4 上复现，本机同版本同系统却正常）。
+     */
+    private val CORE_COMPONENT = ComponentName(PKG, "com.xiaomi.aicr.access.AiCrCoreService")
 
-    /** 插件状态：首次使用要下模型（服务端会一直返回这个，直到就绪）。 */
-    private const val STATUS_DOWNLOADING = 1
-
-    /** 首次下载的等待上限 / 轮询间隔（2026-11-05：等它就绪，而不是一次就判失败）。 */
-    private const val PLUGIN_WAIT_MS = 45_000L
-    private const val PLUGIN_POLL_MS = 1_500L
+    /** 广播通道等待上限：要盖过 AICR 侧「首次下载模型」的 45s 等待。 */
+    private const val BROADCAST_TIMEOUT_MS = 60_000L
 
     /** 单次调用的结果。`mask` 是**已经归一化成灰度**的那份，`bitmap` 是服务原样返回的抠像。 */
     data class Result(
@@ -84,6 +91,13 @@ internal object AicrVision {
         val detail: String,
         /** 为「首次下载」等掉的毫秒数（0 = 没等）。界面用它决定要不要提示。 */
         val waitedMs: Long = 0,
+        /**
+         * **实际生效的通道**（2026-11-19，issue #4）：`"广播"` / `"binder"` / `""`（没走到通道就失败了）。
+         *
+         * 广播是主通道（AICR 进程内本地 bind 自己，绕开跨应用限制）；
+         * binder 是托底。run_log 靠它区分"哪条路走通的"。
+         */
+        val channel: String = "",
     )
 
     /**
@@ -114,71 +128,67 @@ internal object AicrVision {
     fun segmentFile(ctx: Context, file: File): Result =
         runFd(ctx, file, System.currentTimeMillis(), deleteAfter = false)
 
-    /** 真正干活的那段：开 FD → getPluginBinder → segmentByFd → deriveMask。 */
+    /**
+     * 真正干活的那段：**先广播、再 binder 托底**（2026-11-19，issue #4）。
+     *
+     * 广播通道：App 发 `setPackage("com.xiaomi.aicr")` 的自定义广播 → AICR 进程收到后
+     * **本地 bind 自己**（同包同 uid），完全绕开跨应用的包可见性 / 组件管控 / bind 限制。
+     * binder 通道：原来的那条，跨应用 bind —— 部分设备上 `resolveService` 直接返回 null。
+     */
     private fun runFd(ctx: Context, input: File, startAt: Long, deleteAfter: Boolean): Result {
+        // ① 广播（主通道）
+        val (viaBroadcast, bcError) = runBroadcast(ctx, input, startAt)
+        if (viaBroadcast != null) {
+            if (deleteAfter) runCatching { input.delete() }
+            return viaBroadcast
+        }
+
+        // ② binder（托底）
         val conn = connect(ctx, 8000)
-            ?: return fail(startAt, "绑不上 $PKG（服务不存在 / 被系统限制）")
+            ?: return fail(
+                startAt,
+                "广播失败（${bcError ?: "未知"}）；binder 也绑不上 $PKG（服务不存在 / 被系统限制）",
+                0, "binder",
+            )
 
         var pfd: ParcelFileDescriptor? = null
         var waited = 0L
         try {
-            val core = conn.binder ?: return fail(startAt, "服务连接为空")
+            val core = conn.binder ?: return fail(startAt, "服务连接为空", 0, "binder")
             val waitStart = System.currentTimeMillis()
-            val (plugin, status) = awaitPlugin(core)
+            val (plugin, status) = AicrProtocol.awaitPlugin(core)
             waited = System.currentTimeMillis() - waitStart
             Log.i(TAG, "plugin: status=$status binder=$plugin waited=${waited}ms")
             if (plugin == null) {
-                return fail(startAt, "getPluginBinder 返回空（${statusText(status)}）", waited)
+                return fail(startAt, "getPluginBinder 返回空（${AicrProtocol.statusText(status)}）", waited, "binder")
             }
-            if (status != 0) {
+            if (status != AicrProtocol.STATUS_OK) {
                 return fail(
                     startAt,
-                    if (status == STATUS_DOWNLOADING) {
+                    if (status == AicrProtocol.STATUS_DOWNLOADING) {
                         "AI 模型首次下载超时（等了 ${waited / 1000} 秒仍未就绪）"
                     } else {
-                        "插件未就绪（${statusText(status)}）"
+                        "插件未就绪（${AicrProtocol.statusText(status)}）"
                     },
-                    waited,
+                    waited, "binder",
                 )
             }
 
             pfd = ParcelFileDescriptor.open(input, ParcelFileDescriptor.MODE_READ_ONLY)
-            val data = Parcel.obtain()
-            val reply = Parcel.obtain()
-            try {
-                data.writeInterfaceToken(IFACE_SEGMENT)
-                data.writeTypedObject(pfd, 0)
-                data.writeTypedObject(
-                    VisionAttribute(
-                        visionType = 0,
-                        privacy = false,
-                        // 把多个主体并成一块：光栅壁纸要的是「整个人」，不是「最大那个人」
-                        extractCombined = true,
-                        maxAreaAsSingle = false,
-                    ),
-                    0,
-                )
-                plugin.transact(CODE_SEGMENT_BY_FD, data, reply, 0)
-                reply.readException()
-
-                val bitmap = reply.readTypedObject(SegmentResult.CREATOR)?.bitmaps?.firstOrNull()
-                val cost = System.currentTimeMillis() - startAt
-                if (bitmap == null) {
-                    return Result(false, status, null, null, cost, "服务返回空位图", waited)
-                }
-                val mask = deriveMask(bitmap)
-                Log.i(TAG, "ok=${bitmap.width}x${bitmap.height} cost=${cost}ms")
-                return Result(
-                    true, status, bitmap, mask, cost,
-                    "成功：${bitmap.width}×${bitmap.height}", waited,
-                )
-            } finally {
-                data.recycle()
-                reply.recycle()
+            val bitmap = AicrProtocol.segmentByFd(plugin, pfd!!)?.bitmaps?.firstOrNull()
+            val cost = System.currentTimeMillis() - startAt
+            if (bitmap == null) {
+                return fail(startAt, "服务返回空位图", waited, "binder")
             }
+            val mask = deriveMask(bitmap)
+            Log.i(TAG, "ok=${bitmap.width}x${bitmap.height} cost=${cost}ms")
+            return Result(
+                true, status, bitmap, mask, cost,
+                "成功（binder 托底）：${bitmap.width}×${bitmap.height}", waited, "binder",
+            )
         } catch (t: Throwable) {
             Log.e(TAG, "调用失败", t)
-            return fail(startAt, "${t.javaClass.simpleName}: ${t.message}", waited)
+            return fail(startAt, "${t.javaClass.simpleName}: ${t.message}", waited, "binder")
         } finally {
             runCatching { pfd?.close() }
             runCatching { ctx.unbindService(conn.connection) }
@@ -186,10 +196,139 @@ internal object AicrVision {
         }
     }
 
+    /**
+     * 广播通道（2026-11-19，issue #4）。
+     *
+     * 协议：App 把「原图 fd（读）」和「结果 pipe（写）」塞进广播 → AICR 进程收到后
+     * 先写一个 [AicrProtocol.FLAG_ACCEPTED] 字节表示「已接手」，处理完再写 PNG。
+     *
+     * @return 成功结果；**返回 null 一律表示「这条路没走通」**，由调用方回退 binder。
+     */
+    /**
+     * 广播通道（2026-11-19，issue #4）：App 发**有序**广播 → AICR 进程本地 bind 自己 → 抠图。
+     *
+     * ⚠️ 第一版把 `ParcelFileDescriptor` 塞进广播 extras，真机直接抛
+     * `RuntimeException: Not allowed to write file descriptors here`
+     * —— `Intent.prepareToLeaveProcess()` 会对 extras 调 `Bundle.setAllowFds(false)`，
+     * 这是 framework 硬限制、与设备无关。现在改成 **ContentProvider + Uri**：
+     *
+     * ```
+     * 输入图复制到 cacheDir/aicr/<token>_in.png
+     * 广播 extras 只放 content:// 字符串 + FLAG_GRANT_READ/WRITE_URI_PERMISSION + ResultReceiver
+     * AICR 自己 openFileDescriptor / openOutputStream，处理完 receiver.send(OK)
+     * ```
+     *
+     * @return (成功结果, null) 或 (null, 失败原因) —— 后者用于回退 binder 时把两条路的
+     *         原因一起写进 run_log。
+     */
+    private fun runBroadcast(ctx: Context, input: File, startAt: Long): Pair<Result?, String?> {
+        val token = UUID.randomUUID().toString().replace("-", "")
+        val dir = File(ctx.cacheDir, AicrFileProvider.DIR).apply { mkdirs() }
+        val inFile = File(dir, "${token}_in.png")
+        val outFile = File(dir, "${token}_out.png")
+
+        // provider 只暴露 cacheDir/aicr/ 这一层 ⇒ 输入图必须先复制进来。
+        val copied = runCatching {
+            input.inputStream().use { i -> inFile.outputStream().use { o -> i.copyTo(o) } }
+        }.isSuccess
+        if (!copied) {
+            runCatching { inFile.delete() }
+            return null to "复制输入图失败"
+        }
+
+        val latch = CountDownLatch(1)
+        var err: String? = null
+        val receiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {
+            override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+                if (resultCode == AicrProtocol.RESULT_ERR) {
+                    err = resultData?.getString(AicrProtocol.EXTRA_ERROR) ?: "未说明原因"
+                }
+                latch.countDown()
+            }
+        }
+
+        val inUri = Uri.parse(AicrProtocol.fileUri(inFile.name))
+        val outUri = Uri.parse(AicrProtocol.fileUri(outFile.name))
+        // 广播 flags 的 Uri 授权对**动态注册**的 receiver 不一定生效（AOSP 只在静态 receiver
+        // 分支 grant），所以这里再显式授权一次 —— provider 是 exported=false +
+        // grantUriPermissions=true，按单个 Uri 授权给 AICR 包，收尾时 revoke。
+        runCatching {
+            ctx.grantUriPermission(AicrProtocol.PKG, inUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            ctx.grantUriPermission(AicrProtocol.PKG, outUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        }
+        try {
+            val intent = Intent(AicrProtocol.ACTION_SEGMENT)
+                .setPackage(AicrProtocol.PKG)
+                .putExtra(AicrProtocol.EXTRA_MAGIC, AicrProtocol.MAGIC)
+                .putExtra(AicrProtocol.EXTRA_IN_URI, inUri.toString())
+                .putExtra(AicrProtocol.EXTRA_OUT_URI, outUri.toString())
+                .putExtra(AicrProtocol.EXTRA_RESULT, receiver)
+                .addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            runCatching {
+                // 有序广播：AICR 有 5+ 个进程都注册了接收器，第一个收到的进程
+                // `abortBroadcast()` 独占，其余不再收到（否则同一个输出文件被写多遍）。
+                ctx.sendOrderedBroadcast(intent, null)
+            }.onFailure { t ->
+                val msg = "广播发送失败：${t.javaClass.simpleName}: ${t.message}"
+                report(ctx, msg)
+                return null to msg
+            }
+
+            val done = runCatching {
+                latch.await(BROADCAST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            }.getOrDefault(false)
+            if (!done) return null to "广播 ${BROADCAST_TIMEOUT_MS / 1000}s 超时（没有 AICR 进程接）"
+            if (err != null) return null to "广播：$err"
+
+            val png = runCatching { outFile.readBytes() }.getOrNull()
+            if (png == null || png.isEmpty()) return null to "广播：结果文件为空"
+            val bmp = runCatching { BitmapFactory.decodeByteArray(png, 0, png.size) }.getOrNull()
+                ?: return null to "广播：结果解码失败"
+            val mask = deriveMask(bmp)
+            val cost = System.currentTimeMillis() - startAt
+            Log.i(TAG, "ok(broadcast)=${bmp.width}x${bmp.height} cost=${cost}ms")
+            return Result(
+                true, AicrProtocol.STATUS_OK, bmp, mask, cost,
+                "成功（广播通道）：${bmp.width}×${bmp.height}", 0, "广播",
+            ) to null
+        } finally {
+            runCatching { ctx.revokeUriPermission(inUri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            runCatching { ctx.revokeUriPermission(outUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
+            runCatching { inFile.delete() }
+            runCatching { outFile.delete() }
+        }
+    }
+
+
     // ──────────────────────────────────────────────────────────── 绑定 / 插件
 
     private class Conn(val connection: ServiceConnection) {
         @Volatile var binder: IBinder? = null
+    }
+
+    /** 同类失败进程内只写一次 run_log（重试多次会刷屏，500 行很快被挤掉）。 */
+    private val reported = ConcurrentHashMap<String, Boolean>()
+
+    /**
+     * 绑定失败的**持久化**记录（2026-11-19，issue #4）。
+     *
+     * release 包的 `Log.i` 在 HyperOS 上被日志白名单拦掉 —— LSPosed 日志里看不到 App 侧
+     * 任何输出，`HX-AICR` 那条 TAG 从没出现在用户日志里。唯一能带出来的通道是
+     * `run_log.txt`（`/data/user/0/com.frederic22.hyperextreme/run_log.txt`，见 [RunLog]）。
+     *
+     * 记的内容直接对应根因：
+     * * `显式/隐式 bind 抛 XxxException: …` → 组件启动被管控（链式启动那套）
+     * * `两种 Intent 都 bindService=false` → 服务解析不到（包可见性 / 组件被隐藏）
+     * * `… 绑定超时` → 服务拉不起来（冷启动慢 / 被冻结）
+     */
+    private fun report(ctx: Context, msg: String) {
+        Log.w(TAG, msg)
+        val key = msg.substringBefore(':').substringBefore('：')
+        if (reported.putIfAbsent(key, true) != null) return
+        runCatching { RunLog.append(ctx, "AICR 绑定失败", listOf(msg), ok = false) }
     }
 
     private fun connect(ctx: Context, timeoutMs: Long): Conn? {
@@ -208,173 +347,44 @@ internal object AicrVision {
             }
         }
         conn = Conn(sc)
-        val intent = Intent(ACTION).setPackage(PKG)
-        val bound = runCatching { ctx.bindService(intent, sc, Context.BIND_AUTO_CREATE) }
-            .onFailure { Log.e(TAG, "bindService 抛异常", it) }
-            .getOrDefault(false)
-        if (!bound) return null
+
+        // 2026-11-19（issue #4）：先走**显式组件**。Android 11+ 的包可见性过滤只作用于
+        // 隐式 Intent 的解析，显式 ComponentName 不受影响。
+        var how = "显式"
+        var bound = runCatching {
+            ctx.bindService(Intent().setComponent(CORE_COMPONENT), sc, Context.BIND_AUTO_CREATE)
+        }.onFailure {
+            report(ctx, "显式 bind 抛 ${it.javaClass.simpleName}: ${it.message}")
+        }.getOrDefault(false)
+
+        // 显式失败 ⇒ 回退原来的隐式 action。**只在 bound=false 时回退**：
+        // 已经 bind 成功过的 ServiceConnection 不能再用同一个实例绑第二次。
+        if (!bound) {
+            how = "隐式"
+            bound = runCatching {
+                ctx.bindService(Intent(ACTION).setPackage(PKG), sc, Context.BIND_AUTO_CREATE)
+            }.onFailure {
+                report(ctx, "隐式 bind 抛 ${it.javaClass.simpleName}: ${it.message}")
+            }.getOrDefault(false)
+        }
+
+        if (!bound) {
+            report(ctx, "两种 Intent 都 bindService=false（服务解析不到）")
+            return null
+        }
         if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
-            Log.w(TAG, "bind 超时")
+            report(ctx, "$how 绑定超时 ${timeoutMs}ms")
             return null
         }
         return conn
     }
 
     /** @return (插件 binder, Status) */
-    private fun plugin(core: IBinder): Pair<IBinder?, Int> {
-        val data = Parcel.obtain()
-        val reply = Parcel.obtain()
-        return try {
-            data.writeInterfaceToken(IFACE_CORE)
-            data.writeStrongBinder(SilentCallback())
-            data.writeString("HyperExtreme")
-            data.writeString(IFACE_SEGMENT)
-            data.writeString(PLUGIN_VERSION)
-            core.transact(CODE_GET_PLUGIN, data, reply, 0)
-            reply.readException()
-            val binder = reply.readStrongBinder()
-            val hasBundle = reply.readInt() != 0
-            val bundle = Bundle()
-            if (hasBundle) bundle.readFromParcel(reply)
-            binder to bundle.getInt("Status", -1)
-        } finally {
-            data.recycle()
-            reply.recycle()
-        }
-    }
-
-    /**
-     * 取插件，**首次下载时会一直等到就绪**（2026-11-05）。
-     *
-     * 为什么必须等：真机模型下好之后状态恒为 0，但新设备第一次调用拿到的是
-     * `Status=1`（`DOWNLOADING_FIRST_USE`）——原实现直接判失败，用户看到的就是
-     * 「景深主体计算失败」，再点一次也还是失败（模型还没下完）。
-     *
-     * 上限 [PLUGIN_WAIT_MS]，每 [PLUGIN_POLL_MS] 重取一次；超时后把最后一次的
-     * `(binder, status)` 原样返回，由上层拼成「下载超时」的文案。
-     */
-    private fun awaitPlugin(core: IBinder): Pair<IBinder?, Int> {
-        var last = plugin(core)
-        if (last.second != STATUS_DOWNLOADING) return last
-        Log.i(TAG, "AI 模型首次下载中，最多等 ${PLUGIN_WAIT_MS / 1000} 秒")
-        val deadline = System.currentTimeMillis() + PLUGIN_WAIT_MS
-        while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(PLUGIN_POLL_MS)
-            last = plugin(core)
-            Log.i(TAG, "轮询插件：Status=${last.second}")
-            if (last.second != STATUS_DOWNLOADING) return last
-        }
-        return last
-    }
-
-    /** Status 枚举译成人话（界面/toast/日志共用一套说法）。 */
-    private fun statusText(status: Int): String = when (status) {
-        0 -> "Status=0 就绪"
-        1 -> "Status=1 AI 模型首次下载中"
-        2 -> "Status=2 AI 引擎需要升级"
-        // 服务端「一个字节都不写」的拒绝（空 reply）也会落到 -1。
-        // AICR 4.13.8 起新增调用方签名白名单（AccessGuard），被拒时就是这种现象。
-        -1 -> "Status=-1 服务未响应（新版 AI 引擎可能拒绝调用：需模块 hook 放行，" +
-            "并确认 LSPosed 已勾选「小米澎湃 AI 引擎」作用域）"
-        else -> "Status=$status"
-    }
-
-    /**
-     * `ICoreServiceCallback` 的空实现。
-     *
-     * 服务端只在「模型首次下载」时回调 `onDownload(IBinder)` / `speed(String, long)`；
-     * 我们是同步等待，不需要那些进度，**照单全收 return true** 即可。
-     */
-    private class SilentCallback : Binder() {
-        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
-            if (code == INTERFACE_TRANSACTION) {
-                reply?.writeString(DESCRIPTOR)
-                return true
-            }
-            return true
-        }
-
-        companion object {
-            private const val DESCRIPTOR = "com.xiaomi.aicr.ICoreServiceCallback"
-        }
-    }
-
-    // ──────────────────────────────────────────────────────────── Parcelable
-
-    /**
-     * 与 `com.xiaomi.aicr.vision.VisionAttribute` **逐字段同序**。
-     * 见类注释里的 Parcel 顺序；写错一个字段服务端就会收到垃圾。
-     */
-    private class VisionAttribute(
-        private val visionType: Int,
-        private val privacy: Boolean,
-        private val extractCombined: Boolean,
-        private val maxAreaAsSingle: Boolean,
-    ) : Parcelable {
-
-        override fun writeToParcel(dest: Parcel, flags: Int) {
-            dest.writeInt(visionType)
-            dest.writeBoolean(privacy)
-            dest.writeBundle(Bundle())
-            dest.writeBoolean(extractCombined)
-            dest.writeBoolean(maxAreaAsSingle)
-        }
-
-        override fun describeContents(): Int = 0
-
-        companion object {
-            @JvmField
-            val CREATOR = object : Parcelable.Creator<VisionAttribute> {
-                override fun createFromParcel(source: Parcel): VisionAttribute {
-                    val type = source.readInt()
-                    val privacy = source.readBoolean()
-                    source.readBundle(javaClass.classLoader)
-                    val combined = source.readBoolean()
-                    val maxArea = source.readBoolean()
-                    return VisionAttribute(type, privacy, combined, maxArea)
-                }
-
-                override fun newArray(size: Int) = arrayOfNulls<VisionAttribute>(size)
-            }
-        }
-    }
-
-    /**
-     * 只用于**读**服务端返回值。三个字段的顺序与 `SegmentResult.writeToParcel` 一致：
-     * `writeTypedList(mBitmaps)` → `writeList(mRects)` → `writeList(mContours)`。
-     */
-    private class SegmentResult(
-        val bitmaps: List<Bitmap>,
-    ) : Parcelable {
-
-        override fun writeToParcel(dest: Parcel, flags: Int) = Unit
-
-        override fun describeContents(): Int = 0
-
-        companion object {
-            @JvmField
-            val CREATOR = object : Parcelable.Creator<SegmentResult> {
-                override fun createFromParcel(source: Parcel): SegmentResult {
-                    val list = ArrayList<Bitmap>()
-                    @Suppress("DEPRECATION")
-                    source.readTypedList(list, Bitmap.CREATOR)
-                    val rects = ArrayList<Any?>()
-                    source.readList(rects, Bitmap::class.java.classLoader)
-                    val contours = ArrayList<Any?>()
-                    source.readList(contours, Bitmap::class.java.classLoader)
-                    return SegmentResult(list)
-                }
-
-                override fun newArray(size: Int) = arrayOfNulls<SegmentResult>(size)
-            }
-        }
-    }
-
     // ──────────────────────────────────────────────────────────── 工具
 
-    private fun fail(startAt: Long, msg: String, waitedMs: Long = 0): Result {
+    private fun fail(startAt: Long, msg: String, waitedMs: Long = 0, channel: String = ""): Result {
         Log.w(TAG, msg)
-        return Result(false, -1, null, null, System.currentTimeMillis() - startAt, msg, waitedMs)
+        return Result(false, -1, null, null, System.currentTimeMillis() - startAt, msg, waitedMs, channel)
     }
 
     private fun downscale(src: Bitmap, maxSide: Int): Bitmap {

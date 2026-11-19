@@ -20,7 +20,6 @@ import top.yukonga.miuix.kmp.basic.Checkbox
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 「功能提醒」弹窗 —— 切到**系统壁纸服务（免 Root）**模式时弹一次（2026-10-30）。
@@ -47,13 +46,15 @@ internal fun MountModeWarnDialog(
     onConfirm: () -> Unit,
     summary: String = DEFAULT_MOUNT_MODE_WARN,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "功能提醒",
         summary = summary,
         show = show,
         onDismissRequest = onDismissRequest,
     ) {
         val dismissState = LocalDismissState.current
+        // 整行点击的统一振动（2026-11-18）：Checkbox 自己由 miuix 内部振，文字区域补上。
+        val haptic = rememberClickHaptic()
         Column(modifier = Modifier.fillMaxWidth()) {
             Spacer(Modifier.height(8.dp))
             // 整行可点：点文字和点勾选框是一个意思（照 RestartDialog 的做法）。
@@ -61,7 +62,10 @@ internal fun MountModeWarnDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(12.dp))
-                    .clickable { onNoMoreWarnChange(!noMoreWarn) }
+                    .clickable {
+                        haptic()
+                        onNoMoreWarnChange(!noMoreWarn)
+                    }
                     .padding(horizontal = 12.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -73,6 +77,8 @@ internal fun MountModeWarnDialog(
                 Checkbox(
                     state = ToggleableState(noMoreWarn),
                     onClick = { onNoMoreWarnChange(!noMoreWarn) },
+                    // 玻璃弹窗专用配色（与 Normal 按钮同源），见 appCheckboxColors。
+                    colors = appCheckboxColors(),
                 )
             }
             Spacer(Modifier.height(16.dp))

@@ -61,7 +61,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import kotlin.math.roundToInt
 import top.yukonga.miuix.kmp.theme.LocalDismissState
-import top.yukonga.miuix.kmp.window.WindowDialog
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.Text
 import com.frederic22.hyperextreme.aicr.AicrVision
@@ -83,8 +82,8 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.basic.Close
 import top.yukonga.miuix.kmp.squircle.squircleClip
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowBottomSheet
-import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
+import top.yukonga.miuix.kmp.glass.GlassBottomSheet
+import top.yukonga.miuix.kmp.material.isRuntimeShaderSupported
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 
@@ -222,6 +221,19 @@ internal fun RasterGroupSheet(
     var runningTask by remember { mutableStateOf<DepthTask?>(null) }
     // 这次弹出的系统选择器是不是「新建时自动拉起」的 —— 取消时要连浮页一起收回。
     var autoPickArmed by remember { mutableStateOf(false) }
+    /**
+     * 本次打开是「新建」还是「编辑」，**打开时的快照**（2026-11-18）。
+     *
+     * ⚠️ 不能用实时的 `group == null` 判断：`finish()` 末尾会调 `onDismiss()`，
+     * 页面那边立刻把 `editing` 置 null ⇒ 若 `finish` 被第二次调用（遮罩 tap 与下滑拖拽
+     * 两套手势都可能触发 `onDismissRequest`），`group` 已经是 null，就会误判成「新建取消」
+     * 走 `deleteGroup`，把**正在编辑的整组**删掉。
+     *
+     * 这与 [AliveGroupSheet] 的 `isNew` 参数同一个思路（那边由页面传入）。
+     */
+    var isNewGroup by remember { mutableStateOf(false) }
+    /** `finish()` 的幂等守卫：同一次打开里只允许收尾一次（原因见 [isNewGroup]）。 */
+    var finished by remember { mutableStateOf(false) }
     // 每次打开都重建一次工作副本：内容随 Dialog 关闭而销毁，不重建会拿到上上次的列表。
     LaunchedEffect(show, group?.id) {
         if (!show) return@LaunchedEffect
@@ -234,6 +246,8 @@ internal fun RasterGroupSheet(
         addedEver.clear()
         selectedName = null
         cacheVersion++
+        isNewGroup = group == null
+        finished = false
     }
 
     fun persist() {
@@ -253,10 +267,14 @@ internal fun RasterGroupSheet(
      * 真正的落盘与物理删除全部推迟到这一函数。
      */
     fun finish(save: Boolean = true) {
+        // 幂等：遮罩 tap 和下滑拖拽都可能在一次关闭里触发 onDismissRequest（见 isNewGroup 的说明）。
+        if (finished) return
+        finished = true
         val g = working
         if (g != null) {
             when {
-                !save && group == null -> RasterStore.deleteGroup(g)
+                // ⚠️ 用**打开时的快照**，不是实时 `group` —— 第一次收尾后页面已把 editing 置 null。
+                !save && isNewGroup -> RasterStore.deleteGroup(g)
                 // 取消：本次导入的一个都不留。用 [addedEver] 而不是 `names - original` ——
                 // 后者漏掉了"导入后又移除"的那些（它们既不在 names 也不在 original）。
                 !save -> addedEver.forEach { RasterStore.deleteItem(g, it) }
@@ -265,7 +283,8 @@ internal fun RasterGroupSheet(
                     persist()
                     // 新建的组排到第一个（2026-11-05）：顺序持久化在 `rasterGroupOrder` 里，
                     // 页面 onDismiss 的 reload 会按它重排。编辑已有组不动顺序。
-                    if (group == null) {
+                    // 用快照 isNewGroup（同 finish 开头的说明）。
+                    if (isNewGroup) {
                         val p = MaskPrefs(ctx)
                         p.setRasterGroupOrder(listOf(g.id) + p.rasterGroupOrder.filterNot { it == g.id })
                     }
@@ -526,10 +545,15 @@ internal fun RasterGroupSheet(
         )
     }
 
-    WindowBottomSheet(
-        show = show,
-        title = if (group == null) "新建光栅壁纸组合" else "编辑光栅壁纸组合",
+    // 玻璃浮页（miuix 0.9.5）：窗口级 WindowBottomSheet → 同层级 GlassBottomSheet。
+    // ⚠️ 它是 overlay（`renderInRootScaffold = true`），靠 Scaffold 的 popupHost 渲染，
+    // 所以调用点必须在 Scaffold 子树内（本函数由 RasterWallpaperPage 在页面 content 里调）。
+    // 采样层用 [LocalPageBackdrop]：popupHost 不在 `layerBackdrop` 子树里，浮页不会被录进去。
+    GlassBottomSheet(
         onDismissRequest = { finish(save = false) },
+        show = show,
+        backdrop = LocalPageBackdrop.current,
+        title = if (group == null) "新建光栅壁纸组合" else "编辑光栅壁纸组合",
         startAction = {
             IconButton(onClick = { haptic(); finish(save = false) }) {
                 SheetActionIcon(SheetIconKind.Close, "关闭")
@@ -572,7 +596,7 @@ internal fun RasterGroupSheet(
     }
     val radius: Dp = slotW * CARD_RADIUS_RATIO
     // 卡片底色（暗色下比浮页底亮一档，见 rememberCardSurface 的注释）。
-    val surfaceColor = rememberCardSurface()
+    val surfaceColor = rememberGlassCardSurface()
 
     Column(
         modifier = Modifier
@@ -807,7 +831,7 @@ internal fun RasterGroupSheet(
                 .fillMaxWidth()
                 .padding(top = 12.dp)
                 .squircleClip(16.dp)
-                .background(MiuixTheme.colorScheme.secondaryVariant)
+                .background(rememberGlassCardSurface())
                 .clickable(enabled = mirrorEnabled) {
                     haptic()
                     val g = working ?: return@clickable
@@ -941,7 +965,7 @@ internal fun RasterGroupSheet(
         // 「尺寸与壁纸不一致」（照搬 `MaskDetailActivity` 那条，用户 2026-11-04 要求）。
         // 正文按探测结果区分「遮罩 / 主体」；「确定」= 继续（遮罩天然缩放到原图、主体显式缩放）。
         val pm = pendingMask
-        WindowDialog(
+        AppGlassDialog(
             title = "尺寸与壁纸不一致",
             summary = if (pm == null) "" else {
                 val what = if (pm.probe.kind == RasterStore.SubjectKind.MASK) "遮罩" else "主体"
@@ -1007,7 +1031,12 @@ private fun DepthButton(
         onClick = onClick,
         modifier = modifier,
         enabled = enabled,
-        colors = ButtonDefaults.buttonColors(contentColor = tint),
+        // 玻璃浮页：容器色换成与卡片 / 对话框按钮同源的 tonal（onBackground 6%/14%），
+        // 内容色保留调用方给的 tint（primary / error）—— 彩色字在淡底上反而更清楚。
+        colors = ButtonDefaults.buttonColors(
+            color = rememberGlassCardSurface(),
+            contentColor = tint,
+        ),
     ) {
         Text(
             text = if (running) "处理中…" else text,
@@ -1048,6 +1077,8 @@ private fun SlotCard(
             radius = radius,
             modifier = modifier,
             surface = surface,
+            // 只有浮页里的新建卡需要描边（底色是 tonal，没有边就分不出边界）。
+            stroke = NEW_CARD_STROKE,
             onClick = onClick,
         )
         return

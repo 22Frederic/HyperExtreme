@@ -17,6 +17,9 @@ val keystoreProps = rootProject.file("keystore.properties").takeIf { it.exists()
 android {
     namespace = "com.frederic22.hyperextreme"
     compileSdk = 37
+    // miuix 0.9.5 的 AAR 元数据要求 minCompileSdk=37 / minCompileMinorSdk=2
+    //（`aar-metadata.properties` 里写死的，编译期检查、不影响运行行为）。
+    compileSdkMinor = 2
     buildToolsVersion = "37.0.0"
     ndkVersion = "28.2.13676358"
 
@@ -33,8 +36,8 @@ android {
         applicationId = "com.frederic22.hyperextreme"
         minSdk = 33
         targetSdk = 37
-        versionCode = 1050000
-        versionName = "1.0 Beta5"
+        versionCode = 1060000
+        versionName = "1.0 Beta6"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -119,12 +122,13 @@ dependencies {
     implementation(libs.miuix.core)
     implementation(libs.miuix.ui)
     implementation(libs.miuix.icons)
-    // 底栏玻璃：改用 miuix 官方的 miuix-blur（AGSL 手写可分离高斯 + 自适应降采样），
-    // 不再用 kyant backdrop 的 RenderEffect.createBlurEffect 那条链。
+    // 玻璃底：miuix 官方的 miuix-blur（AGSL 手写可分离高斯 + 自适应降采样）。
     implementation(libs.miuix.blur)
-    // 悬浮底栏（从 HyperChanger 移植：Apache-2.0）用到的液态玻璃与形状库
-    implementation(libs.kyant.backdrop)
-    implementation(libs.kyant.shapes)
+    // 0.9.5 新增模块：下拉 / 弹窗 / 顶栏的 OS4 玻璃组件，以及它们依赖的材质与描边。
+    // 三件同版本、由 miuix-glass 以 api 传递；这里显式声明是为了让 EdgeStroke 等
+    // 直接 import 有稳定可见性。
+    implementation(libs.miuix.glass)
+    implementation(libs.miuix.material)
     // 空间壁纸的深度推理（Depth Anything V2 ViT-S int8）。
     // **完整版**：mobile（minimal build）缺 ConvInteger 等算子，实测跑不动这个模型，
     // 2026-10-22 用户决定退回完整版（so 17.8MB），模型直接用 `.onnx`。

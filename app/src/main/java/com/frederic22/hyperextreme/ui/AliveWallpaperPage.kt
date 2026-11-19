@@ -59,7 +59,6 @@ import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 二级页「Alive壁纸」（2026-11-07）。
@@ -485,7 +484,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
     }
 
     // 删除确认（常驻组合树、用 show 控制 —— 条件包裹会让 miuix 的退出动画播不出来）
-    WindowDialog(
+    AppGlassDialog(
         title = "删除此组合？",
         summary = "组合内的图片缓存将被删除",
         show = pendingDelete != null,
@@ -518,7 +517,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         }
     }
 
-    WindowDialog(
+    AppGlassDialog(
         title = "请确认",
         summary = if (activeId.isNotEmpty()) {
             "所有Alive壁纸组合内的图片缓存将被清除。当前 Alive壁纸正在运行，点击“清除”后将自动关闭替换。"

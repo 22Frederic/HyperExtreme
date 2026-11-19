@@ -72,6 +72,9 @@ internal object SpatialForegroundHider {
     /** `Coexist` 订阅只装一次。 */
     private var coexistHookInstalled = false
 
+    /** 内容闸门订阅只装一次（2026-11-19）。 */
+    private var contentGateInstalled = false
+
     // ── 开关读取（300ms 缓存：方法调用频繁，属性反射不宜每次付） ──
     @Volatile private var cacheAt = 0L
     @Volatile private var cacheValue = false
@@ -158,6 +161,19 @@ internal object SpatialForegroundHider {
         }
         if (ok) {
             log("已挂上（锁屏/全局档时接管 keyguard_foreground_layer）")
+            // 内容闸门（2026-11-19）：解锁后通知中心的"包含下方"捕获不尊重可见性 ⇒
+            // 状态一变就让三个主体 View 重绘一帧，`onDraw` 里的 [KeyguardContentGate.allowDraw]
+            // 会把这一帧画成空（RenderNode 里没有可被取走的内容）。
+            // 闸门本身通常在 HookEntry 里更早装好，这里再兜一次（幂等）。
+            KeyguardContentGate.install(module, loader)
+            if (!contentGateInstalled) {
+                contentGateInstalled = true
+                KeyguardContentGate.addListener { _, _ ->
+                    SpatialOverlay.onContentGateChanged()
+                    RasterOverlay.onContentGateChanged()
+                    AliveOverlay.onContentGateChanged()
+                }
+            }
             // MC 共存：音乐屏状态一变就重算一次（不能等下一次 hook 触发）
             if (!coexistHookInstalled) {
                 coexistHookInstalled = true

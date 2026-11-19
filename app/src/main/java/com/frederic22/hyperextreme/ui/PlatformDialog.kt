@@ -17,7 +17,6 @@ import androidx.compose.ui.unit.dp
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 开发者主页（酷安）—— 原 `MaskTabs` 里的 `DeveloperProfileUrl`，2026-10-31 随弹窗一起搬来时改名。
@@ -62,7 +61,7 @@ internal fun PlatformDialog(
     title: String = "选择平台",
     entries: List<Pair<String, String>> = PlatformEntries,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = title,
         show = show,
         onDismissRequest = onDismissRequest,

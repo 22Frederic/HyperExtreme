@@ -81,21 +81,14 @@ import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
-import top.yukonga.miuix.kmp.basic.DropdownArrowEndAction
-import top.yukonga.miuix.kmp.basic.DropdownDefaults
-import top.yukonga.miuix.kmp.basic.DropdownImpl
-import top.yukonga.miuix.kmp.basic.DropdownEntry
-import top.yukonga.miuix.kmp.basic.DropdownItem
-import top.yukonga.miuix.kmp.basic.ListPopupColumn
-import top.yukonga.miuix.kmp.basic.PopupPositionProvider
 import top.yukonga.miuix.kmp.basic.Slider
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
+import top.yukonga.miuix.kmp.glass.GlassDropdownPreference
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ChevronForward
-import top.yukonga.miuix.kmp.overlay.OverlayListPopup
 import top.yukonga.miuix.kmp.squircle.squircleClip
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import java.io.File
@@ -1276,29 +1269,22 @@ private data class OpenSourceEntry(
  * 用到的开源项目。**这里是唯一权威清单** —— 改它不需要同步别处（`agent.md` 没有副本）。
  *
  * 两大类：
- * - **依赖与权重**：miuix / Kyant 两个库 / libxposed API / AndroidX / Compose Multiplatform /
+ * - **依赖与权重**：miuix / libxposed API / AndroidX / Compose Multiplatform /
  *   ONNX Runtime（深度推理的执行引擎）/ Depth Anything V2 **Small**（`assets/models/dav2_small_int8.onnx`）；
- * - **移植进工程的代码**：HyperChanger 的悬浮底栏（`ui/nav/`）、PatchMatch 的 C 移植
- *   （`cpp/patchmatch/`，编成 `libspatial_fill.so`）、Material Icons 的两个图标（`ui/icons/`）。
+ * - **移植进工程的代码**：HyperChanger 的 AOD / 景深 hook（`hook/HookEntry.kt` 等）、
+ *   PatchMatch 的 C 移植（`cpp/patchmatch/`，编成 `libspatial_fill.so`）、
+ *   Material Icons 的两个图标（`ui/icons/`）。
  *
  * ⚠️ **带版本号的那两条不是随手写的**：
- * - `HyperChanger v1.1.3` 是我们实际引用的 tag（commit `a01dc46`，2026-09-18），该版本是 Apache-2.0；
- *   上游后来把协议换成了 **AGPL-3.0-or-later**。Apache-2.0 授权不可撤销，我们那份永久有效，
- *   但版本号必须留着 —— 它划清"我们用的是换协议之前的那一版"。
+ * - `HyperChanger v1.1.3` 是 hook 里 AOD / 景深那几段参照的实现版本（commit `a01dc46`，2026-09-18），
+ *   该版本是 Apache-2.0；上游后来把协议换成了 **AGPL-3.0-or-later**。Apache-2.0 授权不可撤销，
+ *   我们那份永久有效，但版本号必须留着 —— 它划清"我们用的是换协议之前的那一版"。
  * - `Depth Anything V2 Small` 同理：只有 Small/Base/Large 权重是 Apache-2.0，**Giant 是 CC-BY-NC-4.0**。
  */
 private val OpenSourceLicenses = listOf(
     OpenSourceEntry(
         "miuix", "compose-miuix-ui（YuKongA）", "Apache-2.0",
         "https://github.com/compose-miuix-ui/miuix",
-    ),
-    OpenSourceEntry(
-        "Backdrop", "Kyant（Kyant0）", "Apache-2.0",
-        "https://github.com/Kyant0/AndroidLiquidGlass",
-    ),
-    OpenSourceEntry(
-        "Shapes", "Kyant（Kyant0）", "Apache-2.0",
-        "https://github.com/Kyant0/Shapes",
     ),
     // 官方仓库（不是 LSPosed 主仓库）：libxposed API 单独发布在 libxposed/api，
     // 我们 `compileOnly` 的 `libs/libxposed-api-102.jar` 就出自 `io.github.libxposed:api:102.0.0`。
@@ -1326,10 +1312,11 @@ private val OpenSourceLicenses = listOf(
         "ONNX Runtime", "Microsoft", "MIT",
         "https://github.com/microsoft/onnxruntime",
     ),
-    // ⚠️ **版本号必须留**（2026-11-02 查证）：我们引用的是 **v1.1.3**（commit `a01dc46`，2026-09-18），
-    //    该 tag 是 Apache-2.0；上游后来换成 **AGPL-3.0-or-later**。
+    // ⚠️ **版本号必须留**（2026-11-02 查证）：hook 里 AOD / 景深那几段参照的是 **v1.1.3**
+    //    （commit `a01dc46`，2026-09-18），该 tag 是 Apache-2.0；上游后来换成 **AGPL-3.0-or-later**。
     //    Apache-2.0 不可撤销 ⇒ 我们的副本永久有效，但标出版本才能划清边界。
-    //    引用点：`ui/nav/Os4FloatingNavigationBar.kt`（文件头有 SPDX + 原版权）。
+    //    引用点：`hook/HookEntry.kt`（AOD / 景深那几处的注释写明了对应实现）。
+    //    （悬浮底栏那部分 2026-11-19 已整体退役，换成 miuix 官方的 GlassNavigationBar。）
     OpenSourceEntry(
         "HyperChanger v1.1.3", "btm_m（ColdP）", "Apache-2.0",
         "https://github.com/ColdP/HyperChanger",
@@ -1501,29 +1488,29 @@ internal fun SwitchRow(
 }
 
 /**
- * 一个**下拉选择**选项：整行可点，右侧显示「当前值 + 上下箭头」，点开弹出官方那套展开栏。
+ * 一个**下拉选择**选项：整行可点，右侧显示「当前值 + 上下箭头」，点开弹出**玻璃**下拉面板。
  *
- * 2026-09-29 加（用户给了 MIUI 设置页「设置图标」那张截图，要求把设置页原来的三个主题按钮
- * 合成这样一个下拉）。
+ * 2026-09-29 加；**2026-11-18 换成 miuix 0.9.5 的 [GlassDropdownPreference]**（`miuix-glass`）。
  *
- * ## ⚠️ 骨架必须照官方源码，不能自己想 —— 首版显示错误，就是想当然写的
+ * ## 为什么不再手拼
  *
- * 官方出处：`compose-miuix-ui/miuix` 仓库（`miuix-preference/…/OverlayDropdownPreference.kt`、
- * `…/popup/OverlayDropdownPopup.kt`、`…/popup/DropdownEntriesContent.kt`）。三个要点：
+ * 旧实现是拿 `miuix-ui` 的积木（`BasicComponent` + `OverlayListPopup` + `ListPopupColumn` +
+ * `DropdownImpl`）照官方源码接线 —— 因为当时成品 `OverlayDropdownPreference` 在
+ * `miuix-preference` 模块里，本工程没引。0.9.5 把玻璃下拉做进了 `miuix-glass`：
+ * 锚定在行上的玻璃面板 + 展开动画（圆角 4dp → 24dp）+ 选中打勾，一个调用全有，
+ * 13 个调用点的参数一个字不用改。
  *
- * 1. **弹出层要写在 `endActions` 里**（官方就是这么做的 —— 它是 `RowScope` 里的一个可组合项），
- *    这样它才**锚在这一行**上。放到 `BasicComponent` 外面当兄弟就是错的（没有锚点）。
- * 2. **内容必须包一层 `ListPopupColumn`** —— 列表的宽度（200~288dp）与滚动都由它管。
- *    少了这一层正是"展开栏显示错误"的直接原因（首版就是漏了它）。
- * 3. `alignment = PopupPositionProvider.Align.End`（对齐行尾）；点击走 `DropdownItem` 自带的
- *    `onClick`，选中态看 `item.selected` —— 不是自己把 `isSelected` 算出来传进去。
+ * ## 仍需 Scaffold（官方硬约束，别删二级页那个）
  *
- * > ⚠️ **miuix 的成品下拉不在 `miuix-ui` 里**：`OverlayDropdownPreference` / `ArrowPreference`
- * > 那些在**另一个模块 `miuix-preference`**，本工程没引（也不打算引：本地缓存只有 `0.9.4-rc01`，
- * > 与其余 miuix 模块的 `0.9.4` 不是同一版本，混用有风险）。所以这里用 `miuix-ui` 里
- * > 官方提供的**积木**、照上面那份源码接线 —— 观感、动画、配色仍然是官方那套。
- * > 部件全是官方的：`BasicComponent` / `OverlayListPopup` / `ListPopupColumn` / `DropdownImpl` /
- * > `DropdownItem` / `DropdownEntry` / `DropdownArrowEndAction` / `DropdownDefaults`。
+ * `GlassDropdownPreference` 内部走 `renderInRootScaffold = true`，面板由 `Scaffold` 的
+ * `MiuixPopupHost` 渲染 —— 与旧实现同一个前提。**`DetailTabHost` 里那个自建 `Scaffold`
+ * 不能省**，否则下拉「点了没反应」（2026-10-11 踩过一次）。
+ *
+ * ## 玻璃背景
+ *
+ * `backdrop` 取 [LocalPageBackdrop]：一级页 = 整页录制层，二级页 = 顶栏那份。
+ * 拿不到（裸 Activity / 首帧）时为 null，组件自动退回不透明底 —— 官方设计如此，不会崩。
+ * ⚠️ 采样范围只含页面内容与底色，不含弹层自身（弹层在 `popupHost`，天然不在录制层里）。
  */
 @Composable
 internal fun DropdownRow(
@@ -1535,91 +1522,13 @@ internal fun DropdownRow(
     /** false = 整行变灰、不可点（2026-10-30：空间壁纸「挂载模式」在运行中锁死用）。 */
     enabled: Boolean = true,
 ) {
-    val haptic = rememberClickHaptic()
-    val hapticFeedback = LocalHapticFeedback.current
-    val interactionSource = remember { MutableInteractionSource() }
-    val expanded = remember { mutableStateOf(false) }
-    val holdDown = remember { mutableStateOf(false) }
-    val actionColor = MiuixTheme.colorScheme.onSurfaceVariantActions
-    val dropdownColors = DropdownDefaults.dropdownColors()
-    // **照官方**：一组 `DropdownEntry`，每个 `DropdownItem` 自带 `selected` 与 `onClick`。
-    val entries = remember(options, selectedIndex, onSelect) {
-        listOf(
-            DropdownEntry(
-                items = options.mapIndexed { index, text ->
-                    DropdownItem(
-                        text = text,
-                        selected = index == selectedIndex,
-                        onClick = { onSelect(index) },
-                    )
-                },
-            ),
-        )
-    }
-
-    BasicComponent(
+    GlassDropdownPreference(
         title = title,
+        items = options,
+        selectedIndex = selectedIndex,
+        onSelectedIndexChange = onSelect,
         summary = summary,
-        interactionSource = interactionSource,
         enabled = enabled,
-        endActions = {
-            // 当前值：官方用 `body2` 字号 + `onSurfaceVariantActions`，右对齐。
-            Text(
-                text = options.getOrElse(selectedIndex) { "" },
-                modifier = Modifier
-                    .padding(end = 8.dp)
-                    .align(Alignment.CenterVertically)
-                    .weight(1f, fill = false),
-                fontSize = MiuixTheme.textStyles.body2.fontSize,
-                color = actionColor,
-                textAlign = TextAlign.End,
-            )
-            DropdownArrowEndAction(actionColor = actionColor)
-            // 弹出层**就在 endActions 里**（要点 1）。
-            OverlayListPopup(
-                show = expanded.value,
-                alignment = PopupPositionProvider.Align.End,
-                onDismissRequest = { expanded.value = false },
-                onDismissFinished = { holdDown.value = false },
-            ) {
-                // 要点 2：`ListPopupColumn` 管宽度与滚动，漏了就显示错。
-                ListPopupColumn {
-                    entries.forEach { entry ->
-                        val last = entry.items.lastIndex
-                        entry.items.forEachIndexed { index, item ->
-                            DropdownImpl(
-                                item = item,
-                                optionSize = entry.items.size,
-                                isSelected = item.selected,
-                                index = index,
-                                dropdownColors = dropdownColors,
-                                enabled = entry.enabled && item.enabled,
-                                isFirst = index == 0,
-                                isLast = index == last,
-                                onSelectedIndexChange = { picked ->
-                                    hapticFeedback.performHapticFeedback(HapticFeedbackType.Confirm)
-                                    entry.items.getOrNull(picked)?.onClick?.invoke()
-                                    expanded.value = false
-                                },
-                            )
-                        }
-                    }
-                }
-            }
-        },
-        onClick = {
-            // 禁用态整行不可点（`BasicComponent` 自己也会拦，这里双保险）
-            if (enabled) {
-                // 官方：展开时振一下、并把整行置成"按住"态（`holdDownState`）。
-                val next = !expanded.value
-                expanded.value = next
-                if (next) {
-                    holdDown.value = true
-                    haptic()
-                }
-            }
-        },
-        role = Role.DropdownList,
-        holdDownState = holdDown.value,
+        backdrop = LocalPageBackdrop.current,
     )
 }

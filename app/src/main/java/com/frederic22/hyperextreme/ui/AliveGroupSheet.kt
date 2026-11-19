@@ -70,10 +70,9 @@ import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.theme.LocalDismissState
-import top.yukonga.miuix.kmp.window.WindowDialog
 import top.yukonga.miuix.kmp.squircle.squircleClip
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowBottomSheet
+import top.yukonga.miuix.kmp.glass.GlassBottomSheet
 
 /** 槽位尺寸 = 卡片流中间态卡片的 80%（与光栅浮页 `SLOT_SCALE` 同一个值）。 */
 private const val ALIVE_SLOT_SCALE = 0.8f
@@ -144,6 +143,14 @@ internal fun AliveGroupSheet(
     var maskBusy by remember { mutableStateOf(false) }
     /** 等用户确认「尺寸与壁纸不一致」的那次导入（照光栅同一套流程）。 */
     var pendingMask by remember { mutableStateOf<Triple<AliveItem, Uri, RasterStore.SubjectProbe>?>(null) }
+    /**
+     * `close()` 的幂等守卫（2026-11-18）。
+     *
+     * 遮罩 tap 和下滑拖拽两套手势都可能在一次关闭里触发 `onDismissRequest`（光栅那边
+     * 因此误删过整组）。这边虽然用 `isNew` 参数（快照）判断、二次调用只会重复 `rollback`，
+     * 仍然加一层守卫，避免草稿被回滚两次。
+     */
+    var closed by remember { mutableStateOf(false) }
 
     LaunchedEffect(show, group?.id) {
         if (!show) return@LaunchedEffect
@@ -152,6 +159,7 @@ internal fun AliveGroupSheet(
         draft = AliveStore.Draft(g)
         working = g
         runningTask = null
+        closed = false
     }
 
     // 三个槽的封面：**按文件路径分槽判定**，只有真的换了图才重解码。
@@ -391,6 +399,8 @@ internal fun AliveGroupSheet(
      * 应该像光栅一样更改要点击右上角确认才生效」。
      */
     fun close() {
+        if (closed) return
+        closed = true
         val d = draft
         val g = working
         if (isNew) {
@@ -444,10 +454,14 @@ internal fun AliveGroupSheet(
         onDismiss()
     }
 
-    WindowBottomSheet(
-        show = show,
-        title = if (isNew) "新建Alive壁纸组合" else "编辑Alive壁纸组合",
+    // 玻璃浮页（miuix 0.9.5）：窗口级 WindowBottomSheet → 同层级 GlassBottomSheet。
+    // ⚠️ 它是 overlay（`renderInRootScaffold = true`），必须活在 Scaffold 子树内
+    //（本函数由 AliveWallpaperPage 在页面 content 里调）；采样层见 [LocalPageBackdrop]。
+    GlassBottomSheet(
         onDismissRequest = { close() },
+        show = show,
+        backdrop = LocalPageBackdrop.current,
+        title = if (isNew) "新建Alive壁纸组合" else "编辑Alive壁纸组合",
         startAction = {
             IconButton(onClick = { haptic(); close() }) {
                 AliveSheetIcon(AliveIconKind.Close, "关闭")
@@ -564,7 +578,7 @@ internal fun AliveGroupSheet(
 
             // 「尺寸与壁纸不一致」（照光栅同一条文案与交互）
             val pm = pendingMask
-            WindowDialog(
+            AppGlassDialog(
                 title = "尺寸与壁纸不一致",
                 summary = if (pm == null) "" else {
                     val what = if (pm.third.kind == RasterStore.SubjectKind.MASK) "遮罩" else "主体"
@@ -586,6 +600,11 @@ internal fun AliveGroupSheet(
                             pendingMask = null
                             dismissState?.invoke()
                         },
+                        // 玻璃弹窗：与 TextButtonLike 同源的 tonal 配色。
+                        colors = ButtonDefaults.textButtonColors(
+                            color = rememberGlassCardSurface(),
+                            textColor = MiuixTheme.colorScheme.onBackground,
+                        ),
                     )
                     TextButton(
                         text = "确定",
@@ -595,6 +614,10 @@ internal fun AliveGroupSheet(
                             dismissState?.invoke()
                             if (p != null) applyDepth(p.second, p.third.kind)
                         },
+                        colors = ButtonDefaults.textButtonColors(
+                            color = rememberGlassCardSurface(),
+                            textColor = MiuixTheme.colorScheme.onBackground,
+                        ),
                     )
                 }
             }
@@ -615,7 +638,7 @@ internal fun AliveGroupSheet(
                     // 不加 horizontal 内边距：要和上面卡片流的第一张卡左对齐
                     .padding(top = 12.dp)
                     .squircleClip(ALIVE_CARD_RADIUS)
-                    .background(MiuixTheme.colorScheme.secondaryVariant),
+                    .background(rememberGlassCardSurface()),
             ) {
                 // ① 息屏样式：下拉，无 summary
                 AliveStyleRow(
@@ -828,7 +851,7 @@ private fun AliveStyleRow(
         )
     }
 
-    WindowDialog(
+    AppGlassDialog(
         title = title,
         show = pickerOpen,
         onDismissRequest = { pickerOpen = false },
@@ -968,7 +991,9 @@ private fun AliveSlot(
                             cardH = height,
                             radius = ALIVE_CARD_RADIUS,
                             modifier = Modifier,
-                            surface = rememberCardSurface(),
+                            surface = rememberGlassCardSurface(),
+                            // 玻璃浮页里的新建卡才加边（见 NEW_CARD_STROKE 的说明）。
+                            stroke = NEW_CARD_STROKE,
                             enabled = enabled,
                             // 不可点（AOD 跟随锁屏 / 桌面跟着锁屏）时把加号淡出
                             hideAddWhenDisabled = true,
@@ -1047,7 +1072,11 @@ private fun AliveDepthButton(
         onClick = onClick,
         modifier = modifier,
         enabled = enabled,
-        colors = ButtonDefaults.buttonColors(contentColor = tint),
+        // 玻璃浮页：容器色换成 tonal（onBackground 6%/14%），内容色保留 tint。
+        colors = ButtonDefaults.buttonColors(
+            color = rememberGlassCardSurface(),
+            contentColor = tint,
+        ),
     ) {
         Text(
             text = if (running) "处理中…" else text,

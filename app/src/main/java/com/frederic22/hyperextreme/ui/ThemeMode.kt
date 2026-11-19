@@ -2,8 +2,10 @@ package com.frederic22.hyperextreme.ui
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.ui.graphics.Color
 import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 import top.yukonga.miuix.kmp.theme.ThemeController
+import top.yukonga.miuix.kmp.theme.lightColorScheme
 import top.yukonga.miuix.kmp.theme.platformDynamicColors
 
 /** 界面配色模式。深浅色切换；是否额外用系统的 Monet 动态色由「启用Monet颜色」开关决定。 */
@@ -48,7 +50,15 @@ fun rememberThemeController(mode: ThemeMode, monet: Boolean): ThemeController {
                 darkColors = dark,
             )
         } else {
-            ThemeController(colorSchemeMode = mode.toColorSchemeMode())
+            ThemeController(
+                colorSchemeMode = mode.toColorSchemeMode(),
+                // 浅色底对齐小米官方 #F3F3F3（2026-11-18 用户定）。
+                // miuix 的 `lightColorScheme()` 默认 surface 是 #F7F7F7，比其他 token 亮一档；
+                // 只覆写 surface —— background 是纯白（弹窗/浮页的 fallback 用它），不动。
+                // `colors.xml` 的 `launch_bg` 必须同步成同一个值，否则启动遮罩会闪一下。
+                // 深色走默认 `darkColorScheme()`（surface = 纯黑），与官方一致，不改。
+                lightColors = lightColorScheme(surface = Color(0xFFF3F3F3)),
+            )
         }
     }
 }

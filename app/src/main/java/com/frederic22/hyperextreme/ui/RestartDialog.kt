@@ -25,7 +25,6 @@ import top.yukonga.miuix.kmp.basic.Checkbox
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 「选择要重启的应用」多选框 —— 顶栏右上角那个重启按钮弹的就是它。
@@ -42,12 +41,15 @@ internal fun RestartDialog(
     onDismissRequest: () -> Unit,
     onConfirm: (List<String>) -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "选择要重启的应用",
         show = show,
         onDismissRequest = onDismissRequest,
     ) {
         val dismissState = LocalDismissState.current
+        // 整行点击的统一振动（2026-11-18）：原来只有 Checkbox 自己有（miuix 内部），
+        // 点文字区域没有反馈。加在这一层，两边都不重复（子组件消费事件、不冒泡到 Row）。
+        val haptic = rememberClickHaptic()
         // 默认一个都不选（用户指定）—— 勾了哪个就重启哪个。
         var selected by remember { mutableStateOf(emptySet<String>()) }
         Column(modifier = Modifier.fillMaxWidth()) {
@@ -65,7 +67,10 @@ internal fun RestartDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
-                        .clickable(onClick = toggle)
+                        .clickable {
+                            haptic()
+                            toggle()
+                        }
                         .padding(horizontal = 12.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -76,7 +81,12 @@ internal fun RestartDialog(
                         style = MiuixTheme.textStyles.main,
                         modifier = Modifier.weight(1f),
                     )
-                    Checkbox(state = ToggleableState(checked), onClick = toggle)
+                    Checkbox(
+                        state = ToggleableState(checked),
+                        onClick = toggle,
+                        // 玻璃弹窗专用配色（与 Normal 按钮同源），见 appCheckboxColors。
+                        colors = appCheckboxColors(),
+                    )
                 }
             }
             Spacer(Modifier.height(16.dp))

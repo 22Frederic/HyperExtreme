@@ -412,66 +412,46 @@ internal object ParallaxBg {
     /** 传感器采样周期：60Hz（与 60Hz 渲染刷新对齐）。 */
     private const val SENSOR_PERIOD_US = 16_667
 
-    /** 状态机实现类（真机 `analyse/re-glass` 核实：`setState(int, boolean)`，int：0=SHADE / 1=KEYGUARD / 2=SHADE_LOCKED）。 */
-    private const val CLS_STATE_IMPL = "com.android.systemui.statusbar.StatusBarStateControllerImpl"
-
     private const val STATE_SHADE = 0
     private const val STATE_KEYGUARD = 1
     private const val STATE_SHADE_LOCKED = 2
 
     /**
-     * 状态机 hook（v10）—— 记录"真·桌面 / 锁屏"状态，供内容抑制使用（见 [reconcileContentVisibility]）。
+     * 状态机（v10）—— 记录"真·桌面 / 锁屏"状态，供内容抑制使用（见 [reconcileContentVisibility]）。
      *
      * 为什么还要它（可见性之外的第二道闸）：解锁后下拉通知中心时，我们的层可能被系统**瞬显**
      * （可见性回调瞬时翻 true，"恢复绘制"会误触发）——只靠可见性判断有漏洞；而状态机在桌面稳定为
      * SHADE(=0)，下拉不改变它，是"内容该不该存在"的权威信号。
      * 内容仅在 KEYGUARD(1) / SHADE_LOCKED(2)（锁屏在场）时允许绘制；初值未知时退回可见性判断。
+     *
+     * **2026-11-19 起改走共享闸门 [KeyguardContentGate]**：三条景深主体链
+     * （`SpatialOverlay` / `RasterOverlay` / `AliveOverlay`）也要用同一份状态，
+     * 而同一方法被同一模块 hook 两次会互相覆盖 ⇒ 由 gate 统一装 hook，这里只挂监听器。
+     * 本类的抑制时序（防抖 / 解锁退场渐隐）**一字未改**，只是信号来源换了个入口。
      */
-    private fun installStateHook(module: XposedModule, loader: ClassLoader): Boolean = runCatching {
-        val clazz = Class.forName(CLS_STATE_IMPL, false, loader)
-        val method = clazz.declaredMethods.firstOrNull {
-            it.name == "setState" && it.parameterTypes.size == 2 &&
-                it.parameterTypes[0] == Int::class.javaPrimitiveType
-        } ?: error("未找到 setState(int, boolean)")
-        module.hook(method).intercept(object : XposedInterface.Hooker {
-            override fun intercept(chain: XposedInterface.Chain): Any? {
-                val result = chain.proceed()
-                runCatching {
-                    // 扫第一个 Int 参数（防个别框架把接收者混进 args）。
-                    val state = chain.getArgs().firstOrNull { it is Int } as? Int ?: return@runCatching
-                    if (state == lastStatusBarState) return@runCatching
-                    val prev = lastStatusBarState
-                    lastStatusBarState = state
-                    HookRuntime.log("视差壁纸效果：状态机 state=$state（${stateName(state)}）")
-                    // v22.1：解锁退场（1/2→0，"系统判定进入桌面"）→ 走 0.2s 线性渐隐（不再硬切清空）。
-                    val unlockExit = (prev == STATE_KEYGUARD || prev == STATE_SHADE_LOCKED) &&
-                        state == STATE_SHADE
-                    if (Looper.myLooper() == Looper.getMainLooper()) {
-                        if (unlockExit) {
-                            startUnlockFadeOut("状态机（$prev→0）")
-                        } else {
-                            reconcileContentVisibility("状态机")
-                            reconcileLayerGate("状态机")
-                        }
-                    } else {
-                        mainHandler.post {
-                            if (unlockExit) {
-                                runCatching { startUnlockFadeOut("状态机（$prev→0）") }
-                            } else {
-                                runCatching { reconcileContentVisibility("状态机") }
-                                runCatching { reconcileLayerGate("状态机") }
-                            }
-                        }
-                    }
-                }.onFailure { HookRuntime.log("视差壁纸效果：状态机处理异常：$it") }
-                return result
-            }
-        })
-        HookRuntime.log("视差壁纸效果：已挂状态机（setState）")
-        true
-    }.getOrElse {
-        HookRuntime.log("视差壁纸效果：挂状态机失败：$it")
-        false
+    private fun installStateHook(module: XposedModule, loader: ClassLoader): Boolean {
+        val gateOk = KeyguardContentGate.install(module, loader)
+        if (!gateOk) {
+            HookRuntime.log("视差壁纸效果：内容闸门没装上 —— 只剩可见性判断，抑制会退化")
+        }
+        KeyguardContentGate.addListener { prev, now -> onStatusBarState(prev, now) }
+        return gateOk
+    }
+
+    /** 状态变化的实际处理（原先写在 `setState` 的 hook 体内，逻辑不变；主线程，由 gate 保证）。 */
+    private fun onStatusBarState(prev: Int, now: Int) {
+        if (now == lastStatusBarState) return
+        lastStatusBarState = now
+        HookRuntime.log("视差壁纸效果：状态机 state=$now（${stateName(now)}）")
+        // v22.1：解锁退场（1/2→0，"系统判定进入桌面"）→ 走 0.2s 线性渐隐（不再硬切清空）。
+        val unlockExit = (prev == STATE_KEYGUARD || prev == STATE_SHADE_LOCKED) &&
+            now == STATE_SHADE
+        if (unlockExit) {
+            runCatching { startUnlockFadeOut("状态机（$prev→0）") }
+        } else {
+            runCatching { reconcileContentVisibility("状态机") }
+            runCatching { reconcileLayerGate("状态机") }
+        }
     }
 
     private fun stateName(state: Int): String = when (state) {

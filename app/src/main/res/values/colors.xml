@@ -7,6 +7,10 @@
       跟随**系统**日夜（values-night 里是纯黑）—— 用户 2026-10-29 定的方案，
       与 HyperCeiler 等模块的 DayNight 做法一致。App 内强制浅/深时冷启动仍有一帧
       系统色，这是 starting window 由 WMS 用包资源创建的固有代价，改不了。
+
+      ⚠️ 2026-11-18：浅色改成 #F3F3F3（对齐小米官方底），必须与
+      `rememberThemeController` 里 `lightColorScheme(surface = …)` 的值**逐字一致**，
+      否则启动遮罩(旧值) → 首帧(新值)之间会看到一次色跳。
     -->
-    <color name="launch_bg">#FFF7F7F7</color>
+    <color name="launch_bg">#FFF3F3F3</color>
 </resources>

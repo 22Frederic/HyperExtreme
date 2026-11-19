@@ -62,7 +62,6 @@ import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowDialog
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
@@ -1044,7 +1043,7 @@ private fun SpatialDeleteDialog(
     onDismissRequest: () -> Unit,
     onConfirm: () -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "删除此图片？",
         summary = "图片与深度缓存将被删除",
         show = show,
@@ -1096,7 +1095,7 @@ private fun ClearCacheDialog(
     onDismissRequest: () -> Unit,
     onConfirm: () -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "请确认",
         summary = summary,
         show = show,

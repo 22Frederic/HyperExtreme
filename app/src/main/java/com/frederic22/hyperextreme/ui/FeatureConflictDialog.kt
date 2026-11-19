@@ -11,7 +11,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import top.yukonga.miuix.kmp.theme.LocalDismissState
-import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 「功能冲突提醒」弹窗（2026-10-29）—— 空间壁纸 / 视差壁纸**互斥**用。
@@ -38,7 +37,7 @@ internal fun FeatureConflictDialog(
     onDismissRequest: () -> Unit,
     onConfirmClose: () -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "功能冲突提醒",
         summary = summary,
         show = show,

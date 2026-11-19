@@ -11,7 +11,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import top.yukonga.miuix.kmp.theme.LocalDismissState
-import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 「Alive壁纸应用提示」弹窗（2026-11-16）—— AOD 没开、用户点「应用」时弹。
@@ -34,7 +33,7 @@ internal fun AodRequiredDialog(
     onDismissRequest: () -> Unit,
     onJump: () -> Unit,
 ) {
-    WindowDialog(
+    AppGlassDialog(
         title = "Alive壁纸应用提示",
         summary = "AOD未开启，请先开启AOD再使用。你可以点击“跳转”快速到达系统息屏设置页。",
         show = show,

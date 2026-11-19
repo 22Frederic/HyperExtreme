@@ -387,6 +387,15 @@ half4 main(float2 fragCoord) {
     }
 
     /** 清场：移掉我们的 View + **把系统主体插回去**（幂等）。 */
+    /**
+     * 锁屏状态变了（2026-11-19）：重绘一帧，让 [SubjectView.onDraw] 的闸门真正生效
+     * （`onDraw` 只在需要重绘时才跑，不 invalidate 的话上一帧会留在 RenderNode 里被通知中心捕走）。
+     */
+    fun onContentGateChanged() {
+        val v = view ?: return
+        mainHandler.post { runCatching { v.invalidate() } }
+    }
+
     fun onDisabled() {
         if (view == null && installedKey.isEmpty() && systemSubject == null) return
         if (Looper.myLooper() == Looper.getMainLooper()) disabledOnMain()
@@ -840,6 +849,10 @@ half4 main(float2 fragCoord) {
         }
 
         override fun onDraw(canvas: Canvas) {
+            // 内容闸门（2026-11-19）：解锁后通知中心的"包含下方"捕获**不尊重可见性**，
+            // 主体留在 RenderNode 里就会被连同背景一起取走（观感 = 通知中心出现主体层）。
+            // 非锁屏态一律不画，让这一帧的 RenderNode 是空的。见 [KeyguardContentGate]。
+            if (!KeyguardContentGate.allowDraw(this)) return
             val w = width.toFloat()
             val h = height.toFloat()
             if (w <= 0f || h <= 0f) return

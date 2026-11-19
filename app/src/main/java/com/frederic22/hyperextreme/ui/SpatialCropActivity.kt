@@ -60,7 +60,7 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.SmallTopAppBar
 import top.yukonga.miuix.kmp.blur.BlendColorEntry
 import top.yukonga.miuix.kmp.blur.BlurDefaults
-import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
+import top.yukonga.miuix.kmp.material.isRuntimeShaderSupported
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import top.yukonga.miuix.kmp.blur.textureBlur
@@ -192,7 +192,7 @@ private const val CROP_AGSL = """
 /** 「确认显示区域」的圆角：与 miuix `Button` 默认圆角同值（16dp），**圆角矩形而非胶囊**。 */
 private val CROP_BUTTON_CORNER = 16.dp
 
-// ── 投影：参数与系统底栏（`Os4FloatingNavigationBar`）**完全一致** ──
+// ── 投影：高斯 28dp / 黑 0.13，自绘（数值沿用旧悬浮底栏） ──
 //
 // 不用 `graphicsLayer.shadowElevation`：那套光源固定在屏幕上方，只有下缘有影，
 // 做不出「光从看屏幕的方向打过来」的四周均匀效果。改成自绘：一个大一圈的圆角块
@@ -541,7 +541,7 @@ private fun CropScreen(key: String, onClose: () -> Unit) {
  * （miuix `Button` = `max(MinHeight 40dp, 行高 24 + insideMargin 13×2)` ≈ 50dp）。
  * 只有叠色和字色不同 —— 用户要求它们看起来是一对。
  *
- * 投影参数与系统底栏（`Os4FloatingNavigationBar`）一致：高斯 28dp / 黑 0.13。
+ * 投影参数：高斯 28dp / 黑 0.13（数值沿用旧悬浮底栏）。
  * `matchParentSize()` 不参与 Box 测量 ⇒ 阴影层自动等于按钮尺寸，不改变按钮高度。
  */
 @Composable

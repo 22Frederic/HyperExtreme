@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -40,9 +41,9 @@ import com.frederic22.hyperextreme.resolveAppDark
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import top.yukonga.miuix.kmp.blur.Backdrop
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.window.WindowDialog
 import java.io.File
 
 /**
@@ -274,91 +275,99 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
     }
 
         // 底色自己铺：这一层就是整个窗口的内容，不铺会在第一帧露白（主题的 windowBackground 是白的）。
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MiuixTheme.colorScheme.surface),
-    ) {
-        DetailTabHost(
-            title = when (page) {
-                DetailPage.MaskReplace -> "锁屏遮罩替换"
-                DetailPage.ParallaxBg -> "视差壁纸"
-                DetailPage.SpatialWallpaper -> "空间壁纸"
-                DetailPage.RasterWallpaper -> "光栅壁纸"
-                DetailPage.AliveWallpaper -> "Alive壁纸"
-                DetailPage.SystemUi -> "系统界面"
-            },
-            onBack = onClose,
-            onRestartAod = { askRestartAod = true },
+    // 玻璃背景录制层（0.9.5）：由 [DetailTabHost] 上报 —— 本页的弹窗写在 Host 外面，
+    // 读不到 Host 里的局部变量，所以在这里 provide 给整棵子树（见 [LocalPageBackdrop]）。
+    var pageBackdrop by remember { mutableStateOf<Backdrop?>(null) }
+    CompositionLocalProvider(LocalPageBackdrop provides pageBackdrop) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MiuixTheme.colorScheme.surface),
         ) {
-            when (page) {
-                DetailPage.MaskReplace -> MaskReplaceDetail(state = state, onPick = pickRole)
-                DetailPage.ParallaxBg -> ParallaxBgDetail(state = state, onPick = pickParallaxBg)
-                // 「空间壁纸」：**独立链**，暂不接收选图回调（深度模型流程还没接）。
-                DetailPage.SpatialWallpaper -> SpatialWallpaperDetail(state)
-                // 「光栅壁纸」（2026-11-03）：目前只是**主体验证页**，渲染链还没接。
-                DetailPage.RasterWallpaper -> RasterWallpaperDetail(state)
-                // 「Alive壁纸」（2026-11-07）：照片透镜「启航」，三态（AOD / 锁屏 / 桌面）。
-                DetailPage.AliveWallpaper -> AliveWallpaperDetail(state)
-                DetailPage.SystemUi -> SystemUiDetail(state)
-            }
-        }
-    }
+            DetailTabHost(
+                title = when (page) {
+                    DetailPage.MaskReplace -> "锁屏遮罩替换"
+                    DetailPage.ParallaxBg -> "视差壁纸"
+                    DetailPage.SpatialWallpaper -> "空间壁纸"
+                    DetailPage.RasterWallpaper -> "光栅壁纸"
+                    DetailPage.AliveWallpaper -> "Alive壁纸"
+                    DetailPage.SystemUi -> "系统界面"
+                },
+                onBack = onClose,
+                onRestartAod = { askRestartAod = true },
+                onPageBackdrop = { pageBackdrop = it },
+                overlay = {
+                    lastPendingImport?.let { pending ->
+                        AppGlassDialog(
+                            title = "尺寸与壁纸不一致",
+                            summary = "所选图片 ${pending.imageSize.first}×${pending.imageSize.second}，" +
+                                "壁纸 ${pending.wallpaperSize.first}×${pending.wallpaperSize.second}。\n" +
+                                "尺寸不一致时抠像可能错位。仍要继续吗？",
+                            show = pendingImport != null,
+                            onDismissRequest = { pendingImport = null },
+                        ) {
+                            val dismissState = LocalDismissState.current
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                TextButtonLike(
+                                    text = "取消",
+                                    onClick = {
+                                        val source = pending.source
+                                        pendingImport = null
+                                        dismissState?.invoke()
+                                        source.delete()
+                                    },
+                                )
+                                Spacer(Modifier.width(20.dp))
+                                TextButtonLike(
+                                    text = "确定",
+                                    primary = true,
+                                    onClick = {
+                                        val source = pending.source
+                                        pendingImport = null
+                                        dismissState?.invoke()
+                                        scope.launch { state.importRole(pending.role, source) }
+                                    },
+                                )
+                            }
+                        }
+                    }
 
-    lastPendingImport?.let { pending ->
-        WindowDialog(
-            title = "尺寸与壁纸不一致",
-            summary = "所选图片 ${pending.imageSize.first}×${pending.imageSize.second}，" +
-                "壁纸 ${pending.wallpaperSize.first}×${pending.wallpaperSize.second}。\n" +
-                "尺寸不一致时抠像可能错位。仍要继续吗？",
-            show = pendingImport != null,
-            onDismissRequest = { pendingImport = null },
-        ) {
-            val dismissState = LocalDismissState.current
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                    // 「点选择图片 → hook 探测壁纸原图」时的等待提示：等 hook 回执（最多 5 秒）。
+                    // ⚠️ 别和系统相册自己那条「正在准备文件…100%」进度条搞混 —— 那条属于 `com.android.photopicker`，
+                    // 出现在相册里（准备文件时）；本弹窗是**我们自己的**，出现在从相册回来之后。
+                    AppGlassDialog(
+                        title = "正在准备文件",
+                        summary = "正在读取当前壁纸原图的分辨率，请稍候…",
+                        show = state.preparingWallpaper,
+                        onDismissRequest = {},
+                    ) {}
+
+                    // 顶栏右上角那个重启按钮：弹窗本身与一级页面共用 [RestartDialog]。
+                    RestartDialog(
+                        show = askRestartAod,
+                        onDismissRequest = { askRestartAod = false },
+                        onConfirm = { state.restartTargets(it) },
+                    )
+                },
             ) {
-                TextButtonLike(
-                    text = "取消",
-                    onClick = {
-                        val source = pending.source
-                        pendingImport = null
-                        dismissState?.invoke()
-                        source.delete()
-                    },
-                )
-                Spacer(Modifier.width(20.dp))
-                TextButtonLike(
-                    text = "确定",
-                    primary = true,
-                    onClick = {
-                        val source = pending.source
-                        pendingImport = null
-                        dismissState?.invoke()
-                        scope.launch { state.importRole(pending.role, source) }
-                    },
-                )
+                when (page) {
+                    DetailPage.MaskReplace -> MaskReplaceDetail(state = state, onPick = pickRole)
+                    DetailPage.ParallaxBg -> ParallaxBgDetail(state = state, onPick = pickParallaxBg)
+                    // 「空间壁纸」：**独立链**，暂不接收选图回调（深度模型流程还没接）。
+                    DetailPage.SpatialWallpaper -> SpatialWallpaperDetail(state)
+                    // 「光栅壁纸」（2026-11-03）：目前只是**主体验证页**，渲染链还没接。
+                    DetailPage.RasterWallpaper -> RasterWallpaperDetail(state)
+                    // 「Alive壁纸」（2026-11-07）：照片透镜「启航」，三态（AOD / 锁屏 / 桌面）。
+                    DetailPage.AliveWallpaper -> AliveWallpaperDetail(state)
+                    DetailPage.SystemUi -> SystemUiDetail(state)
+                }
             }
         }
+
     }
-
-    // 「点选择图片 → hook 探测壁纸原图」时的等待提示：等 hook 回执（最多 5 秒）。
-    // ⚠️ 别和系统相册自己那条「正在准备文件…100%」进度条搞混 —— 那条属于 `com.android.photopicker`，
-    // 出现在相册里（准备文件时）；本弹窗是**我们自己的**，出现在从相册回来之后。
-    WindowDialog(
-        title = "正在准备文件",
-        summary = "正在读取当前壁纸原图的分辨率，请稍候…",
-        show = state.preparingWallpaper,
-        onDismissRequest = {},
-    ) {}
-
-    // 顶栏右上角那个重启按钮：弹窗本身与一级页面共用 [RestartDialog]。
-    RestartDialog(
-        show = askRestartAod,
-        onDismissRequest = { askRestartAod = false },
-        onConfirm = { state.restartTargets(it) },
-    )
 
     // 「屏幕灭亮提醒」弹窗已于 2026-10-04 按用户要求删除 —— 注入改成 hook 后不再依赖灭亮屏，
     // 是否灭亮屏改由「替换行为 → 替换后自动灭亮屏一次」开关决定（见 MaskReplaceDetail）。

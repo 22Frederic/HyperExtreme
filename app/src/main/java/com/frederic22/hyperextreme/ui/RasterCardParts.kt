@@ -101,6 +101,14 @@ internal const val DELETE_BAR_WIDTH_RATIO = 0.44f
 /** 卡片**常态**内描边：1dp 纯黑 alpha 0.1。 */
 internal val CARD_STROKE = Color.Black.copy(alpha = 0.1f)
 internal val CARD_STROKE_WIDTH = 1.dp
+/**
+ * 「新建」卡在**玻璃浮页**上的描边（2026-11-18）。
+ *
+ * 比封面卡的 [CARD_STROKE]（黑 10%）更淡：新建卡底色已经压到 6%/14% 的 tonal，
+ * 用 10% 的黑边会显得"一圈灰框"，5% 只是给边界一个极轻的落点。
+ * ⚠️ 一级页卡片流**不加**描边 —— 那边底色是不透明实色，本来就有边界。
+ */
+internal val NEW_CARD_STROKE = Color.Black.copy(alpha = 0.05f)
 
 /** 删除钮出现/消失时长（一级页与浮页槽位共用，用户 2026-11-03 定 0.15s）。 */
 internal const val BADGE_FADE_MS = 150
@@ -185,6 +193,27 @@ internal fun rememberCardSurface(): Color {
     }
 }
 
+/**
+ * 玻璃面上的卡片 / 内容容器底色（2026-11-18，miuix 0.9.5 玻璃浮页）。
+ *
+ * 官方 `guide/glass.md` 没有"玻璃上的内容卡片"专章，但官方所有玻璃组件内部的**内容层**
+ * 都是同一条做法 —— `onBackground` 的低透明度色调：
+ *  * `GlassDialogButton` Normal / Destructive 底 = `onBackground @ 15/255(浅) / 36/255(深)`；
+ *  * `GlassNavigationBar` 的 indicator 底 = `onBackground @ 6%(浅) / 12%(深)`；
+ *  * `GlassMaterials` 的颜色层也全是低 alpha 混合，没有不透明填充。
+ *
+ * 原来的 [rememberCardSurface] 是不透明实色（浅色往黑 lerp 6%、深色往白 lerp 14%），
+ * 铺在玻璃浮页上就是"贴了一块实心板"。**玻璃上用这个函数代替它**。
+ * ⚠️ 只有浮页（[RasterGroupSheet] / [AliveGroupSheet]）用它；一级页卡片流仍用
+ * [rememberCardSurface]（那里不是玻璃底，透明卡会融进页面）。
+ */
+@Composable
+internal fun rememberGlassCardSurface(): Color {
+    val cs = MiuixTheme.colorScheme
+    val isDark = cs.surface.luminance() < 0.5f
+    return cs.onBackground.copy(alpha = if (isDark) 36f / 255f else 15f / 255f)
+}
+
 /** 「新建」卡：深色底 + 蓝色圆形加号（视觉对齐系统锁屏编辑里的那张）。 */
 @Composable
 internal fun NewCard(
@@ -192,8 +221,15 @@ internal fun NewCard(
     cardH: Dp,
     radius: Dp,
     modifier: Modifier,
-    /** 卡片底色。默认 `surfaceContainerHigh`（一级页卡片流用这个就够），浮页传 [rememberCardSurface]。 */
+    /** 卡片底色。默认 `surfaceContainerHigh`（一级页卡片流用这个就够），浮页传 [rememberGlassCardSurface]。 */
     surface: Color = MiuixTheme.colorScheme.surfaceContainerHigh,
+    /**
+     * 描边色，`null` = 不画（默认）。
+     *
+     * 只有玻璃浮页传 [NEW_CARD_STROKE]：那边底色是低透明度 tonal，没有边就分不出卡片边界；
+     * 一级页卡片流底色是不透明实色，不需要。
+     */
+    stroke: Color? = null,
     /**
      * 能不能点。卡片流里只有居中的那张才可点（2026-11-05 用户要求）；
      * 浮页里这张卡不参与居中逻辑，保持默认的恒可点。
@@ -221,6 +257,13 @@ internal fun NewCard(
             .size(cardW, cardH)
             .squircleClip(radius)
             .background(surface)
+            .then(
+                if (stroke != null) {
+                    Modifier.squircleStroke({ CARD_STROKE_WIDTH }, { stroke }, radius)
+                } else {
+                    Modifier
+                },
+            )
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {

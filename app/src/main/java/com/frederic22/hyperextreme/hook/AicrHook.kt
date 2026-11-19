@@ -1,8 +1,23 @@
 package com.frederic22.hyperextreme.hook
 
+import android.content.BroadcastReceiver
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.ServiceConnection
+import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
 import android.os.Parcel
+import android.os.ParcelFileDescriptor
+import android.os.ResultReceiver
+import com.frederic22.hyperextreme.aicr.AicrProtocol
+import java.io.ByteArrayOutputStream
+import java.io.OutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import java.lang.reflect.InvocationTargetException
@@ -81,45 +96,62 @@ internal object AicrHook {
             hookOnTransact(module, c)
         }
 
-        // ② 兜底：hook Service#onCreate，构造完实例后从 mBinder 字段拿实现对象再 hook
-        if (!ok) {
-            val onCreate = runCatching { service.getDeclaredMethod("onCreate") }.getOrNull()
-            if (onCreate == null) {
-                log("兜底失败：$SERVICE 没有 onCreate")
-                return false
-            }
-            onCreate.isAccessible = true
-            runCatching {
-                module.hook(onCreate).intercept(object : XposedInterface.Hooker {
-                    override fun intercept(chain: XposedInterface.Chain): Any? {
-                        val result = chain.proceed()
-                        val svc = chain.getThisObject()
-                        val binder = runCatching {
-                            svc?.javaClass?.getDeclaredField("mBinder")
-                                ?.apply { isAccessible = true }
-                                ?.get(svc)
-                        }.getOrNull()
-                        if (binder == null) {
-                            log("兜底：onCreate 后拿不到 mBinder（字段名变了？）")
-                        } else {
-                            val m = binder.javaClass.declaredMethods.firstOrNull {
-                                it.name == METHOD && it.parameterCount == 5
-                            }
-                            if (m == null) {
-                                log("兜底：mBinder 里没有 $METHOD(5 参数)，类=${binder.javaClass.name}")
-                            } else {
-                                hookMethod(module, m)
-                            }
-                            // 访问校验在 onTransact 里（新版 4.13+），必须单独挂
-                            hookOnTransact(module, binder.javaClass)
-                        }
-                        return result
-                    }
-                })
-                log("已挂上 $SERVICE#onCreate（等实例后 hook $METHOD）")
-                ok = true
-            }.onFailure { log("挂 onCreate 失败：${it.javaClass.simpleName}: ${it.message}") }
+        // ② **无条件** hook Service#onCreate（2026-11-19，issue #4）：
+        //    ① 保存实例 —— 广播通道要拿它去本地调 mPlugInManager；
+        //    ② 注册广播接收器 —— 跨应用 bind 在部分设备上解析不到，改由 AICR 进程内自取；
+        //    ③ 顺带保留原来的 mBinder 兜底（直接找内部类没成功时才走）。
+        val onCreate = runCatching { service.getDeclaredMethod("onCreate") }.getOrNull()
+        if (onCreate == null) {
+            log("兜底失败：$SERVICE 没有 onCreate")
+            runCatching { ensureReceiver() }
+            return ok
         }
+        onCreate.isAccessible = true
+        runCatching {
+            module.hook(onCreate).intercept(object : XposedInterface.Hooker {
+                override fun intercept(chain: XposedInterface.Chain): Any? {
+                    val result = chain.proceed()
+                    val svc = chain.getThisObject()
+                    coreService = svc
+                    // 包一层：这里是 Service.onCreate 的 hook，任何异常冒出去都会让
+                    // AICR 的 coreService 创建失败 ⇒ mPlugInManager 永远为 null。
+                    runCatching { ensureReceiver() }
+                    // ⚠️ **无条件**补 hook（2026-11-19 修回归）：这里原先写的是 `if (!ok)`，
+                    //    而 `ok` 在下方「挂上 onCreate」后就被置 true —— Kotlin 的局部 var
+                    //    被闭包捕获会装箱成 Ref，于是本闭包读到的永远是 true，补 hook 一次
+                    //    都没执行过。后果：`declaredClasses` 恒为 0 的设备（本机和用户机都是，
+                    //    见类注释）上 `getPluginBinder` / `onTransact` 全没挂 ⇒ 被 AccessGuard
+                    //    拒 ⇒ 空 reply ⇒ `Status=-1`。
+                    //    `hookMethod` / `hookOnTransact` 内部都有 `hooked` 去重，服务重建多次
+                    //    重复进来也安全。
+                    val binder = runCatching {
+                        svc?.javaClass?.getDeclaredField("mBinder")
+                            ?.apply { isAccessible = true }
+                            ?.get(svc)
+                    }.getOrNull()
+                    if (binder == null) {
+                        log("兜底：onCreate 后拿不到 mBinder（字段名变了？）")
+                    } else {
+                        val m = binder.javaClass.declaredMethods.firstOrNull {
+                            it.name == METHOD && it.parameterCount == 5
+                        }
+                        if (m == null) {
+                            log("兜底：mBinder 里没有 $METHOD(5 参数)，类=${binder.javaClass.name}")
+                        } else {
+                            hookMethod(module, m)
+                        }
+                        // 访问校验在 onTransact 里（新版 4.13+），必须单独挂
+                        hookOnTransact(module, binder.javaClass)
+                    }
+                    return result
+                }
+            })
+            log("已挂上 $SERVICE#onCreate（实例保存 + 广播注册）")
+            ok = true
+        }.onFailure { log("挂 onCreate 失败：${it.javaClass.simpleName}: ${it.message}") }
+        // 主进程 / 其他子进程里没有 `AiCrCoreService.onCreate` 可挂 ⇒ 这里再试一次
+        // （`onPackageReady` 时 Application 可能还没建好，取不到 Context 就等 onCreate 兜底）。
+        runCatching { ensureReceiver() }
         return ok
     }
 
@@ -367,6 +399,200 @@ internal object AicrHook {
         } ?: return null
         return m.invoke(pm, desc, address) as? IBinder
     }
+
+    // ──────────────────────────────────────────────────────────── 广播通道（2026-11-19，issue #4）
+
+    /**
+     * ## 为什么要有这一条
+     *
+     * 用户设备（K80 Pro / HyperOS 4）上 App 侧 `bindService` **两种 Intent 都返回 false**
+     * （显式 ComponentName 也 false），`resolveService` 直接解析不到。但 AICR **自己**调自己
+     * 是同包同 uid，不受包可见性 / 组件管控的任何限制。
+     *
+     * 所以改成：App 发定向广播 → **任意** AICR 进程收到后，用 `bindService` 绑**自己的**
+     * service（同包同 uid，必成）→ 走标准 AIDL 抠图 → 结果写回 App 给的 pipe。
+     *
+     * 注册点选在 `onCreate`（而不是 `install` 当下）：那时进程的 Application 一定就绪，
+     * `currentApplication()` 拿得到 Context。
+     *
+     * ## 协议
+     *
+     * ```
+     * App:  Intent(ACTION_SEGMENT).setPackage("com.xiaomi.aicr")
+     *         .putExtra(EXTRA_IN,  原图 fd 只读)
+     *         .putExtra(EXTRA_OUT, 结果 pipe 写端)
+     * AICR: 收到 → 立刻写 FLAG_ACCEPTED（表示「已接手」）→ 本地 bind 自己 → segmentByFd
+     *         → 写 PNG → 关闭写端（App 读到 EOF）
+     * ```
+     */
+
+    @Volatile private var coreService: Any? = null
+    @Volatile private var selfCore: IBinder? = null
+    @Volatile private var receiverReady = false
+
+    /** `onPackageReady` 时 Application 还没建好 ⇒ 延迟重试（最多 12 次 ≈ 6 秒）。 */
+    private val receiverRetry = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private fun ensureReceiver() {
+        if (receiverReady) return
+        // 2026-11-19 P2：**不再按进程名过滤**。`Application.getProcessName()` 在
+        // `onPackageReady` 这个时机拿到的不是本进程名（真机日志实证：主进程 + coreService +
+        // cognitionService + actionprovider + searchService + searchDataService 全注册了），
+        // 靠它筛等于没筛。改成「所有进程都注册 + 有序广播由第一个收到的进程
+        // `abortBroadcast()` 独占」—— 覆盖最全（主进程被回收也有人接），且只处理一次。
+        val app = HookRuntime.appContext()
+        if (app == null) {
+            // 主进程 / 非 coreService 子进程没有 `AiCrCoreService.onCreate` 可等，
+            // 只能等 Application 建好 —— 每个进程独立计数，不会互相拖累。
+            if (receiverRetry.getAndIncrement() < 12) {
+                runCatching {
+                    android.os.Handler(android.os.Looper.getMainLooper())
+                        .postDelayed({ ensureReceiver() }, 500L)
+                }
+            }
+            return
+        }
+        synchronized(this) {
+            if (receiverReady) return
+            val filter = IntentFilter(AicrProtocol.ACTION_SEGMENT)
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    if (intent.getStringExtra(AicrProtocol.EXTRA_MAGIC) != AicrProtocol.MAGIC) return
+                    // **有序广播：第一个收到的进程独占**（AICR 有 5+ 个进程都注册了接收器，
+                    // 不独占的话它们会同时往同一个 pipe 写，数据直接错乱）。
+                    // abortBroadcast 必须在 onReceive 里同步调用，之后才轮到 goAsync。
+                    runCatching {
+                        if (isOrderedBroadcast) {
+                            resultCode = 1
+                            abortBroadcast()
+                        }
+                    }
+                    val pending = goAsync()
+                    Thread({
+                        try {
+                            handleSegmentBroadcast(context, intent)
+                        } catch (t: Throwable) {
+                            log("广播：处理异常 ${t.javaClass.simpleName}: ${t.message}")
+                        } finally {
+                            runCatching { pending.finish() }
+                        }
+                    }, "hx-aicr-seg").start()
+                }
+            }
+            runCatching {
+                app.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+                receiverReady = true
+                log("广播通道已注册（进程=${runCatching { android.app.Application.getProcessName() }.getOrNull() ?: "?"}）")
+            }.onFailure { log("注册广播失败：${it.javaClass.simpleName}: ${it.message}") }
+        }
+    }
+
+    /** 让 AICR **自己**绑自己的 coreService —— 同包同 uid，必成。 */
+    private fun bindSelf(app: Context): IBinder? {
+        selfCore?.let { if (it.isBinderAlive) return it }
+        val latch = CountDownLatch(1)
+        var b: IBinder? = null
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                b = service
+                latch.countDown()
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                selfCore = null
+            }
+        }
+        val intent = Intent().setComponent(
+            ComponentName(AicrProtocol.PKG, AicrProtocol.CORE_CLASS),
+        )
+        val ok = runCatching { app.bindService(intent, conn, Context.BIND_AUTO_CREATE) }
+            .getOrDefault(false)
+        if (!ok) {
+            log("广播：本地 bind 自己失败（bindService=false）")
+            return null
+        }
+        runCatching { latch.await(10, TimeUnit.SECONDS) }
+        val binder = b
+        if (binder == null) {
+            log("广播：本地 bind 超时")
+            return null
+        }
+        selfCore = binder
+        return binder
+    }
+
+    private fun handleSegmentBroadcast(ctx: Context, intent: Intent) {
+        val rr = intent.getParcelableExtra(AicrProtocol.EXTRA_RESULT, ResultReceiver::class.java)
+        val inUri = intent.getStringExtra(AicrProtocol.EXTRA_IN_URI)?.let(Uri::parse)
+        val outUri = intent.getStringExtra(AicrProtocol.EXTRA_OUT_URI)?.let(Uri::parse)
+        if (inUri == null || outUri == null) {
+            log("广播：缺少 uri（in=$inUri out=$outUri）")
+            replyErr(rr, "广播缺少 in_uri / out_uri")
+            return
+        }
+        var inPfd: ParcelFileDescriptor? = null
+        var out: OutputStream? = null
+        try {
+            // 广播自带的 FLAG_GRANT_READ/WRITE_URI_PERMISSION 已把这两个文件授权给本 uid。
+            inPfd = ctx.contentResolver.openFileDescriptor(inUri, "r")
+            if (inPfd == null) {
+                replyErr(rr, "打不开输入 Uri（临时授权失效？）")
+                return
+            }
+            out = ctx.contentResolver.openOutputStream(outUri, "wt")
+            if (out == null) {
+                replyErr(rr, "打不开输出 Uri（临时授权失效？）")
+                return
+            }
+
+            val core = bindSelf(ctx)
+            if (core == null) {
+                replyErr(rr, "本地 bind 自己失败")
+                return
+            }
+            val (plugin, status) = AicrProtocol.awaitPlugin(core)
+            if (plugin == null) {
+                replyErr(rr, "getPluginBinder 返回空（${AicrProtocol.statusText(status)}）")
+                return
+            }
+            if (status != AicrProtocol.STATUS_OK) {
+                replyErr(rr, "插件未就绪（${AicrProtocol.statusText(status)}）")
+                return
+            }
+            val result = AicrProtocol.segmentByFd(plugin, inPfd)
+            val bmp = result?.bitmaps?.firstOrNull()
+            if (bmp == null) {
+                replyErr(rr, "服务返回空位图")
+                return
+            }
+            val png = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.PNG, 100, png)
+            out.write(png.toByteArray())
+            out.flush()
+            // 先关流再回 OK —— App 收到 OK 会立刻读文件。
+            runCatching { out.close() }
+            out = null
+            runCatching { rr?.send(AicrProtocol.RESULT_OK, null) }
+            log("广播：完成 ${bmp.width}×${bmp.height}")
+        } catch (t: Throwable) {
+            log("广播：失败 ${t.javaClass.simpleName}: ${t.message}")
+            replyErr(rr, "${t.javaClass.simpleName}: ${t.message}")
+        } finally {
+            runCatching { out?.close() }
+            runCatching { inPfd?.close() }
+        }
+    }
+
+    /** 把失败原因回传给 App（App 会写进 run_log 并继续回退 binder）。 */
+    private fun replyErr(rr: ResultReceiver?, msg: String) {
+        runCatching {
+            rr?.send(
+                AicrProtocol.RESULT_ERR,
+                Bundle().apply { putString(AicrProtocol.EXTRA_ERROR, msg) },
+            )
+        }
+    }
+
 
     private fun log(msg: String) = HookRuntime.log("AICR $msg")
 }

@@ -36,6 +36,7 @@ import androidx.compose.runtime.DisposableEffect
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -50,19 +51,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import top.yukonga.miuix.kmp.blur.Backdrop
-import top.yukonga.miuix.kmp.blur.BlendColorEntry
-import top.yukonga.miuix.kmp.blur.BlurDefaults
 import top.yukonga.miuix.kmp.blur.LayerBackdrop
-import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
+import top.yukonga.miuix.kmp.material.isRuntimeShaderSupported
 import top.yukonga.miuix.kmp.blur.layerBackdrop
-import top.yukonga.miuix.kmp.blur.textureBlur
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -74,24 +71,22 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.ui.icons.CheckCircleOutlineIcon
 import com.frederic22.hyperextreme.ui.icons.ErrorOutlineIcon
-import com.frederic22.hyperextreme.ui.nav.NavTab
-import com.frederic22.hyperextreme.ui.nav.Os4FloatingNavigationBar
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.job
-import kotlinx.coroutines.launch
+import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.Icon
-import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
-import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.basic.rememberTopAppBarState
-import top.yukonga.miuix.kmp.basic.ButtonDefaults
+import top.yukonga.miuix.kmp.glass.GlassIconButton
+import top.yukonga.miuix.kmp.glass.GlassNavigationBar
+import top.yukonga.miuix.kmp.glass.GlassNavigationItem
+import top.yukonga.miuix.kmp.glass.GlassTopAppBar
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Checkbox
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.glass.GlassDialogButtonDefaults
+import top.yukonga.miuix.kmp.glass.GlassDialogButtonRole
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ChevronBackward
 import top.yukonga.miuix.kmp.icon.extended.Home
@@ -104,8 +99,6 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.PagerGestureNestedScrollConnection
 import top.yukonga.miuix.kmp.utils.PagerNavigationSpringSpec
 import top.yukonga.miuix.kmp.utils.pagerGestureOverride
-import top.yukonga.miuix.kmp.utils.springAnimateToPage
-import top.yukonga.miuix.kmp.window.WindowDialog
 
 /** 目标应用（= 模块的作用域），定义在 data 层，这里只做别名。 */
 
@@ -159,22 +152,30 @@ fun MaskSwapApp(onDarkModeChange: (Boolean) -> Unit = {}) {
     var monetColor by remember { mutableStateOf(prefs.monetColor) }
     val controller = rememberThemeController(themeMode, monetColor)
 
+    // 玻璃背景录制层（miuix 0.9.5）：对象在这里持有、由 Shell 挂到页面内容上录制，
+    // 并向下 provide —— 弹窗（写在 Shell 函数体里）就能读到同一份。详见 [LocalPageBackdrop]。
+    val pageBackdrop = rememberLayerBackdrop()
+
     // textStyles 用 [HyperTextStyles]：miuix 默认的正文是 400，HyperOS 系统界面是 MiSans Medium，
     // 不补这一档字重就会"比系统显示的细一档"（详见该文件里的说明）。
     MiuixTheme(controller = controller, textStyles = HyperTextStyles) {
-        MaskSwapShell(
-            onThemeModeChange = { mode ->
-                themeMode = mode
-                prefs.setThemeMode(mode.id)
-            },
-            onMonetChange = { monetColor = it },
-            onDarkModeChange = onDarkModeChange,
-        )
+        CompositionLocalProvider(LocalPageBackdrop provides pageBackdrop) {
+            MaskSwapShell(
+                backdrop = pageBackdrop,
+                onThemeModeChange = { mode ->
+                    themeMode = mode
+                    prefs.setThemeMode(mode.id)
+                },
+                onMonetChange = { monetColor = it },
+                onDarkModeChange = onDarkModeChange,
+            )
+        }
     }
 }
 
 @Composable
 private fun MaskSwapShell(
+    backdrop: LayerBackdrop,
     onThemeModeChange: (ThemeMode) -> Unit,
     onMonetChange: (Boolean) -> Unit,
     onDarkModeChange: (Boolean) -> Unit,
@@ -193,39 +194,11 @@ private fun MaskSwapShell(
         snapAnimationSpec = PagerNavigationSpringSpec,
     )
     // 悬浮底栏的玻璃效果需要一份"背景录制"：只录页面内容（连底栏一起录会和 RenderNode 形成环）。
-    val backdrop = rememberLayerBackdrop()
-    // 选中页**不能直接跟随 `pagerState.currentPage`**：它在滚动途中会逐页经过中间页
-    //（1→3 会依次经过 2、3），底栏的选中块会被"先弹到终点 → 拽回中间页 → 再弹回终点"，
-    // 观感就是跨页拖动时抽一下。照 miuix 官方 example（MainPagerState）的写法：
-    // ① 底栏发起的导航先定住 `selectedIndex`，导航期间屏蔽 pager 的中间状态；
-    // ② 只有用户手指滑页（非导航中）才从 `currentPage` 同步回来。
-    val selectedIndex = remember { mutableIntStateOf(pagerState.currentPage) }
-    val navJob = remember { mutableStateOf<Job?>(null) }
-    var navigating by remember { mutableStateOf(false) }
-    fun animatePagerTo(target: Int) {
-        if (target == selectedIndex.intValue) return
-        navJob.value?.cancel()
-        selectedIndex.intValue = target
-        navigating = true
-        navJob.value = scope.launch {
-            val myJob = coroutineContext.job
-            try {
-                pagerState.springAnimateToPage(target)
-            } finally {
-                if (navJob.value == myJob) {
-                    navigating = false
-                    if (pagerState.currentPage != target) {
-                        selectedIndex.intValue = pagerState.currentPage
-                    }
-                }
-            }
-        }
-    }
-    LaunchedEffect(pagerState.currentPage) {
-        if (!navigating && selectedIndex.intValue != pagerState.currentPage) {
-            selectedIndex.intValue = pagerState.currentPage
-        }
-    }
+    // 2026-11-18 起对象由 [MaskSwapApp] 创建并作为参数传进来 —— 弹窗也要读它（见 [LocalPageBackdrop]）。
+    // 选中页与 pager 的联动交给 [AppPagerState]（miuix 官方 example 的 `MainPagerState` 同款）：
+    // `currentPage` 在滚动途中会逐页经过中间页，不能直接拿来驱动底栏的选中块。
+    val appPagerState = rememberAppPagerState(pagerState, scope)
+    LaunchedEffect(pagerState.currentPage) { appPagerState.syncPage() }
     val isDark = when (state.themeMode) {
         ThemeMode.DARK -> true
         ThemeMode.LIGHT -> false
@@ -261,44 +234,10 @@ private fun MaskSwapShell(
     // 「选图」那条链（picker + pickRole + 尺寸不一致弹窗）2026-09-29 整体搬去
     // `MaskDetailActivity` 的 `MaskDetailScreen` —— 二级页成了独立 Activity，它得自己走完这条链。
 
-    // 顶栏右上角重启按钮的弹窗 —— 与二级页共用一份（`RestartDialog`）。
-    RestartDialog(
-        show = askRestartAod,
-        onDismissRequest = { askRestartAod = false },
-        onConfirm = { state.restartTargets(it) },
-    )
-
     // 检查更新（2026-11-16）：**每天（北京时间）首次**进模块自动查一次。
     // 这里是冷启动那条路；回前台 / 跨零点走 [MaskUiState.onResume]。
     // 两处都受同一个日期闸门约束，重复调用直接返回（开关关着也直接返回）。
     LaunchedEffect(Unit) { state.autoCheckUpdateOnce() }
-
-    // 更新相关三个弹窗 —— 与其它弹窗一样**常驻组合树、用 show 控制**
-    //（条件包裹会让 miuix 的退出动画播不出来）。
-    UpdateFoundDialog(
-        show = state.updateFound != null,
-        versionName = state.updateFound?.versionName.orEmpty(),
-        versionCode = state.updateFound?.versionCode ?: 0,
-        onDismissRequest = { state.updateFound = null },
-        onConfirm = {
-            state.updateFound = null
-            // 不直接跳转：再弹「选择平台」（大陆用户多半要走网盘）
-            state.showReleaseDialog = true
-        },
-    )
-    UpdateFailedDialog(
-        show = state.updateFailed,
-        onDismissRequest = { state.updateFailed = false },
-    )
-    PlatformDialog(
-        show = state.showReleaseDialog,
-        onDismissRequest = { state.showReleaseDialog = false },
-        onPick = { url ->
-            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
-                .onFailure { AppToast.show(context, "无法打开链接") }
-        },
-        entries = ReleaseEntries,
-    )
 
     // 「屏幕灭亮提醒」也搬去 `MaskDetailActivity` 了：它只可能被二级页的「立即替换」触发
     //（`MaskUiState.requestReplace()`），一级页面没有那条路。
@@ -318,71 +257,8 @@ private fun MaskSwapShell(
             activationAlert = true
         }
     }
-    WindowDialog(
-        title = "本模块未激活",
-        summary = (when {
-            !state.activated && state.rootAvailable == false -> "请检查LSPosed与Root"
-            !state.activated -> "请检查LSPosed"
-            else -> "请检查Root"
-        // 2026-10-31：末尾这句里给档位名加引号 + 补「（免Root）」，与页面下拉里的文案逐字一致。
-        // 2026-11-05：两处「空间壁纸」补上「与光栅壁纸」—— 光栅壁纸同样有免 Root 的服务模式。
-        }) + "，如果需要在无Root下使用空间壁纸与光栅壁纸，请点击忽略，并在空间壁纸与光栅壁纸的挂载模式中选择" +
-            "“系统壁纸服务（免Root）”。",
-        show = activationAlert,
-        onDismissRequest = { activationAlert = false },
-    ) {
-        val dismissState = LocalDismissState.current
-        Column(modifier = Modifier.fillMaxWidth()) {
-            // 「以后不再弹出该弹窗」：默认不勾；**勾了并点下面的按钮才写入**。
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .clickable { activationNoMore = !activationNoMore }
-                    .padding(horizontal = 12.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "以后不再弹出该弹窗",
-                    style = MiuixTheme.textStyles.main,
-                    modifier = Modifier.weight(1f),
-                )
-                Checkbox(
-                    state = ToggleableState(activationNoMore),
-                    onClick = { activationNoMore = !activationNoMore },
-                )
-            }
-            Spacer(Modifier.height(16.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                TextButtonLike(
-                    text = "忽略",
-                    onClick = {
-                        if (activationNoMore) activationPrefs.setActivationWarnDismissed(true)
-                        activationAlert = false
-                        dismissState?.invoke()
-                    },
-                )
-                Spacer(Modifier.width(20.dp))
-                TextButtonLike(
-                    text = "退出",
-                    primary = true,
-                    onClick = {
-                        if (activationNoMore) activationPrefs.setActivationWarnDismissed(true)
-                        activationAlert = false
-                        dismissState?.invoke()
-                        // "退出" = 关掉模块界面回到桌面，不动任何系统状态。
-                        context.findActivity()?.finish()
-                    },
-                )
-            }
-        }
-    }
 
-    // 底栏放在 Scaffold 外层：它的位置只由 NavBarBottomGap 决定，
-    // 不会再被 Scaffold 的 contentWindowInsets（底部导航条）往外推一次。
+    // 底栏在 Scaffold 内、`layerBackdrop` 外（位置见下面调用处的说明）。
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
             // 顶栏搬到每一页里面了（见 [TabHost]），所以这里不再消费任何 inset ——
@@ -409,10 +285,14 @@ private fun MaskSwapShell(
                         state = pagerState,
                         modifier = Modifier
                             .fillMaxSize()
-                            // miuix 0.9.4 的 CrossAxis 手势（PagerSwipeNode）：跟手拖动 +
+                            // miuix 0.9.5 的 CrossAxis 手势（PagerSwipeNode）：跟手拖动 +
                             // 松手走 PagerNavigationSpringSpec，纵向拖动会退出、交给页面自己滚。
+                            // ⚠️ 0.9.5 起 `flingBehavior` 是**必填**参数（0.9.4 时可省），
+                            // 且枚举 `CrossAxisInterceptor` 改名 `CrossAxis`、`TapToHalt` 被删 ——
+                            // 我们只用默认模式，所以补一个 flingBehavior 即可。
                             .pagerGestureOverride(
                                 pagerState = pagerState,
+                                flingBehavior = pagerFlingBehavior,
                                 enabled = true,
                             ),
                         // miuix 的 CrossAxis 手势接管：pager 自己的触摸滚动关掉，
@@ -473,18 +353,129 @@ private fun MaskSwapShell(
                 //
                 // 但仍要留在 `layerBackdrop` 那层**外面**：进了那层就会被当成背景录进玻璃的副本里
                 //（玻璃会把自己录进去）。所以位置是"Scaffold 内、layerBackdrop 外"。
-                Os4FloatingNavigationBar(
-                    tabs = Tab.entries.map { item ->
-                        NavTab(label = item.label, icon = item.icon) {
-                            animatePagerTo(item.ordinal)
-                        }
+                // 底栏：miuix 官方的玻璃悬浮导航条（2026-11-19 替换掉从 HyperChanger 移植的那套）。
+                //
+                // 位置由组件自己的 `defaultWindowInsetsPadding` 决定（系统导航条 inset + 官方
+                // 浮动边距）；两侧各留 24dp 等价于原来"0.88 屏宽"。
+                // ⚠️ `isDynamicColor` 为 false（我们只在开 Monet 时用动态色），选中态走
+                // `onBackground` + 低 alpha 的指示块，与官方 example 一致。
+                GlassNavigationBar(
+                    items = Tab.entries.map { item ->
+                        GlassNavigationItem(icon = item.icon, label = item.label)
                     },
-                    selectedIndex = selectedIndex,
+                    selectedIndex = appPagerState.selectedPage,
+                    onSelect = { appPagerState.animateToPage(it) },
                     backdrop = backdrop,
-                    isDarkTheme = isDark,
-                    modifier = Modifier.align(Alignment.BottomCenter),
-                    onTabSelected = { index -> animatePagerTo(index) },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(horizontal = 24.dp),
                 )
+
+                // ===== 弹窗（必须留在 Scaffold 子树内：miuix 的 overlay 靠 MiuixPopupHost 消费）=====
+                // 顶栏右上角重启按钮的弹窗 —— 与二级页共用一份（`RestartDialog`）。
+                RestartDialog(
+                    show = askRestartAod,
+                    onDismissRequest = { askRestartAod = false },
+                    onConfirm = { state.restartTargets(it) },
+                )
+
+                // 更新相关三个弹窗 —— 与其它弹窗一样**常驻组合树、用 show 控制**
+                //（条件包裹会让 miuix 的退出动画播不出来）。
+                UpdateFoundDialog(
+                    show = state.updateFound != null,
+                    versionName = state.updateFound?.versionName.orEmpty(),
+                    versionCode = state.updateFound?.versionCode ?: 0,
+                    onDismissRequest = { state.updateFound = null },
+                    onConfirm = {
+                        state.updateFound = null
+                        // 不直接跳转：再弹「选择平台」（大陆用户多半要走网盘）
+                        state.showReleaseDialog = true
+                    },
+                )
+                UpdateFailedDialog(
+                    show = state.updateFailed,
+                    onDismissRequest = { state.updateFailed = false },
+                )
+                PlatformDialog(
+                    show = state.showReleaseDialog,
+                    onDismissRequest = { state.showReleaseDialog = false },
+                    onPick = { url ->
+                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                            .onFailure { AppToast.show(context, "无法打开链接") }
+                    },
+                    entries = ReleaseEntries,
+                )
+
+                AppGlassDialog(
+                    title = "本模块未激活",
+                    summary = (when {
+                        !state.activated && state.rootAvailable == false -> "请检查LSPosed与Root"
+                        !state.activated -> "请检查LSPosed"
+                        else -> "请检查Root"
+                    // 2026-10-31：末尾这句里给档位名加引号 + 补「（免Root）」，与页面下拉里的文案逐字一致。
+                    // 2026-11-05：两处「空间壁纸」补上「与光栅壁纸」—— 光栅壁纸同样有免 Root 的服务模式。
+                    }) + "，如果需要在无Root下使用空间壁纸与光栅壁纸，请点击忽略，并在空间壁纸与光栅壁纸的挂载模式中选择" +
+                        "“系统壁纸服务（免Root）”。",
+                    show = activationAlert,
+                    onDismissRequest = { activationAlert = false },
+                ) {
+                    val dismissState = LocalDismissState.current
+                    // 整行点击的统一振动（2026-11-18）：Checkbox 自己由 miuix 内部振，文字区域补上。
+                    val haptic = rememberClickHaptic()
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        // 「以后不再弹出该弹窗」：默认不勾；**勾了并点下面的按钮才写入**。
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    haptic()
+                                    activationNoMore = !activationNoMore
+                                }
+                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "以后不再弹出该弹窗",
+                                style = MiuixTheme.textStyles.main,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Checkbox(
+                                state = ToggleableState(activationNoMore),
+                                onClick = { activationNoMore = !activationNoMore },
+                                // 玻璃弹窗专用配色（与 Normal 按钮同源），见 appCheckboxColors。
+                                colors = appCheckboxColors(),
+                            )
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            TextButtonLike(
+                                text = "忽略",
+                                onClick = {
+                                    if (activationNoMore) activationPrefs.setActivationWarnDismissed(true)
+                                    activationAlert = false
+                                    dismissState?.invoke()
+                                },
+                            )
+                            Spacer(Modifier.width(20.dp))
+                            TextButtonLike(
+                                text = "退出",
+                                primary = true,
+                                onClick = {
+                                    if (activationNoMore) activationPrefs.setActivationWarnDismissed(true)
+                                    activationAlert = false
+                                    dismissState?.invoke()
+                                    // "退出" = 关掉模块界面回到桌面，不动任何系统状态。
+                                    context.findActivity()?.finish()
+                                },
+                            )
+                        }
+                    }
+                }
+
             }
         }
 
@@ -505,6 +496,33 @@ private fun MaskSwapShell(
 internal val LocalTopBarHeight = compositionLocalOf { 0.dp }
 
 /**
+ * 当前页的「玻璃背景录制层」（miuix 0.9.5 的玻璃组件用）。
+ *
+ * ## 为什么需要它
+ *
+ * 0.9.5 的 `GlassDropdownPreference` / `GlassDialog` 都要求一个 `Backdrop` 做背景采样，
+ * 而 backdrop 原本是各页 `rememberLayerBackdrop()` 建的**局部变量**：
+ *  * 一级页：`MaskSwapShell` 里那份整页录制（底栏玻璃也用它，2026-11-18 提到 `MaskSwapApp`）；
+ *  * 二级页：`DetailTabHost` 里那份（顶栏模糊也用它）。
+ *
+ * 弹窗 / 下拉的**组合位置**在这些 Host 的局部作用域之外（`WindowDialog(...)` 直接写在
+ * `MaskSwapShell` / `MaskDetailActivity` 的函数体里，下拉行在各页组件深处），读不到局部变量；
+ * 包成 CompositionLocal 也必须有地方 provide —— 所以统一在**调用方的最外层** provide，
+ * 下游用 `LocalPageBackdrop.current` 取。
+ *
+ * ## 采样范围（官方规范 `guide/glass.md#background-sampling`）
+ *
+ * 只包含页面内容与页面底色，**不包含**底栏与弹窗自身 —— 底栏在 `Scaffold` 内、`layerBackdrop`
+ * 外，弹窗在 `popupHost` 里，两者天然不在录制范围，不会自采样。
+ *
+ * ⚠️ 与 `LocalTopBarHeight` / `LocalPageScroll` 不同，这里用 `staticCompositionLocalOf`：
+ * backdrop 的**身份**在一次会话里不变（同一个 `LayerBackdrop` 对象反复录制），换页也不换对象，
+ * 没必要为它触发重组。真的拿不到（裸 Activity、首帧还没上报）就是 null，玻璃组件自动退回
+ * 不透明底色 —— 官方就是这么设计的，不会崩。
+ */
+internal val LocalPageBackdrop = staticCompositionLocalOf<Backdrop?> { null }
+
+/**
  * 本页的滚动状态（[TabHost] / [DetailTabHost] 各持有一份，向下提供）。
  *
  * 顶栏的收起量按**内容滚动位置** 1:1 推导（见两个 Host 里的 `snapshotFlow`），所以 Host
@@ -522,12 +540,12 @@ internal fun rememberPageScroll(): ScrollState {
 }
 
 /**
- * 页面级模糊背景（2026-10-15：全界面顶栏均匀模糊）。
+ * 页面级模糊背景（2026-10-15）。
  *
  * 与底栏玻璃用的 [backdrop]（整页录制、**含顶栏**）刻意分开：顶栏要采样的源里不能有它自己
  * （否则玻璃把自己录进去、递归成鬼影）。所以这里每页各建一份、只录**内容层**，
- * 顶栏用 [BlurredTopBar] 的 `textureBlur` 采样它 —— miuix 官方 example
- * （`MainPage` / `rememberBlurBackdrop`）同款做法。
+ * 交给 [GlassTopAppBar] 的 `backdrop` —— 2026-11-18 起顶栏换成 miuix 的 `GlassTopAppBar`，
+ * `progressiveBlur = true` 时它会在内部再录一层、画出「顶部实、向下渐隐」的渐变模糊带。
  *
  * `drawRect(surface)` 先铺不透明底色：录制内容若有透明区域，模糊会把颜色扩散到透明像素、
  * 出现色块（官方指南原文）。
@@ -543,46 +561,10 @@ private fun rememberPageBlurBackdrop(): LayerBackdrop? {
 }
 
 /**
- * 顶栏的模糊壳（官方 `BlurredBar` 的**均匀模糊**分支）：有 backdrop 就给顶栏衬一层
- * `textureBlur` 背景（25f + surface 0.8 混合，官方参数），没有就什么都不做（顶栏保持原底色）。
- *
- * `textureBlur` 是"先画模糊、再 drawContent"，标题 / 图标等正常内容都画在玻璃之上；
- * 用它的前提是顶栏自身 `color` 已置透明 —— 见两个 Host 的调用处。
- */
-@Composable
-private fun BlurredTopBar(
-    backdrop: Backdrop?,
-    blurActive: Boolean,
-    modifier: Modifier = Modifier,
-    content: @Composable () -> Unit,
-) {
-    val surface = MiuixTheme.colorScheme.surface
-    val colors = BlurDefaults.blurColors(
-        blendColors = listOf(BlendColorEntry(color = surface.copy(alpha = 0.8f))),
-    )
-    Box(
-        modifier = modifier.then(
-            if (blurActive && backdrop != null) {
-                Modifier.textureBlur(
-                    backdrop = backdrop,
-                    shape = RectangleShape,
-                    blurRadius = 25f,
-                    colors = colors,
-                )
-            } else {
-                Modifier
-            },
-        ),
-    ) {
-        content()
-    }
-}
-
-/**
  * 一页 = 自己的顶栏 + 可滚动内容。
  *
  * 顶栏刻意放在**页内**而不是 Scaffold 的 topBar 槽位：这样翻页时整页（含大标题）一起横向滑走，
- * 而不是"页面滑完了标题才突然换字"。折叠仍然是 miuix 的 [TopAppBar] + ScrollBehavior 那套
+ * 而不是"页面滑完了标题才突然换字"。折叠仍然是 miuix 的 [GlassTopAppBar] + ScrollBehavior 那套
  * （展开时大字号居左 → 上滑收成小标题居中），只是每一页各有一套 state，互不影响 ——
  * 也就不再需要在翻页时手动把 heightOffset 归零了。
  *
@@ -613,7 +595,6 @@ private fun TabHost(
     // 顶栏玻璃才有采样的东西。顶栏原来的"占位"改由内容自己用 [LocalTopBarHeight] 留白
     // （见 [TabColumn]）。
     val blurBackdrop = rememberPageBlurBackdrop()
-    val blurActive = blurBackdrop != null
     // 顶栏展开态高度（含状态栏留白）：记"最大值"（折叠只会变矮），内容头部留白用它。
     var barHeightPx by remember { mutableIntStateOf(0) }
     val barHeight = with(LocalDensity.current) { barHeightPx.toDp() }
@@ -638,28 +619,38 @@ private fun TabHost(
                 content()
             }
         }
-        BlurredTopBar(
+        // 玻璃顶栏（miuix 0.9.5）：渐变模糊带 + 大标题收起 + 小标题模糊过渡。
+        // `progressiveBlur` 内部会再录一层 backdrop（= 页面内容），画出「顶部实、向下渐隐」的模糊带；
+        // 高度 = (状态栏 + 折叠高度 + bottomContent + 20dp) × 1.2，不占布局。
+        GlassTopAppBar(
+            title = title,
+            // ⚠️ 必须显式传，不能让它从 scrollBehavior 推导：`isContentScrolled` 的实现是
+            // `scrollBehavior?.state?.contentOffset ?: visualContentOffset`，而 contentOffset 是
+            // 非空 Float —— 只要传了 scrollBehavior 就永远读它。我们不挂 nestedScrollConnection
+            //（见上面 LaunchedEffect 的说明），contentOffset 恒 0 ⇒ 判"没滚" ⇒ 玻璃圆钮的背景
+            // 层 alpha 恒 0（按钮只剩图标、没有玻璃底）。
+            isContentScrolled = pageScroll.value > 0,
+            largeTitle = title,
             backdrop = blurBackdrop,
-            blurActive = blurActive,
+            scrollBehavior = scrollBehavior,
+            // 有符号内容位置（向上滚为负）：collapseRamp 用 `(-offset - RampStart) / RampDistance`，
+            // 与上面 `heightOffset = -value` 同号，别传成正值。
+            visualContentOffset = { -pageScroll.value.toFloat() },
+            progressiveBlur = true,
             modifier = Modifier.align(Alignment.TopCenter),
-        ) {
-            TopAppBar(
-                modifier = Modifier.onSizeChanged { size -> if (size.height > barHeightPx) barHeightPx = size.height },
-                title = title,
-                largeTitle = title,
-                scrollBehavior = scrollBehavior,
-                // 玻璃激活时顶栏底色置透明（模糊层负责背景）；不支持的设备保持原来的不透明底色。
-                color = if (blurActive) Color.Transparent else MiuixTheme.colorScheme.surface,
-                actions = {
-                    IconButton(onClick = { haptic(); onRestartAod() }) {
-                        Icon(
-                            imageVector = MiuixIcons.Refresh,
-                            contentDescription = "重启锁屏编辑器",
-                        )
-                    }
-                },
-            )
-        }
+            // 测**前景**高度（不含背景带向外延伸的 bandOverhang）；内容头部留白靠它。
+            contentModifier = Modifier.onSizeChanged { size ->
+                if (size.height > barHeightPx) barHeightPx = size.height
+            },
+            actions = {
+                GlassIconButton(onClick = { haptic(); onRestartAod() }) {
+                    Icon(
+                        imageVector = MiuixIcons.Refresh,
+                        contentDescription = "重启锁屏编辑器",
+                    )
+                }
+            },
+        )
     }
 }
 
@@ -692,6 +683,23 @@ internal fun DetailTabHost(
     title: String,
     onBack: () -> Unit,
     onRestartAod: () -> Unit,
+    /**
+     * 把本页的玻璃录制层上报给调用方（2026-11-18）。
+     *
+     * 二级页的弹窗写在 `DetailTabHost` **外面**（`MaskDetailActivity` 的 Box 里），
+     * 读不到这里的局部变量；上报之后由调用方在更外层 provide [LocalPageBackdrop]，
+     * 弹窗与页面内深处的下拉行就都能拿到。传 null 表示运行时不支持着色器（玻璃退化）。
+     */
+    onPageBackdrop: (Backdrop?) -> Unit = {},
+    /**
+     * 浮层槽位（2026-11-18）：弹窗必须挂在这里，不能挂在 Host 外面。
+     *
+     * miuix 的 `GlassDialog` 是**同层级 overlay**（`OverlayDialog` → `DialogContentLayout`
+     * → `LocalDialogStates` → `Scaffold` 的 `MiuixPopupHost` 消费），调用点不在 Scaffold
+     * 子树里时，状态塞进的是**没人消费的默认空表**，表现为"弹窗点了没反应、也不报错"。
+     * 旧的 `WindowDialog` 是独立窗口、不受此限，换玻璃弹窗后才有了这条硬约束。
+     */
+    overlay: @Composable () -> Unit = {},
     content: @Composable () -> Unit,
 ) {
     // 收起驱动与一级页 [TabHost] 同一套（2026-10-15 修正）：只借 `MiuixScrollBehavior`
@@ -702,9 +710,10 @@ internal fun DetailTabHost(
     val haptic = rememberClickHaptic()
     // 系统返回键：先关掉二级页，而不是把应用整个退掉。
     BackHandler { onBack() }
-    // 与一级页 [TabHost] 同款（2026-10-15 顶栏均匀模糊）：内容全屏 + 顶栏浮层。
+    // 与一级页 [TabHost] 同款（2026-11-18 换成玻璃顶栏）：内容全屏 + 顶栏浮层。
     val blurBackdrop = rememberPageBlurBackdrop()
-    val blurActive = blurBackdrop != null
+    // 上报给 [MaskDetailActivity]，让写在 Host 外面的弹窗也能拿到同一份录制层。
+    SideEffect { onPageBackdrop(blurBackdrop) }
     var barHeightPx by remember { mutableIntStateOf(0) }
     val barHeight = with(LocalDensity.current) { barHeightPx.toDp() }
     // 内容滚动位置 → 顶栏收起量（1:1），与一级页 [TabHost] 同一套（原理见那里的说明）。
@@ -731,36 +740,39 @@ internal fun DetailTabHost(
                     content()
                 }
             }
-            BlurredTopBar(
+            // 与一级页同款玻璃顶栏（见 [TabHost] 里的说明），多一个返回按钮。
+            GlassTopAppBar(
+                title = title,
+                // 同 [TabHost]：必须显式传，从 scrollBehavior 推导只会拿到恒 0 的 contentOffset。
+                isContentScrolled = pageScroll.value > 0,
+                largeTitle = title,
                 backdrop = blurBackdrop,
-                blurActive = blurActive,
+                scrollBehavior = scrollBehavior,
+                visualContentOffset = { -pageScroll.value.toFloat() },
+                progressiveBlur = true,
                 modifier = Modifier.align(Alignment.TopCenter),
-            ) {
-                TopAppBar(
-                    modifier = Modifier.onSizeChanged { size -> if (size.height > barHeightPx) barHeightPx = size.height },
-                    title = title,
-                    largeTitle = title,
-                    scrollBehavior = scrollBehavior,
-                    // 玻璃激活时顶栏底色置透明（模糊层负责背景），不支持的设备保持不透明底色。
-                    color = if (blurActive) Color.Transparent else MiuixTheme.colorScheme.surface,
-                    navigationIcon = {
-                        IconButton(onClick = { haptic(); onBack() }) {
-                            Icon(
-                                imageVector = MiuixIcons.ChevronBackward,
-                                contentDescription = "返回",
-                            )
-                        }
-                    },
-                    actions = {
-                        IconButton(onClick = { haptic(); onRestartAod() }) {
-                            Icon(
-                                imageVector = MiuixIcons.Refresh,
-                                contentDescription = "重启锁屏编辑器",
-                            )
-                        }
-                    },
-                )
-            }
+                contentModifier = Modifier.onSizeChanged { size ->
+                    if (size.height > barHeightPx) barHeightPx = size.height
+                },
+                navigationIcon = {
+                    GlassIconButton(onClick = { haptic(); onBack() }) {
+                        Icon(
+                            imageVector = MiuixIcons.ChevronBackward,
+                            contentDescription = "返回",
+                        )
+                    }
+                },
+                actions = {
+                    GlassIconButton(onClick = { haptic(); onRestartAod() }) {
+                        Icon(
+                            imageVector = MiuixIcons.Refresh,
+                            contentDescription = "重启锁屏编辑器",
+                        )
+                    }
+                },
+            )
+            // 弹窗等浮层：必须在 Scaffold 子树内（本函数自带 Scaffold，见上方 KDoc）。
+            overlay()
         }
     }
 }
@@ -958,8 +970,26 @@ internal fun deviceName(context: Context): String = runCatching {
  * 2026-09-29 由 `private` 改为 `internal`：二级页（[MaskDetailActivity]）与共用的
  * [RestartDialog] 都在别的文件里用它。
  *
- * 2026-11-03 加 [danger]：**警示主题色**（`colorScheme.error` 底 + `onError` 字），
- * 给「删除此组合？」这类不可恢复的确认用；默认 false，原有调用一个字都不用改。
+ * 2026-11-03 加 [danger]：**警示档**，给「删除此组合？」这类不可恢复的确认用；
+ * 默认 false，原有调用一个字都不用改。
+ *
+ * ## 2026-11-18：换 `GlassDialogButton`（miuix 0.9.5）
+ *
+ * 弹窗外壳换成玻璃之后，原来的 `TextButton` + `textButtonColors()`（`secondaryVariant`
+ * 底 + `onSecondaryVariant` 字）在玻璃面上对比度不够，用户实测「看不清」。
+ * 改成官方的 `GlassDialogButton` —— 它的三档配色就是为 `glassDialogSurface` 调的：
+ *
+ * | 档 | 底 | 字 |
+ * | --- | --- | --- |
+ * | `Normal` | `onBackground @ 6%(浅)/14%(深)` | `onBackground @ 0.9` |
+ * | `Primary` | `primary` | `onPrimary` |
+ * | `Destructive` | 同上淡底 | **`error` 红字** |
+ *
+ * ⚠️ **`danger` 的视觉变了**（2026-11-18 用户定「以官方为准」）：旧版是 **`error` 红底 +
+ * `onError` 白字**，新版是**淡底 + 红字**。这是官方玻璃对话框的写法，视觉更轻。
+ *
+ * 函数签名与 `RowScope` 扩展不变 ⇒ 28 个调用点零改动；`weight(1f)` 保留在内部，
+ * 外层的 `Row(SpaceBetween)` 照旧平分。
  */
 @Composable
 internal fun RowScope.TextButtonLike(
@@ -968,20 +998,22 @@ internal fun RowScope.TextButtonLike(
     danger: Boolean = false,
     onClick: () -> Unit,
 ) {
-    // 两个弹窗的四个按钮都从这里出，振动统一加在这一层。
+    // 所有弹窗的按钮都从这里出，振动统一加在这一层。
     val haptic = rememberClickHaptic()
-    TextButton(
-        text = text,
+    // 用 miuix 的 Button 而不是 GlassDialogButton：前者走 squircleSurface + LocalIndication，
+    // 有平滑圆角与按压过渡；后者是 RoundedCornerShape + 瞬时按压遮罩（实测"突然"）。
+    // 配色直接借官方玻璃按钮那一套（返回的就是 basic 的 ButtonColors）。
+    Button(
         onClick = { haptic(); onClick() },
         modifier = Modifier.weight(1f),
-        colors = when {
-            danger -> ButtonDefaults.textButtonColorsPrimary(
-                color = MiuixTheme.colorScheme.error,
-                // ⚠️ 第二个参数叫 `textColor`，不是 `contentColor`（《07》里那条坑，MaskTabs L155 也有注记）。
-                textColor = MiuixTheme.colorScheme.onError,
-            )
-            primary -> ButtonDefaults.textButtonColorsPrimary()
-            else -> ButtonDefaults.textButtonColors()
-        },
-    )
+        colors = GlassDialogButtonDefaults.buttonColors(
+            when {
+                danger -> GlassDialogButtonRole.Destructive
+                primary -> GlassDialogButtonRole.Primary
+                else -> GlassDialogButtonRole.Normal
+            },
+        ),
+    ) {
+        Text(text = text, style = MiuixTheme.textStyles.button)
+    }
 }
