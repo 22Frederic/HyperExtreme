@@ -606,6 +606,86 @@ internal object ParallaxBg {
     private const val METHOD_APPLY_ELEMENT_BLEND = "applyElementViewBlend"
     private const val M_DISABLE_CONTAIN_BELOW = "disableMiBackgroundContainBelow"
 
+    /**
+     * **永远不翻**的 View —— 通知面板 / 控制中心（2026-11-20 用户报 bug）。
+     *
+     * 直板机上 `ShadeBlendBlurController` 的 `case 10`（订阅 `isFlipScreen=false`）会对
+     * `notificationPanelView` 调 `disableMiBackgroundContainBelow(true)`（禁止包含窗口内下方）。
+     * 被我们翻成"允许"后，整个通知面板窗口（含亮度条 mirror 的 `R.id.blur_provider`
+     * / `BlurProviderView`）的模糊从 SF **实时窗口模糊**降级成「捕获窗口内下方」的**捕获式模糊** ——
+     * 捕获不逐帧，控制中心滑亮度条进预览态时柔光玻璃的"逐渐变深"就变成硬切。
+     *
+     * 反编译核对：`com.miui.systemui.shade.blur.ShadeBlendBlurController#BlurProvider` 构造时
+     * 对 `shadeWindowView` / `notificationPanelView` / `controlCenterContainer` 各调一次 `(false)`；
+     * 之后 `case 10` 在直板机上把 `notificationPanelView` 改回 `(true)` —— 那才是系统要的终态。
+     */
+    private val CONTAIN_BELOW_BLOCKED = arrayOf(
+        "com.android.systemui.shade.NotificationShadeWindowView",
+        "com.android.systemui.shade.NotificationPanelView",
+    )
+
+    /** 控制中心的容器（`controlCenterContainer`）按包前缀整片排除。 */
+    private const val CONTAIN_BELOW_BLOCKED_PREFIX = "com.miui.systemui.controlcenter."
+
+    private fun containBelowBlocked(view: View): Boolean {
+        val name = view.javaClass.name
+        if (name.startsWith(CONTAIN_BELOW_BLOCKED_PREFIX)) return true
+        return CONTAIN_BELOW_BLOCKED.any { name == it }
+    }
+
+    /**
+     * 「视差壁纸正在运行」—— 玻璃包含实验的唯一闸门。
+     *
+     * 顺序：内存里的最新配置（`config` 是 `@Volatile`，前后台都可能写）→ 远程偏好兜底。
+     * 读不到一律当"没在跑"⇒ **不碰系统**，与"没开功能就完全不影响系统"的纪律一致。
+     *
+     * ⚠️ 不能只看 `backdropRef` 是否在树上：系统只在**配置时**调一次
+     * `disableMiBackgroundContainBelow(true)`（`MiuiBlurUtils` / `LockScreenInfoLayout` /
+     * `ShadeBlendBlurController.start()`），那一刻背景层通常还没插进树 ——
+     * 用"层在树上"当闸门会把启动那一次永远漏掉，玻璃进样直接失效。
+     */
+    private fun parallaxRunning(): Boolean {
+        config?.let { return it.active }
+        return HookRuntime.remoteBoolean(MaskPrefs.KEY_PARALLAX_ACTIVE) == true
+    }
+
+    /** 视差没在跑时被拒翻的 View（弱引用、去重、上限 32）—— 等 [retryDeniedContainBelow] 补翻。 */
+    private val deniedContainBelow =
+        java.util.Collections.synchronizedList(ArrayList<WeakReference<View>>(8))
+
+    private fun rememberDenied(view: View) {
+        synchronized(deniedContainBelow) {
+            if (deniedContainBelow.size >= 32) return
+            if (deniedContainBelow.any { it.get() === view }) return
+            deniedContainBelow.add(WeakReference(view))
+        }
+    }
+
+    /**
+     * **补翻**：视差从"没开"变成"在跑"时，把系统启动阶段被闸门拒掉的 View 再翻一遍。
+     *
+     * 不加这一步的话，用户在模块里点「立即替换」后系统不会重新调
+     * `disableMiBackgroundContainBelow(true)`，玻璃进样就永远缺失（A 方案要保的功能）。
+     * 只在主线程调用（`applyState` 里），失败只记日志。
+     */
+    private fun retryDeniedContainBelow() {
+        if (deniedContainBelow.isEmpty()) return
+        var flipped = 0
+        synchronized(deniedContainBelow) {
+            val iter = deniedContainBelow.iterator()
+            while (iter.hasNext()) {
+                val view = iter.next().get()
+                iter.remove()
+                if (view == null || !view.isAttachedToWindow) continue
+                if (containBelowBlocked(view)) continue
+                runCatching { allowContainBelow(view) }.onSuccess { flipped++ }
+            }
+        }
+        if (flipped > 0) {
+            HookRuntime.log("玻璃包含实验：视差已运行 → 补翻 $flipped 个当时被拒的视图")
+        }
+    }
+
     private fun installGlassContainExperiment(module: XposedModule, loader: ClassLoader): Boolean {
         if (!EXPERIMENT_CONTAIN_BELOW) return true
         val flipOk = installContainBelowFlip(module, loader)
@@ -621,12 +701,28 @@ internal object ParallaxBg {
             override fun intercept(chain: XposedInterface.Chain): Any? {
                 val result = chain.proceed()
                 runCatching {
-                    if (chain.getArgs().firstOrNull() as? Boolean == true) {
-                        val view = chain.getThisObject() as? View ?: return@runCatching
-                        allowContainBelow(view)
-                        val caller = callerHint()
-                        logOnce("cb-flip-$caller", "玻璃包含实验：已翻转 禁止→允许（$caller）")
+                    if (chain.getArgs().firstOrNull() as? Boolean != true) return@runCatching
+                    val view = chain.getThisObject() as? View ?: return@runCatching
+                    // 通知面板 / 控制中心：**永远不动**（2026-11-20，亮度条柔光玻璃硬切）。
+                    if (containBelowBlocked(view)) {
+                        logOnce(
+                            "cb-block-${view.javaClass.simpleName}",
+                            "玻璃包含实验：跳过 ${view.javaClass.simpleName}（通知面板 / 控制中心黑名单）",
+                        )
+                        return@runCatching
                     }
+                    // 闸门：视差没在跑就完全不碰系统；记下来等它开起来再补翻。
+                    if (!parallaxRunning()) {
+                        rememberDenied(view)
+                        logOnce(
+                            "cb-gate-${view.javaClass.simpleName}",
+                            "玻璃包含实验：视差未运行 → 不翻 ${view.javaClass.simpleName}",
+                        )
+                        return@runCatching
+                    }
+                    allowContainBelow(view)
+                    val caller = callerHint()
+                    logOnce("cb-flip-$caller", "玻璃包含实验：已翻转 禁止→允许（$caller）")
                 }.onFailure { HookRuntime.log("玻璃包含实验：翻转异常：$it") }
                 return result
             }
@@ -651,13 +747,16 @@ internal object ParallaxBg {
                         val result = chain.proceed()
                         runCatching {
                             val target = chain.getArgs().filterIsInstance<View>().firstOrNull()
-                            if (target != null) {
-                                allowContainBelow(target)
-                                logOnce(
-                                    "cb-blend-${target.javaClass.simpleName}",
-                                    "玻璃包含实验：已补允许包含（${target.javaClass.simpleName}）",
-                                )
-                            }
+                                ?: return@runCatching
+                            if (containBelowBlocked(target)) return@runCatching
+                            // 闸门同上：视差没在跑就一点都不碰（这条**不**记进 denied ——
+                            // 通知/媒体元素会被高频创建，列表会白涨；它们下次展开时会再调一次）。
+                            if (!parallaxRunning()) return@runCatching
+                            allowContainBelow(target)
+                            logOnce(
+                                "cb-blend-${target.javaClass.simpleName}",
+                                "玻璃包含实验：已补允许包含（${target.javaClass.simpleName}）",
+                            )
                         }.onFailure { HookRuntime.log("玻璃包含实验：补刀异常：$it") }
                         return result
                     }
@@ -1290,6 +1389,8 @@ internal object ParallaxBg {
             applyImageAsync(context, view, config.revision)
             syncParallax(context)
             ensureSensor(context)
+            // 玻璃包含实验：系统启动时视差可能还没开（闸门拒翻），现在真跑起来了 → 补翻一遍。
+            retryDeniedContainBelow()
             // 视图重建（SystemUI 重启 / 配置变化）后把系统当前的连续模糊比例补上，别丢状态。
             applyBlurToBackdrop(lastBlurRatio)
             if (lastShownLogged != true) {

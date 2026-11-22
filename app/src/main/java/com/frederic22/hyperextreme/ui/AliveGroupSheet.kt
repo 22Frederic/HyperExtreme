@@ -594,30 +594,25 @@ internal fun AliveGroupSheet(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    TextButton(
+                    // 与光栅 / 遮罩页的尺寸弹窗逐字一致：统一走 [TextButtonLike]
+                    // （miuix TextButton + textButtonColors 会渲染成"取消纯文字 / 确定灰底"的错位观感）。
+                    TextButtonLike(
                         text = "取消",
                         onClick = {
                             pendingMask = null
                             dismissState?.invoke()
                         },
-                        // 玻璃弹窗：与 TextButtonLike 同源的 tonal 配色。
-                        colors = ButtonDefaults.textButtonColors(
-                            color = rememberGlassCardSurface(),
-                            textColor = MiuixTheme.colorScheme.onBackground,
-                        ),
                     )
-                    TextButton(
+                    Spacer(Modifier.width(20.dp))
+                    TextButtonLike(
                         text = "确定",
+                        primary = true,
                         onClick = {
                             val p = pm
                             pendingMask = null
                             dismissState?.invoke()
                             if (p != null) applyDepth(p.second, p.third.kind)
                         },
-                        colors = ButtonDefaults.textButtonColors(
-                            color = rememberGlassCardSurface(),
-                            textColor = MiuixTheme.colorScheme.onBackground,
-                        ),
                     )
                 }
             }

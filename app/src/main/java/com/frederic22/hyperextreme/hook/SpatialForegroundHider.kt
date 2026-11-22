@@ -2,7 +2,9 @@ package com.frederic22.hyperextreme.hook
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
+import android.view.ViewGroup
 import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.data.SpatialFlag
 import io.github.libxposed.api.XposedInterface
@@ -60,6 +62,9 @@ internal object SpatialForegroundHider {
     private const val CLS_PANEL = "com.android.keyguard.panel.KeyguardPanelViewController"
     private const val METHOD = "updateKeyguardElementsVisibility"
     private const val FIELD_FOREGROUND = "keyguardForegroundLayer"
+
+    /** 自检周期：2s。只比引用，开销可忽略。 */
+    private const val SELF_CHECK_MS = 2_000L
 
     /** 同一条日志只打一次（`updateKeyguardElementsVisibility` 调用很频繁）。 */
     private val logged = ConcurrentHashMap<String, Boolean>()
@@ -168,11 +173,39 @@ internal object SpatialForegroundHider {
             KeyguardContentGate.install(module, loader)
             if (!contentGateInstalled) {
                 contentGateInstalled = true
-                KeyguardContentGate.addListener { _, _ ->
+                KeyguardContentGate.addListener { _, now ->
                     SpatialOverlay.onContentGateChanged()
                     RasterOverlay.onContentGateChanged()
                     AliveOverlay.onContentGateChanged()
+                    // **回锁屏时主动补挂**（2026-11-22 用户报：连续快速「桌面 → 黑屏 → 锁屏」
+                    // 后三条链的景深主体层都不显示）。机制：锁屏前景层随锁屏树重建，我们的
+                    // `SubjectView` 随旧层销毁、系统那个 `deducted_image_view` 却仍是"已摘"态；
+                    // 而重新挂载的唯一入口 `updateKeyguardElementsVisibility` 在快速切态时
+                    // 可能只调一次、且在层还是 INVISIBLE 的时候 ⇒ `handle` 早退后无人补。
+                    // 这里派两次：下一帧（本次状态分发的布局走完）+ 200ms（锁屏树重建完）。
+                    if (now == KeyguardContentGate.STATE_KEYGUARD ||
+                        now == KeyguardContentGate.STATE_SHADE_LOCKED
+                    ) {
+                        mainHandler.post { runCatching { refresh() } }
+                        mainHandler.postDelayed({ runCatching { refresh() } }, 200L)
+                        // **把主体 alpha 抬回来**（2026-11-22 根因）：快速「桌面 → 黑屏 → 锁屏」时，
+                        // 灭屏那一刻 `doWallpaperBlackAnim(show=false)` 会把主体淡到 0
+                        // （`*Overlay.onEnterAod`），而亮屏回来的 `show=true` 可能整次调用被系统跳过
+                        // ⇒ 没人抬。真机日志：`onDraw … allowed=true shown=true a=0.00`，
+                        // 位图 / 尺寸 / 闸门全正常，只有 alpha 是 0。
+                        // 只在**屏幕真的亮着**时抬：AOD 里 `isInteractive=false`，绝不能抬。
+                        // 三条链一起（Alive 虽然强制 AOD 才用，但逻辑保持同步，避免下次又漏）。
+                        mainHandler.postDelayed({
+                            runCatching {
+                                if (!screenInteractive()) return@runCatching
+                                SpatialOverlay.resetAlpha()
+                                RasterOverlay.resetAlpha()
+                                AliveOverlay.resetAlpha()
+                            }
+                        }, 200L)
+                    }
                 }
+                startSelfCheck()
             }
             // MC 共存：音乐屏状态一变就重算一次（不能等下一次 hook 触发）
             if (!coexistHookInstalled) {
@@ -242,8 +275,7 @@ internal object SpatialForegroundHider {
         // 把壁纸 leash 预放大到 1.05，AGSL 主体要跟着；自定义模式下 leash 是 1.0。
         // 放在 visibility 检查之前 —— 层不可见时也要把模式记下来。
         runCatching { syncLeashScale(self) }
-        val field = self.javaClass.getDeclaredField(FIELD_FOREGROUND).apply { isAccessible = true }
-        val layer = field.get(self) as? android.view.ViewGroup ?: return
+        val layer = readForeground(self) ?: return
         lastSelf = self
         // ⚠️ 顺序很关键（2026-11-14）：这一层平时被我们压成 INVISIBLE，
         // 若把 MC 封面判断放在下面的 visibility 闸门之后，封面出现时闸门直接 return
@@ -265,7 +297,11 @@ internal object SpatialForegroundHider {
             }
             return
         }
-        if (layer.visibility != View.VISIBLE) return
+        if (layer.visibility != View.VISIBLE) {
+            // 系统可能"先调方法、后设可见"（快速切态时尤其明显）⇒ 隔一拍再试，别永久放弃。
+            retryHandleLater(self)
+            return
+        }
 
         if (SpatialOverlay.active() || RasterOverlay.active()) {
             // 新链：我们的主体顶替系统主体 ⇒ 把系统那个 ImageView **从父容器摘掉**（问题 2：
@@ -316,6 +352,91 @@ internal object SpatialForegroundHider {
             }
         }
     }
+
+    /** 反射取 `keyguardForegroundLayer`（层会被锁屏树重建，别缓存）。 */
+    private fun readForeground(self: Any): ViewGroup? = runCatching {
+        self.javaClass.getDeclaredField(FIELD_FOREGROUND).apply { isAccessible = true }
+            .get(self) as? ViewGroup
+    }.getOrNull()
+
+    /** `handle` 早退的重试计数（1s 内最多 2 次，避免高频方法刷屏）。 */
+    @Volatile private var retryCount = 0
+
+    @Volatile private var lastRetryAt = 0L
+
+    /**
+     * 层还不可见时的延迟重试（2026-11-22）。
+     *
+     * `handle` 只由 `updateKeyguardElementsVisibility` 触发，而系统可能是"先调方法、后设可见"
+     * —— 尤其是快速「桌面 → 黑屏 → 锁屏」、锁屏树正在重建的那几帧。早退就永久放弃的话，
+     * 主体层会一直不显示（用户 2026-11-22 报）。
+     */
+    private fun retryHandleLater(self: Any) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRetryAt > 1000L) retryCount = 0
+        if (retryCount >= 2) return
+        retryCount++
+        lastRetryAt = now
+        mainHandler.postDelayed({
+            runCatching {
+                if (readForeground(self)?.visibility == View.VISIBLE) {
+                    retryCount = 0
+                    handle(self)
+                }
+            }
+        }, 80L)
+    }
+
+    /** 2s 自检只启动一次。 */
+    private var selfCheckStarted = false
+
+    /**
+     * 低频自检（2026-11-22）—— 兜「系统彻底不再调 `updateKeyguardElementsVisibility`」。
+     *
+     * 判据：锁屏态 + 层 VISIBLE + 当前在跑的链的主体 View 不在层里 ⇒ 补一次 [refresh]。
+     * 2s 一次、只比引用，开销可忽略；桌面态 / 层不可见时直接返回。
+     */
+    private fun startSelfCheck() {
+        if (selfCheckStarted) return
+        selfCheckStarted = true
+        val tick = object : Runnable {
+            override fun run() {
+                runCatching { selfCheckOnce() }
+                mainHandler.postDelayed(this, SELF_CHECK_MS)
+            }
+        }
+        mainHandler.postDelayed(tick, SELF_CHECK_MS)
+    }
+
+    private fun selfCheckOnce() {
+        val self = lastSelf ?: return
+        if (!enabled()) return
+        val s = KeyguardContentGate.state
+        if (s != KeyguardContentGate.STATE_KEYGUARD && s != KeyguardContentGate.STATE_SHADE_LOCKED) return
+        val layer = readForeground(self) ?: return
+        if (layer.visibility != View.VISIBLE) return
+        val expected = when {
+            SpatialOverlay.active() -> SpatialOverlay.attachedView()
+            RasterOverlay.active() -> RasterOverlay.attachedView()
+            aliveDepthOn -> AliveOverlay.attachedView()
+            else -> return
+        }
+        if (expected != null && expected.parent === layer) return
+        log("自检：锁屏态但主体 View 不在前景层 → 重新挂载")
+        refresh()
+    }
+
+    /**
+     * 屏幕是否真的亮着（非 AOD / 非灭屏）。
+     *
+     * AOD 时 `PowerManager.isInteractive` 是 false —— 这正是「不能把主体抬到 AOD 上」的判据。
+     * 拿不到 Context 时按 true 处理（宁可抬，不可漏）。
+     */
+    private fun screenInteractive(): Boolean = runCatching {
+        val app = HookRuntime.appContext() ?: return@runCatching true
+        (app.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager)
+            .isInteractive
+    }.getOrDefault(true)
 
     private fun logOnce() {
         if (logged.putIfAbsent("hidden", true) == null) {

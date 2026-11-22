@@ -62,6 +62,11 @@ internal object AliveGlCore {
      * 值 = `0.5 − 时钟中心的屏幕比例`。实测「锁屏联动息屏」的 `LinkageClock`
      * 时钟块中心在屏幕 0.2665 处 ⇒ 这里应约 0.2335。
      * 由 `AodClockProbe` 在每次 AOD 布局后写入；读不到就是 [AOD_Y]。
+     *
+     * ⚠️ **2026-11-22 起球心不再读它**（用户报「每次进 AOD 先在一个位置、120ms 后瞬移到
+     * 另一个位置」，见《07》§7.20）：[stateFor] 固定用 [AOD_Y]。
+     * 探针与 `onAodClockYChanged()` 都保留着（AOD 宿主识别还靠 `AodClockProbe.isCandidate`），
+     * 将来若要做"稳定后一次性对齐 + 补间"，把 [stateFor] 改回读这里即可。
      */
     @Volatile
     var aodCenterY: Float = AOD_Y
@@ -128,7 +133,7 @@ internal object AliveGlCore {
         0 -> LensState(
             blur = AOD_BLUR, scale = AOD_SCALE, distortion = AOD_DISTORTION,
             decorAlpha = AOD_DECOR_ALPHA, decorAngle = 0f,
-            x = AOD_X, y = aodCenterY, speed = AOD_SPEED, ripple = 0f,
+            x = AOD_X, y = AOD_Y, speed = AOD_SPEED, ripple = 0f,
             angle = Float.NaN,
         )
         1 -> LensState(

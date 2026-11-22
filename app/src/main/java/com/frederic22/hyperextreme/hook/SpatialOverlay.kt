@@ -194,6 +194,9 @@ internal object SpatialOverlay {
         return "att=${v.isAttachedToWindow} vis=${v.visibility} a=${"%.2f".format(v.alpha)}"
     }
 
+    /** 自检用（2026-11-22）：插进前景层的那个 View（没建 / 已 detach 就是 null）。 */
+    internal fun attachedView(): View? = view?.takeIf { it.isAttachedToWindow }
+
     // ───────────────── 解锁退场（2026-10-30，v1.5.74，问题一）─────────────────
     //
     // ## 为什么主体必须自己淡出

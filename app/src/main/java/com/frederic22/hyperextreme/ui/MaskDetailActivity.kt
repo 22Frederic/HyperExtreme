@@ -300,9 +300,12 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                     lastPendingImport?.let { pending ->
                         AppGlassDialog(
                             title = "尺寸与壁纸不一致",
-                            summary = "所选图片 ${pending.imageSize.first}×${pending.imageSize.second}，" +
+                            // 与光栅 / Alive 同一口径：名字跟着探测结果走（`MaskRole.SUBJECT.title`
+                            // = 主体、`SUBJECT_MASK.title` = 遮罩），不再写死"图片 / 抠像"。
+                            summary = "所选${pending.role.title} " +
+                                "${pending.imageSize.first}×${pending.imageSize.second}，" +
                                 "壁纸 ${pending.wallpaperSize.first}×${pending.wallpaperSize.second}。\n" +
-                                "尺寸不一致时抠像可能错位。仍要继续吗？",
+                                "尺寸不一致时${pending.role.title}可能错位。仍要继续吗？",
                             show = pendingImport != null,
                             onDismissRequest = { pendingImport = null },
                         ) {

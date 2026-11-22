@@ -59,6 +59,15 @@ import kotlin.math.abs
 internal object AliveRenderer {
 
     private const val TAG = "ALIVE"
+
+    /**
+     * AOD 球心是否跟随 AOD 时钟（`AodClockProbe`）。
+     *
+     * **2026-11-22 置 false**（用户拍板）：LinkageClock 下球心会从默认 35% 瞬移到时钟中心
+     * 26.65%，差 8.35% 屏高。探针与 [AliveGlCore.aodCenterY] 都保留，改回 true + 恢复
+     * [AliveGlCore.stateFor] 读 `aodCenterY` 即可重新启用。
+     */
+    private const val AOD_CLOCK_FOLLOW = false
     private const val AUTHORITY = "com.frederic22.hyperextreme.provider"
 
     /**
@@ -1188,6 +1197,11 @@ internal object AliveRenderer {
      * `stateFor(0)` 已经拿到新值；这条只是兜住「测量晚于进入」的那一次。
      */
     fun onAodClockYChanged() {
+        // ⚠️ **2026-11-22 停用**（用户拍板 A，见《07》§7.20）：AOD 球心固定 `AOD_Y`，
+        //    不再跟随时钟。上一版只改了 `stateFor(0)`、漏了这里 —— 探针第一次量到值仍会把
+        //    `lens.y` 拉过去，表现就是「切锁屏样式后第一次进 AOD 还跟时钟、第二次才正常」。
+        //    恢复方式：删掉这一行闸 + `AliveGlCore.stateFor(0)` 改回读 `aodCenterY`。
+        if (!AOD_CLOCK_FOLLOW) return
         handler?.post {
             if (runningKey == null) return@post
             if (!aodActive || mode != 0) return@post

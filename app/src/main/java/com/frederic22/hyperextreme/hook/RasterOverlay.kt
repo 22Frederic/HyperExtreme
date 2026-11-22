@@ -515,6 +515,9 @@ internal object RasterOverlay {
         mainHandler.post { runCatching { v.invalidate() } }
     }
 
+    /** 自检用（2026-11-22）：插进前景层的那个 View（没建 / 已 detach 就是 null）。 */
+    internal fun attachedView(): View? = view?.takeIf { it.isAttachedToWindow }
+
     fun onDisabled() = onDisabled(keepBitmaps = false)
 
     /**

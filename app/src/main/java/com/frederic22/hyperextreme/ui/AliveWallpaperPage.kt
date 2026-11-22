@@ -68,7 +68,7 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * ## 页面结构（四块，自上而下）
  *
  * 1. **卡片流** —— 与光栅同一套 [CoverCarousel]，一张卡 = 一张照片，最左边是「新建」；
- * 2. **主按钮** —— 三态（无服务模式：`新图片` / `应用` / `取消应用`）；
+ * 2. **主按钮** —— 三态（无服务模式：`新组合` / `应用` / `取消应用`）；
  * 3. **参数占位卡** —— 用户 2026-11-07 明确「下面那些选项就改成一个卡片，内容占位就行」；
  * 4. **清除所有Alive壁纸组合** —— 红字危险卡 + 二次确认 + 卡片流清除动画（照光栅）。
  *
@@ -380,7 +380,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
         Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
             val isActive = selected != null && selected.id == activeId
             val label = when {
-                selected == null -> "新图片"
+                selected == null -> "新组合"
                 isActive -> "取消应用"
                 else -> "应用"
             }
