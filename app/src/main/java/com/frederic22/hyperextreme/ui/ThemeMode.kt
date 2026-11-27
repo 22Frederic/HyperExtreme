@@ -8,7 +8,7 @@ import top.yukonga.miuix.kmp.theme.ThemeController
 import top.yukonga.miuix.kmp.theme.lightColorScheme
 import top.yukonga.miuix.kmp.theme.platformDynamicColors
 
-/** 界面配色模式。深浅色切换；是否额外用系统的 Monet 动态色由「启用Monet颜色」开关决定。 */
+/** 界面配色模式。深浅色切换；是否额外用系统的 Monet 动态色由「Monet颜色」开关决定。 */
 enum class ThemeMode(val id: String, val label: String) {
     SYSTEM("system", "跟随系统"),
     LIGHT("light", "浅色"),

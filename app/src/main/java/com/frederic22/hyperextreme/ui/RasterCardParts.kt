@@ -3,6 +3,8 @@ package com.frederic22.hyperextreme.ui
 import android.graphics.Bitmap
 import android.graphics.RectF
 import android.util.Size
+import android.view.RoundedCorner
+import android.view.View
 import android.view.WindowManager
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -46,6 +48,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
@@ -154,6 +157,60 @@ internal fun rememberScreenSizePx(): Size {
             with(density) {
                 Size(cfg.screenWidthDp.dp.roundToPx(), cfg.screenHeightDp.dp.roundToPx())
             }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ 圆角
+
+/**
+ * 屏幕物理圆角（px）——**卡片圆角 = 它 × 卡宽比**（2026-11-27）。
+ *
+ * ## 为什么不是固定比例
+ *
+ * 之前 `CARD_RADIUS_RATIO = 0.136`（卡宽 × 比例）是个经验值，换台圆角不同的设备就对不上：
+ * 卡片是「缩小的一屏」，圆角必须等比跟着屏幕走。小米锁屏编辑也是这么做的
+ * （`CombineEditView` 的圆角动画直接用 `deviceUtil.screenRadii()`）。
+ *
+ * ## API
+ *
+ * `Display.getRoundedCorner(int)` / `RoundedCorner.getRadius()` 都是 **API 31 公开接口，
+ * 不需要任何权限**（minSdk 正好 33），返回物理像素。
+ * 取四角里**非 0 的最小值**：折叠屏 / 异形屏四角可能不同，取小的更保守；
+ * 全为 0（无圆角设备 / 厂商没上报）⇒ 调用方退回 [CARD_RADIUS_RATIO]。
+ *
+ * 本机实测：四角都是 134px（44.7dp @3.0），与 `dumpsys display` 的 `roundedCorners` 一致。
+ */
+internal fun screenCornerRadiusPx(view: View): Float {
+    val display = view.display ?: return 0f
+    var best = 0f
+    for (pos in intArrayOf(
+        RoundedCorner.POSITION_TOP_LEFT,
+        RoundedCorner.POSITION_TOP_RIGHT,
+        RoundedCorner.POSITION_BOTTOM_RIGHT,
+        RoundedCorner.POSITION_BOTTOM_LEFT,
+    )) {
+        val r = runCatching { display.getRoundedCorner(pos)?.radius ?: 0 }.getOrDefault(0)
+        if (r > 0 && (best == 0f || r < best)) best = r.toFloat()
+    }
+    return best
+}
+
+/**
+ * 卡片的圆角（px）= 屏幕圆角 × (卡宽 ÷ 屏宽)。
+ *
+ * 卡片流 / 浮页槽位 / 锁屏遮罩 / 视差页 / 预览卡**全部走这里**，几何口径唯一。
+ * 屏幕圆角拿不到时退回旧口径（[CARD_RADIUS_RATIO]），保证任何设备都有圆角。
+ */
+@Composable
+internal fun rememberCardRadiusPx(cardWidthPx: Float, screenWidthPx: Float): Float {
+    val view = LocalView.current
+    return remember(view, cardWidthPx, screenWidthPx) {
+        val corner = screenCornerRadiusPx(view)
+        if (corner > 0f && screenWidthPx > 0f) {
+            corner * (cardWidthPx / screenWidthPx)
+        } else {
+            cardWidthPx * CARD_RADIUS_RATIO
         }
     }
 }

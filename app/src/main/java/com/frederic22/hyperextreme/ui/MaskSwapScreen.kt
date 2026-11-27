@@ -16,7 +16,12 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -25,6 +30,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerDefaults
@@ -49,17 +55,26 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.Dp
 import top.yukonga.miuix.kmp.blur.Backdrop
+import top.yukonga.miuix.kmp.blur.BlendColorEntry
+import top.yukonga.miuix.kmp.blur.BlurDefaults
 import top.yukonga.miuix.kmp.blur.LayerBackdrop
 import top.yukonga.miuix.kmp.material.isRuntimeShaderSupported
 import top.yukonga.miuix.kmp.blur.layerBackdrop
+import top.yukonga.miuix.kmp.blur.progressiveTextureBlur
+import top.yukonga.miuix.kmp.blur.ProgressiveBlur
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -72,6 +87,7 @@ import com.frederic22.hyperextreme.data.MaskPrefs
 import com.frederic22.hyperextreme.ui.icons.CheckCircleOutlineIcon
 import com.frederic22.hyperextreme.ui.icons.ErrorOutlineIcon
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
@@ -81,6 +97,8 @@ import top.yukonga.miuix.kmp.glass.GlassIconButton
 import top.yukonga.miuix.kmp.glass.GlassNavigationBar
 import top.yukonga.miuix.kmp.glass.GlassNavigationItem
 import top.yukonga.miuix.kmp.glass.GlassTopAppBar
+import top.yukonga.miuix.kmp.glass.GlassTopAppBarDefaults
+import top.yukonga.miuix.kmp.glass.GlassMotion
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Checkbox
@@ -111,13 +129,21 @@ import top.yukonga.miuix.kmp.utils.pagerGestureOverride
 private const val ActivationAlertDelayMs = 3000L
 
 /**
- * 页面底部的"渐隐纱"（2026-10-04 用户要求）：从屏幕底向上 **290px**（@3x = 96.7dp）线性渐隐 ——
- * 底部 alpha = [BottomFadeAlpha]（0.85），到顶端为 0；浅色用白色、深色用黑色。
+ * 页面底部的"渐隐纱"（2026-10-04 用户要求；2026-11-25 改为**渐变模糊**）：
+ * 从屏幕底向上 **[BottomFadeHeight]（75dp，固定值）**，模糊强度线性递减 —— 底部满、顶端为 0
+ *（`ProgressiveBlur.Bottom`）。高度曾短暂改成「与顶栏那条带等长」（顶栏镜像），2026-11-25 用户回退。
  *
- * 放在页面录制层（`layerBackdrop`）**内**：底栏玻璃采样到的背景也会包含它（用户选 A）；
- * 绘制顺序 = 页面内容 → 这层纱 → 底栏阴影 → 底栏玻璃，即"在底栏（含阴影）的下层"。
+ * 位置（2026-11-25 搬进 [TabHost] 后）：内容录制层（`layerBackdrop`）**外面**、顶栏与底栏之间 ——
+ * 采样 `blurBackdrop`（只含内容）才不会被自己录进去；底栏玻璃那层 `backdrop` 仍包含它，观感不变。
+ *
+ * ⚠️ **半径 80dp、curve 0.25 —— 与顶栏那条带完全同档**（2026-11-25 定）。
+ * 之前试过 80 / 64 / 50 一路往下调都没止住闪烁，说明问题不在半径本身（`computeProgressiveEdgePadding`
+ * 的 padding 是确定性的）—— 见 [TabHost] 里 `bottomFade` 分支的说明：整套参数与结构（graphicsLayer /
+ * curve / colors / scrim）已按 `GlassTopAppBar` 搬过来。
  */
-private val BottomFadeHeight = 96.7.dp
+private val BottomFadeHeight = 75.dp
+
+/** 纯色遮罩降级路径（不支持着色器）里底部那一端的透明度。 */
 private const val BottomFadeAlpha = 0.85f
 
 /**
@@ -126,7 +152,12 @@ private const val BottomFadeAlpha = 0.85f
  * 二级页是**盖住底栏**的全屏页（用户指定），所以它们不占 [Tab] 的位置。
  * 见 [FunctionHome] / [MaskReplaceDetail] / [SystemUiDetail]。
  */
-internal enum class DetailPage { MaskReplace, ParallaxBg, SpatialWallpaper, RasterWallpaper, AliveWallpaper, SystemUi }
+internal enum class DetailPage {
+    MaskReplace, ParallaxBg, SpatialWallpaper, RasterWallpaper, AliveWallpaper, SystemUi,
+
+    /** 第三方许可证列表（2026-11-24：从关于页拆出来的二级页，每条许可一个 Card）。 */
+    Licenses,
+}
 
 // 二级页（[DetailPage]）的转场**不归本文件管**：它现在是独立 Activity（[MaskDetailActivity]），
 // 转场由**系统的 Activity 动画**负责 —— 为什么必须如此、以及为什么不在这里复刻，见那个类的注释。
@@ -147,7 +178,7 @@ fun MaskSwapApp(onDarkModeChange: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val prefs = remember { MaskPrefs(context) }
     var themeMode by remember { mutableStateOf(ThemeMode.of(prefs.themeMode)) }
-    // 「启用Monet颜色」（2026-11-07）：状态提到这一层，因为换配色必须**换 ThemeController 实例**
+    // 「Monet颜色」（2026-11-07）：状态提到这一层，因为换配色必须**换 ThemeController 实例**
     //（它的 lightColors / darkColors 都是 val）。真正的换实例逻辑在 [rememberThemeController]。
     var monetColor by remember { mutableStateOf(prefs.monetColor) }
     val controller = rememberThemeController(themeMode, monetColor)
@@ -303,13 +334,40 @@ private fun MaskSwapShell(
                         beyondViewportPageCount = 1,
                     ) { page ->
                         val tab = Tab.entries[page]
-                        TabHost(title = tab.label, onRestartAod = { askRestartAod = true }) {
+                        TabHost(
+                            title = tab.label,
+                            onRestartAod = { askRestartAod = true },
+                            // 关于页照 miuix demo：顶栏不展开大标题（body 用 logo 当大标题），
+                            // 顶栏小标题在 logo 区滚过 35% 之后才浮现。
+                            expandable = tab != Tab.About,
+                            titleFadeDistance = if (tab == Tab.About) 220.dp else null,
+                            // 主页：无滚动 ⇒ 顶栏三项全钉死（无标题 / 玻璃钮常驻 / 模糊带常驻）。
+                            chromeAlwaysOn = tab == Tab.Home,
+                            // 主页不画底部渐隐纱（它自己那条整片模糊已覆盖底部），其余三页保留。
+                            //
+                            // 2026-11-25 归因实验结论（用户实测）：功能页 ↔ 设置页的切页掉帧
+                            // **确实来自这条** `progressiveTextureBlur`（1070039 给所有非主页
+                            // 新增的唯一一项每帧成本）。用户决定保留视觉，改为跟进 miuix 0.9.5-rc01
+                            // 的模糊管线优化（1D 着色器特化 / 只在最终 pass 反预乘 / 跳过零模糊层
+                            // / 避免渐进模糊自失效循环）来抵这笔开销。
+                            bottomFade = tab != Tab.Home,
+                        ) {
                             when (tab) {
                                 // 主页（2026-10-29：状态卡搬回最上面、「去选图替换」按钮已删；
                                 // 2026-11-08：「当前运行」卡可直点进二级页 ⇒ 走同一个 onOpen）
-                                Tab.Home -> HomeTab(state, onOpen = { page ->
-                                    MaskDetailActivity.start(context, page)
-                                })
+                                Tab.Home -> HomeTab(
+                                    state = state,
+                                    onOpen = { page -> MaskDetailActivity.start(context, page) },
+                                    // 空态点卡片 → 切到「功能」页签（用户 2026-11-24 指定）。
+                                    //
+                                    // 2026-11-25：改走底栏同一个入口 —— `AppPagerState.animateToPage`
+                                    // 先钉住 `selectedPage`，再用 `springAnimateToPage`（miuix 的
+                                    // `PagerNavigationSpringSpec`，与手指松手同一个 spec）。原来直接调
+                                    // `pagerState.animateScrollToPage`：曲线不同，而且绕过了 AppPagerState，
+                                    // 底栏选中块要等 `LaunchedEffect(currentPage) → syncPage()` 才追过去
+                                    // ⇒ 观感是「页面先滑、块后到」，与底栏点击不一致（用户报）。
+                                    onGoFunction = { appPagerState.animateToPage(Tab.Function.ordinal) },
+                                )
 
                                 // 一级功能页现在只有两张入口卡片，真正的内容在二级页（独立 Activity）里。
                                 Tab.Function -> FunctionHome(onOpen = { page ->
@@ -321,26 +379,19 @@ private fun MaskSwapShell(
                                     onThemeModeChange(mode)
                                 }, onMonetChange = onMonetChange)
 
-                                Tab.About -> AboutTab(state)
+                                // 关于页：只有**停在它上面**时才让动态背景跑（2026-11-25）。
+                                // `selectedPage` 在底栏导航时立刻变、手滑时过半变，够用；
+                                // 这个读取只发生在 About 这一页的组合作用域里，不会拖累其它页重组。
+                                Tab.About -> AboutTab(
+                                    state = state,
+                                    visible = appPagerState.selectedPage == Tab.About.ordinal,
+                                )
                             }
                         }
                     }
 
-                    // 底部渐隐纱：贴屏幕底、页面内容之上、底栏（含阴影）之下；在录制层内 → 玻璃采样含它。
-                    Box(
-                        Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .height(BottomFadeHeight)
-                            .background(
-                                Brush.verticalGradient(
-                                    listOf(
-                                        (if (isDark) Color.Black else Color.White).copy(alpha = 0f),
-                                        (if (isDark) Color.Black else Color.White).copy(alpha = BottomFadeAlpha),
-                                    ),
-                                ),
-                            ),
-                    )
+                    // 底部渐隐纱已搬进 [TabHost]（2026-11-25）：改成渐变模糊后需要采样「内容层」
+                    // （`blurBackdrop`），留在这里会把自己录进去。主页不画，见 `TabHost(bottomFade = …)`。
                 }
 
                 // 沉浸式：底栏浮在内容之上（内容能从它下面滚过去）。不能用 Scaffold 的 bottomBar 槽位，
@@ -357,8 +408,15 @@ private fun MaskSwapShell(
                 //
                 // 位置由组件自己的 `defaultWindowInsetsPadding` 决定（系统导航条 inset + 官方
                 // 浮动边距）；两侧各留 24dp 等价于原来"0.88 屏宽"。
-                // ⚠️ `isDynamicColor` 为 false（我们只在开 Monet 时用动态色），选中态走
-                // `onBackground` + 低 alpha 的指示块，与官方 example 一致。
+                //
+                // ⚠️ **rc01 把「手势区 inset ≤ 16dp」时的浮动边距从 28dp 降到了 20dp**
+                //（`GlassNavigationBar.kt` 的 `floatingMargin` 分支）⇒ 真机表现是
+                //「关掉手势提示线（小白条）后底栏比原来低 8dp，开着时不变」。这里补回差值。
+                // 硬编码 8dp = 28 - 20；上游以后再动这个分支，这里要跟着调。
+                val navBarBottom = with(LocalDensity.current) {
+                    WindowInsets.navigationBars.getBottom(this).toDp()
+                }
+                val navBottomCompensation = if (navBarBottom <= 16.dp) 8.dp else 0.dp
                 GlassNavigationBar(
                     items = Tab.entries.map { item ->
                         GlassNavigationItem(icon = item.icon, label = item.label)
@@ -368,7 +426,8 @@ private fun MaskSwapShell(
                     backdrop = backdrop,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(horizontal = 24.dp),
+                        .padding(horizontal = 24.dp)
+                        .padding(bottom = navBottomCompensation),
                 )
 
                 // ===== 弹窗（必须留在 Scaffold 子树内：miuix 的 overlay 靠 MiuixPopupHost 消费）=====
@@ -577,18 +636,43 @@ private fun rememberPageBlurBackdrop(): LayerBackdrop? {
  * 下发，再用 [snapshotFlow] 把滚动位置 1:1 写成 `heightOffset`：内容滚多少、大标题收多少。
  * （顶栏玻璃也天然对上：收起完成那一刻，内容恰好滑到顶栏底下。）
  */
+
+
 @Composable
 private fun TabHost(
     title: String,
     onRestartAod: () -> Unit,
+    /** false = 不展开大标题（关于页照 miuix demo：大标题在 body 里，顶栏只有小标题）。 */
+    expandable: Boolean = true,
+    /**
+     * 非 null = 顶栏标题的透明度跟内容滚动绑定（demo 时序）：
+     * 前 35% 滚动距离内保持 0（body 大标题还在），之后线性升到 1。
+     * 距离按 dp 给（= body 大标题区的高度）。
+     */
+    titleFadeDistance: Dp? = null,
+    /**
+     * true = 「无滚动页」的顶栏形态（2026-11-24，主页用）。
+     *
+     * 主页三张卡定住、内容不滚动 ⇒ `pageScroll.value` 恒 0，靠它推导的三项全失效：
+     * 大标题不会收起、玻璃圆钮没有底色、标题透明度永远 1。这里一次性钉死：
+     * **标题彻底不显示**（大标题也不展开）、**玻璃钮底常驻**，渐进模糊带本来就常驻绘制。
+     */
+    chromeAlwaysOn: Boolean = false,
+    /**
+     * 底部「渐隐纱」是否显示（2026-11-25）。
+     *
+     * true = 渐变模糊（`ProgressiveBlur.Bottom`，高 75dp / 半径 80dp、底部满 → 顶部 0）；false = 主页
+     * （它自己那条整片模糊已经把底部盖住了）。不支持着色器时退回原来的纯色遮罩。
+     */
+    bottomFade: Boolean = true,
     content: @Composable () -> Unit,
 ) {
     // 只借 `MiuixScrollBehavior` 携带 state（顶栏读它的 `heightOffset`）；**不挂**它的
     // `nestedScrollConnection`（原因见上面的函数说明）。收起量由内容滚动位置驱动（见下方）。
     val appBarState = rememberTopAppBarState()
     val scrollBehavior = MiuixScrollBehavior(appBarState)
-    // 顶栏右上角的重启按钮：四个页签各有一个，都从这个 [TabHost] 出。
-    val haptic = rememberClickHaptic()
+    // 顶栏右上角的重启按钮：四个页签各有一个，都从这个 [TabHost] 出
+    //（振动在 [GlassIconButtonWithFeedback] 里，这里不再持有 haptic）。
     // 2026-10-15 顶栏均匀模糊：结构从「Column（顶栏占位 + 内容在下方）」改成
     // 「Box 叠层（内容全屏 + 顶栏浮层盖在上面）」—— miuix 官方的顶栏玻璃就是这个结构
     // （Scaffold 把 topBar 和 content 都放 (0,0)、content 先画）：只有内容能滚进顶栏区域，
@@ -619,23 +703,105 @@ private fun TabHost(
                 content()
             }
         }
+        // 底部渐隐纱（2026-10-04；2026-11-25 由「纯色遮罩」改成**渐变模糊**）：
+        // 贴屏幕底、高 [BottomFadeHeight]（75dp 固定）、强度趋势「底部满 → 顶部 0」，
+        // 把原来的「叠一层白/黑」换成「把下面的内容糊掉」——
+        // 采样 [blurBackdrop]（只含内容层，不含自己 ⇒ 不会自引用叠影）。
+        if (bottomFade) {
+            val darkSurface = MiuixTheme.colorScheme.surface.luminance() < 0.5f
+            // **整套参数与结构照 `GlassTopAppBar` 的渐进模糊带搬**（2026-11-25 用户定，
+            // 因为同样 80dp 半径 / 同样 backdrop，顶栏不闪、这里闪）。逐项对应：
+            //   · `graphicsLayer { alpha = 1f }`  ← 顶栏是 `alpha = bandProgress × bgAlpha`，我们恒 1
+            //   · `gradient = Bottom.copy(curve = 0.25f)` ← 顶栏 `TopBarProgressiveGradient` 同款 curve
+            //   · `blurRadius = 80f`             ← `GlassTopAppBarDefaults.ProgressiveBlurRadius`
+            //   · `colors = blurColors`          ← 顶栏那层 surface 20% 的调色
+            //   · `drawWithContent + scrimBrush` ← 顶栏那条 0.50→0 的容器色 scrim（这里镜像成底实顶虚）
+            // 唯一不抄的是顶栏的 `backdropCaptureModifier`（它把带的输出录给按钮玻璃采样，我们没这需求）。
+            // 高度仍是 [BottomFadeHeight]，位置仍是贴底 —— 用户明确"除了高度"。
+            val surfaceColor = MiuixTheme.colorScheme.surface
+            val blendColors = remember(surfaceColor) {
+                listOf(BlendColorEntry(surfaceColor.copy(alpha = 0.2f)))
+            }
+            val blurColors = BlurDefaults.blurColors(blendColors = blendColors)
+            val scrimBrush = remember(surfaceColor) {
+                // 顶栏是「顶部 0.50 → 底部 0」，这里**镜像**成「底部 0.50 → 顶部 0」。
+                Brush.verticalGradient(
+                    0f to Color.Transparent,
+                    0.10f to surfaceColor.copy(alpha = 0.05f),
+                    0.25f to surfaceColor.copy(alpha = 0.16f),
+                    0.5f to surfaceColor.copy(alpha = 0.32f),
+                    0.75f to surfaceColor.copy(alpha = 0.44f),
+                    1f to surfaceColor.copy(alpha = 0.50f),
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .height(BottomFadeHeight)
+                    .then(
+                        if (blurBackdrop != null) {
+                            Modifier
+                                .graphicsLayer { alpha = 1f }
+                                .progressiveTextureBlur(
+                                    backdrop = blurBackdrop,
+                                    shape = RectangleShape,
+                                    gradient = ProgressiveBlur.Bottom.copy(curve = 0.25f),
+                                    blurRadius = 80f,
+                                    colors = blurColors,
+                                    enabled = true,
+                                )
+                                .drawWithContent {
+                                    drawContent()
+                                    drawRect(brush = scrimBrush)
+                                }
+                        } else {
+                            // 降级（运行时不吃 shader）：退回原来的纯色遮罩。
+                            Modifier.background(
+                                Brush.verticalGradient(
+                                    listOf(
+                                        (if (darkSurface) Color.Black else Color.White)
+                                            .copy(alpha = 0f),
+                                        (if (darkSurface) Color.Black else Color.White)
+                                            .copy(alpha = BottomFadeAlpha),
+                                    ),
+                                ),
+                            )
+                        },
+                    ),
+            )
+        }
+        // 顶栏标题透明度：demo 时序 —— body 大标题（foreground blur）彻底淡出后，顶栏小标题才浮现。
+        // 在 lambda 里读 `pageScroll.value`（绘制阶段取值），滚动时不会整页 recompose。
+        val fadePx = with(LocalDensity.current) { (titleFadeDistance ?: 0.dp).toPx() }
+        val titleAlpha: () -> Float = if (titleFadeDistance != null && fadePx > 0f) {
+            {
+                val p = (pageScroll.value / fadePx).coerceIn(0f, 1f)
+                ((p - 0.35f) / 0.65f).coerceIn(0f, 1f)
+            }
+        } else {
+            { 1f }
+        }
         // 玻璃顶栏（miuix 0.9.5）：渐变模糊带 + 大标题收起 + 小标题模糊过渡。
         // `progressiveBlur` 内部会再录一层 backdrop（= 页面内容），画出「顶部实、向下渐隐」的模糊带；
         // 高度 = (状态栏 + 折叠高度 + bottomContent + 20dp) × 1.2，不占布局。
         GlassTopAppBar(
             title = title,
-            // ⚠️ 必须显式传，不能让它从 scrollBehavior 推导：`isContentScrolled` 的实现是
-            // `scrollBehavior?.state?.contentOffset ?: visualContentOffset`，而 contentOffset 是
-            // 非空 Float —— 只要传了 scrollBehavior 就永远读它。我们不挂 nestedScrollConnection
-            //（见上面 LaunchedEffect 的说明），contentOffset 恒 0 ⇒ 判"没滚" ⇒ 玻璃圆钮的背景
-            // 层 alpha 恒 0（按钮只剩图标、没有玻璃底）。
-            isContentScrolled = pageScroll.value > 0,
+            // ⚠️ 必须显式传，不能让它从 scrollBehavior 推导（2026-11-25 升级 rc01）：新版默认
+            // 重载在 `scrollBehavior == null` 时**直接返回 true**，而我们有 scrollBehavior 时
+            // 它读的是 `contentOffset` —— 我们不挂 nestedScrollConnection（见上面 LaunchedEffect
+            // 的说明），contentOffset 恒 0 ⇒ 判"没滚" ⇒ 玻璃圆钮的背景层 alpha 恒 0
+            //（按钮只剩图标、没有玻璃底）。
+            isContentScrolled = if (chromeAlwaysOn) true else pageScroll.value > 0,
             largeTitle = title,
+            // 关于页：不展开大标题（body 里用 logo 当大标题），且顶栏标题随滚动浮现。
+            expandable = expandable && !chromeAlwaysOn,
+            titleAlpha = if (chromeAlwaysOn) ({ 0f }) else titleAlpha,
             backdrop = blurBackdrop,
-            scrollBehavior = scrollBehavior,
-            // 有符号内容位置（向上滚为负）：collapseRamp 用 `(-offset - RampStart) / RampDistance`，
-            // 与上面 `heightOffset = -value` 同号，别传成正值。
-            visualContentOffset = { -pageScroll.value.toFloat() },
+            // `chromeAlwaysOn`（主页）传 null：新版渐进模糊带改由 `maskProgress`（`isContentScrolled`
+            // 驱动）和 `collapsedFraction` 驱动，不再需要旧的 `visualContentOffset` ——
+            // rc01 已删除该参数（2026-11-25 升级时移除）。
+            scrollBehavior = if (chromeAlwaysOn) null else scrollBehavior,
             progressiveBlur = true,
             modifier = Modifier.align(Alignment.TopCenter),
             // 测**前景**高度（不含背景带向外延伸的 bandOverhang）；内容头部留白靠它。
@@ -643,7 +809,7 @@ private fun TabHost(
                 if (size.height > barHeightPx) barHeightPx = size.height
             },
             actions = {
-                GlassIconButton(onClick = { haptic(); onRestartAod() }) {
+                GlassIconButtonWithFeedback(onClick = onRestartAod) {
                     Icon(
                         imageVector = MiuixIcons.Refresh,
                         contentDescription = "重启锁屏编辑器",
@@ -707,7 +873,7 @@ internal fun DetailTabHost(
     // 手势收大标题、内容不滚 —— 用户实测否决）；收起量由内容滚动位置 1:1 驱动，见下方。
     val appBarState = rememberTopAppBarState()
     val scrollBehavior = MiuixScrollBehavior(appBarState)
-    val haptic = rememberClickHaptic()
+    // 振动在两个 [GlassIconButtonWithFeedback] 里，这里不再持有 haptic。
     // 系统返回键：先关掉二级页，而不是把应用整个退掉。
     BackHandler { onBack() }
     // 与一级页 [TabHost] 同款（2026-11-18 换成玻璃顶栏）：内容全屏 + 顶栏浮层。
@@ -748,14 +914,15 @@ internal fun DetailTabHost(
                 largeTitle = title,
                 backdrop = blurBackdrop,
                 scrollBehavior = scrollBehavior,
-                visualContentOffset = { -pageScroll.value.toFloat() },
+                // rc01 删除了 `visualContentOffset`：渐进模糊带现在由 `maskProgress` /
+                // `collapsedFraction` 驱动（2026-11-25 升级时移除）。
                 progressiveBlur = true,
                 modifier = Modifier.align(Alignment.TopCenter),
                 contentModifier = Modifier.onSizeChanged { size ->
                     if (size.height > barHeightPx) barHeightPx = size.height
                 },
                 navigationIcon = {
-                    GlassIconButton(onClick = { haptic(); onBack() }) {
+                    GlassIconButtonWithFeedback(onClick = onBack) {
                         Icon(
                             imageVector = MiuixIcons.ChevronBackward,
                             contentDescription = "返回",
@@ -763,7 +930,7 @@ internal fun DetailTabHost(
                     }
                 },
                 actions = {
-                    GlassIconButton(onClick = { haptic(); onRestartAod() }) {
+                    GlassIconButtonWithFeedback(onClick = onRestartAod) {
                         Icon(
                             imageVector = MiuixIcons.Refresh,
                             contentDescription = "重启锁屏编辑器",
@@ -787,14 +954,17 @@ internal fun TabColumn(content: @Composable () -> Unit) {
             // 顶部留白 = 顶栏展开态高度（[TabHost] 实测提供，2026-10-15 顶栏均匀模糊）：
             // 内容初始从顶栏下面开始，滚动时这段留白先滚走、内容从顶栏玻璃下穿过。
             // 底部留白：给悬浮底栏留出空间，内容能滚到它下面，最后一项也不会被挡住。
-            .padding(top = LocalTopBarHeight.current, bottom = 120.dp),
+            // 2026-11-25 用户定 120 → **106dp**：滚到底时最后一张卡与底栏玻璃顶边正好留
+            // 24dp（106 - 底栏 54 - 浮动边距 28 = 24）。手势导航下成立；三键导航时底栏会上移，
+            // 间距相应变小（同一套 `GlassNavigationBar` 的 insets 逻辑，不是这里能控的）。
+            .padding(top = LocalTopBarHeight.current, bottom = 106.dp),
     ) {
         content()
     }
 }
 
 /**
- * 关于页的状态卡 —— **样式照 HyperMusicCover 的激活卡搬过来**（2026-09-29 用户指定）。
+ * 主页的状态卡（2026-10-29 从关于页搬回）—— **样式照 HyperMusicCover 的激活卡搬过来**（2026-09-29 用户指定）。
  *
  * ⚠️ **只搬了样式**：检测逻辑、状态判定、`settled` 语义全是我们自己的（用户明确"我们只是搬样式"）；
  * 卡片**不可点**（HyperMusicCover 那张点一下会重新检测，我们不做那套交互）。
@@ -813,6 +983,9 @@ internal fun TabColumn(content: @Composable () -> Unit) {
  *
  * **激活 = 绿、有 LSPosed 无 Root = 橙、无 LSPosed = 红**。卡面是固定色值（不跟动态取色），
  * 深浅色各一套；图标用 Material Icons 的 `check_circle_outline` / `error_outline`（见 `ui/icons/StatusIcons.kt`）。
+ *
+ * 2026-11-25：主页三张卡片改成磨砂玻璃后，传 [glassBackdrop] 时卡面透明，三态色改为
+ * **卡面淡染（18%，暗色 22%）+ 图标 tint**，文字走 `onSurface`（用户定「颜色不用太重，能看出来就行」）。
  */
 @Composable
 internal fun BigStatusCard(
@@ -821,6 +994,22 @@ internal fun BigStatusCard(
     version: String,
     /** 激活状态是否**已经确认**。[MaskUiState.activationSettled] —— false 时不能急着说"未激活"。 */
     settled: Boolean,
+    /**
+     * `noRoot` 档（已激活但 su 不可用）点击时执行 —— 重测 root。
+     *
+     * 2026-11-24：原来这活儿是主页一张独立的「未检测到Root」卡（橙卡 + 箭头）干的，
+     * 用户要求删卡、把它并进状态卡：该档整卡可点，行为与其他可点卡一致
+     *（`Card(insideMargin = 0)` + 内容 `.clickable { haptic(); … }`，涟漪被卡片圆角裁剪）。
+     */
+    onNoRootClick: (() -> Unit)? = null,
+    /**
+     * 磨砂卡面的采样源（2026-11-25，主页用）。
+     *
+     * 非空时卡面改「透明 + `textureBlur`」，三态色不再铺满卡面，只做**很淡的染色**
+     *（用户 2026-11-25 定「颜色不用太重，能看出来就行」）+ 图标 tint 体现；
+     * `null` 保持原来的实色卡面。
+     */
+    glassBackdrop: LayerBackdrop? = null,
 ) {
     // "已激活但没有 root" = 模块装上也用不了（替换、探壁纸尺寸都要 su），所以单独一档配色（橙）。
     val noRoot = activated && hasRoot == false
@@ -845,8 +1034,26 @@ internal fun BigStatusCard(
     val statusText = when {
         probing -> "正在检测…"
         !activated -> "模块未激活"
-        noRoot -> "模块未激活（无 Root）"
+        // 2026-11-24：原来这里写「模块未激活（无 Root）」，用户要求改成这句 —— 同时它也是
+        // 「点击以刷新」的提示语（整卡可点，见 [onNoRootClick]）。
+        noRoot -> "无Root（点击以刷新）"
         else -> "模块已激活"
+    }
+    // 只有 `noRoot` 档需要点击（重测 root）；其余档不可点，行为与改造前一致。
+    val clickable = noRoot && onNoRootClick != null
+    val haptic = rememberClickHaptic()
+    // 磨砂分支的淡染颜色：与上面 `containerColor` 同一套三态判据，但用**图标色**（更饱和）
+    // 而不是近白的卡面色 —— 近白色叠上去等于没染。
+    val statusTint = when {
+        probing -> null
+        active -> StatusCardGreenGlyph
+        noRoot -> StatusCardAmberGlyph
+        else -> StatusCardRedGlyph
+    }
+    val cardDecor = if (glassBackdrop != null) {
+        rememberGlassCardModifier(glassBackdrop, statusTint)
+    } else {
+        Modifier
     }
     Row(
         modifier = Modifier
@@ -860,10 +1067,29 @@ internal fun BigStatusCard(
             // 用 miuix 官方的 Card（圆角、内容色、按压反馈都跟系统一致）；`insideMargin` 用官方默认值。
             // 文字颜色**刻意不显式指定**：默认 contentColor 在深浅两套卡面上都读得清
             //（HyperMusicCover 也只传 `color`）。
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.defaultColors(color = containerColor),
+            //
+            // ⚠️ 2026-11-25：磨砂分支的卡面是透明的，`contentColor` 必须显式给 `onSurface`
+            // —— 传 `Color.Transparent` 会让上面那套「不指定颜色」的 Text 全变透明。
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(cardDecor),
+            colors = if (glassBackdrop != null) {
+                CardDefaults.defaultColors(Color.Transparent, MiuixTheme.colorScheme.onSurface)
+            } else {
+                CardDefaults.defaultColors(color = containerColor)
+            },
         ) {
-            Box {
+            Box(
+                // miuix 的 `CardDefaults.InsideMargin` 就是 `PaddingValues(0.dp)` ⇒ 这层 Box
+                // 正好铺满整张卡，clickable 加在这里 = **整卡可点**（含四边），涟漪被 Card 的
+                // 圆角裁掉 —— 与 `AppEntryCard` / `RunningWallpaperCard` 的可点写法完全一致。
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = clickable) {
+                        haptic()
+                        onNoRootClick?.invoke()
+                    },
+            ) {
                 // 右下角的大图标：先铺满，再用 offset 推出右下角，溢出的一角被卡片裁掉。
                 Box(
                     modifier = Modifier
@@ -914,8 +1140,8 @@ internal fun BigStatusCard(
  * **橙那套是我们自己配的**（它只有"激活/未激活"两种状态，没有"无 Root"这一档），
  * 沿用同一套明度关系。
  *
- * `internal` 而不是 `private`：主页那张「未检测到Root」卡（见 `MaskTabs.HomeTab`）也用同一组色值 ——
- * 用户要求它跟状态卡的橙是**同一个橙**，共用常量才能长期保证一致。
+ * `internal` 而不是 `private`：橙那套只有状态卡的 `noRoot` 档在用；2026-11-24 之前主页还有一张
+ * 独立的「未检测到Root」卡共用它（用户要求"同一个橙"），那张卡已删除、职责并进状态卡。
  */
 internal val StatusCardGreenLight = Color(0xFFDFFAE4)
 internal val StatusCardGreenDark = Color(0xFF1A3825)
@@ -942,6 +1168,12 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 internal fun appVersion(context: Context): String = runCatching {
     context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "1.0"
 }.getOrDefault("1.0")
+
+/** 关于页版本号：`v1.0 Beta7(1070018)`（与「检查更新」弹窗的写法一致）。 */
+internal fun appVersionLabel(context: Context): String = runCatching {
+    val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+    "v${pi.versionName ?: "1.0"}(${pi.longVersionCode})"
+}.getOrDefault("v${appVersion(context)}")
 
 /** 系统属性（MIUI/HyperOS 版本号都在这里）。 */
 internal fun systemProperty(key: String): String? = runCatching {

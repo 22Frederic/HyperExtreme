@@ -57,6 +57,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import kotlin.math.roundToInt
@@ -312,6 +313,14 @@ internal fun RasterGroupSheet(
         // 兜底再截一刀：系统选择器那边已经按剩余空位限过张数了。
         val room = (MAX_ITEMS - names.size).coerceAtLeast(0)
         if (room == 0) return
+        // ⚠️ 文件管理组件（DocumentsUI）**没有「最大张数」的 extra**（`EXTRA_ALLOW_MULTIPLE` 只是
+        //    布尔开关）⇒ 用户能选 100 张，下面 `take(room)` 会静默丢掉多余的。相册组件走
+        //    `EXTRA_PICK_IMAGES_MAX`，由 photopicker 卡死、不会超 —— 所以显式判模式，
+        //    别让「文件管理组件」这句文案在相册路径上撒谎（2026-11-26 用户要求，只提示大概）。
+        //    ⚠️ 已知不处理：`take(room)` 在判重之前截断 ⇒ 重复图会占配额（用户再点一次空槽即可补齐）。
+        if (uris.size > room && ImagePick.isFileMode(ctx)) {
+            AppToast.show(ctx, "文件管理组件返回图片数大于限制，部分图片未导入")
+        }
         importing = true
         scope.launch {
             val r = withContext(Dispatchers.IO) {
@@ -503,9 +512,8 @@ internal fun RasterGroupSheet(
         }
     }
 
-    val maskPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia(),
-    ) { uri ->
+    val maskPicker = rememberLauncherForActivityResult(ImagePick.One()) { r ->
+        val uri = ImagePick.consume(ctx, r).firstOrNull()
         val name = maskTarget
         maskTarget = null
         if (uri != null && name != null) importMask(name, uri)
@@ -514,13 +522,13 @@ internal fun RasterGroupSheet(
     // 系统控件里能选几张 = 剩余空位（用户 2026-11-03 要求）。
     // `PickMultipleVisualMedia` 的 maxItems 在构造时校验必须 > 1，只剩 1 个空位时退回单选。
     val room = (MAX_ITEMS - names.size).coerceAtLeast(0)
-    val multiContract = remember(room) {
-        ActivityResultContracts.PickMultipleVisualMedia(room.coerceAtLeast(2))
+    val multiContract = remember(room) { ImagePick.Many(room.coerceAtLeast(2)) }
+    val multiPicker = rememberLauncherForActivityResult(multiContract) { r ->
+        handlePicked(ImagePick.consume(ctx, r))
     }
-    val multiPicker = rememberLauncherForActivityResult(multiContract) { handlePicked(it) }
-    val singlePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia(),
-    ) { uri -> handlePicked(if (uri == null) emptyList() else listOf(uri)) }
+    val singlePicker = rememberLauncherForActivityResult(ImagePick.One()) { r ->
+        handlePicked(ImagePick.consume(ctx, r))
+    }
 
     // 新建流程：浮页与系统选图**同时**弹出（用户 2026-11-03）。
     //
@@ -530,10 +538,10 @@ internal fun RasterGroupSheet(
     //    是 `maxItems = 2`。自动拉起就发生在这一帧：`rememberLauncherForActivityResult` 内部是
     //    `rememberUpdatedState(contract)`，还没重组过，拿到的仍是旧 contract。
     //    新建一定是**空组**（room 恒 = MAX_ITEMS），所以这条路径单独用一个固定的 contract。
-    val freshContract = remember {
-        ActivityResultContracts.PickMultipleVisualMedia(MAX_ITEMS)
+    val freshContract = remember { ImagePick.Many(MAX_ITEMS) }
+    val freshPicker = rememberLauncherForActivityResult(freshContract) { r ->
+        handlePicked(ImagePick.consume(ctx, r))
     }
-    val freshPicker = rememberLauncherForActivityResult(freshContract) { handlePicked(it) }
 
     // 必须放在 launcher 注册之后才拿得到 picker；只在「新建 + 还没有图」时触发一次。
     LaunchedEffect(show, group?.id) {
@@ -554,6 +562,12 @@ internal fun RasterGroupSheet(
         show = show,
         backdrop = LocalPageBackdrop.current,
         title = if (group == null) "新建光栅壁纸组合" else "编辑光栅壁纸组合",
+        // **横向 24dp**（beta01 的观感，2026-11-25 用户要求恢复）：
+        // rc01 把 `GlassBottomSheet` 的默认内边距单独抽成 `GlassBottomSheetDefaults.InsideMargin`
+        // 并砍到 `DpSize(12.dp, 0.dp)` ⇒ 卡片流左右各贴边 12dp，视觉上"更靠到边缘"。
+        // 这里写死旧值，不跟着上游默认走（上游若再改也不会把观感带跑）。纵向仍是 0：
+        // 顶部留白由覆盖式标题栏的 `innerPadding` 给，底部由内容自己的 `NavBarBottomGap` 给。
+        insideMargin = DpSize(24.dp, 0.dp),
         startAction = {
             IconButton(onClick = { haptic(); finish(save = false) }) {
                 SheetActionIcon(SheetIconKind.Close, "关闭")
@@ -574,7 +588,11 @@ internal fun RasterGroupSheet(
                 SheetActionIcon(SheetIconKind.Check, "完成")
             }
         },
-    ) {
+    ) { innerPadding ->
+    // ⚠️ rc01（2026-11-25）起 `GlassBottomSheet` 的标题栏是**覆盖式**（内部固定
+    // `overlayHeader = true`）：header 浮在内容之上，`PaddingValues` 的 top = 实测 header 高度，
+    // **内容必须自己吃**（见下面 Column 的 `.padding(innerPadding)`），否则卡片流会顶到标题栏
+    // 下面 —— 这是升级 rc01 后「卡片流与标题栏重叠」的原因。
     // 封面分批出图（2026-11-13）：打开瞬间只解前几张，其余按批次补（见 COVER_* 常量）。
     // 状态放 content 内部 ⇒ Dialog 销毁即丢，下次打开重新从第一批开始（这正是要的）。
     var readyCount by remember { mutableIntStateOf(COVER_FIRST_BATCH) }
@@ -590,17 +608,21 @@ internal fun RasterGroupSheet(
     // 卡宽 = 屏宽 × 0.45，所以槽宽 = 屏宽 × 0.45 × 0.8；高度按屏幕比例 = 竖屏预览。
     val screen = rememberScreenSizePx()
     val density = LocalDensity.current
-    val slotW: Dp = with(density) { (screen.width * CARD_WIDTH_RATIO * SLOT_SCALE).toDp() }
+    val slotWPx = screen.width * CARD_WIDTH_RATIO * SLOT_SCALE
+    val slotW: Dp = with(density) { slotWPx.toDp() }
     val slotH: Dp = with(density) {
-        (screen.width * CARD_WIDTH_RATIO * SLOT_SCALE * screen.height / screen.width).toDp()
+        (slotWPx * screen.height / screen.width).toDp()
     }
-    val radius: Dp = slotW * CARD_RADIUS_RATIO
+    // 圆角 = 系统屏幕圆角 × 卡宽比（2026-11-27）。
+    val radius: Dp = with(density) { rememberCardRadiusPx(slotWPx, screen.width.toFloat()).toDp() }
     // 卡片底色（暗色下比浮页底亮一档，见 rememberCardSurface 的注释）。
     val surfaceColor = rememberGlassCardSurface()
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            // 覆盖式标题栏留出的 top（rc01 起必须吃，见上面 lambda 的说明）。
+            .padding(innerPadding)
             // 底部留白与悬浮底栏一致（NavBarBottomGap = 26dp）。
             .padding(bottom = NavBarBottomGap),
     ) {

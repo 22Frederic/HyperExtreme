@@ -29,7 +29,7 @@ import kotlin.math.abs
  * * d4 扭曲：`0.5 + 0.46·cos(2πx) + 10% 噪声`（108 点波形谐波分解：k=1 占 0.231，
  *   k=2..8 全部只有 0.017~0.024）
  *
- * ## 四档与 vivo 的参数（`DrawNConfigure.<init>` 里的 const，已逐条核对）
+ * ## 五档与 vivo 的参数（`DrawNConfigure.<init>` 里的 const，已逐条核对）
  *
  * | 参数 | d1 条纹 | d3 磨砂 | d4 扭曲 |
  * |---|---|---|---|
@@ -148,12 +148,19 @@ internal object RasterGlCore {
         return (-(base * step))..((n - 1 - base) * step)
     }
 
-    // ───────────────────── 「过渡效果」四档（2026-11-06）─────────────────────
+    // ───────────────────── 「过渡效果」五档（2026-11-06 / 11-26 加第 5 档）─────────────────────
 
-    /** 0 = 默认（纯擦除，对应 vivo 的 d2）；1 = 条纹玻璃（d1）；2 = 磨砂玻璃（d3）；3 = 条纹玻璃·扭曲（d4）。 */
+    /**
+     * 0 = 默认（纯擦除，对应 vivo 的 d2）；1 = 条纹玻璃（d1）；2 = 磨砂玻璃（d3）；
+     * 3 = 条纹玻璃·扭曲（d4 的参数 + 等宽余弦）；**4 = 细线玻璃（vivo d4 的真实贴图波形）**。
+     *
+     * ⚠️ 3 和 4 的参数**完全相同**（都是 `Draw4Configure` 那一组），区别只在高度场：
+     * 3 是我们自己的等宽余弦，4 是 d4 贴图实测的「两段抛物线 + 中央尖峰」。
+     */
     const val STYLE_STRIPE = 1
     const val STYLE_FROST = 2
     const val STYLE_TWIST = 3
+    const val STYLE_FINE = 4
 
     // vivo 公共项（DrawNConfigure 构造函数）
     const val VIVO_TRANS_WIDTH = 0.8f
@@ -191,10 +198,29 @@ internal object RasterGlCore {
     /** 条纹周期：1200 宽屏上 19 px（862 宽截图实测 14 px，换算到 1200）。 */
     const val STRIPE_PERIOD_PX_1200 = 19f
 
+    /**
+     * **细线玻璃**的周期：d1 的 `108/15 = 7.2` 倍 ⇒ 136.8 px @1200。
+     *
+     * vivo 的两张贴图是同一套 `u_RasterTextureSize`（贴图宽度 = 屏幕上的一个周期）：
+     * `d1_15x15.png` 实测 **15×12**，`d4_15x15.png` 实测 **108×200**（文件名是复制遗留）。
+     * 所以 d4 一个周期天然是 d1 的 108/15 —— 用同一个 19px 会把它的波形压扁 7.2 倍。
+     */
+    const val FINE_PERIOD_PX_1200 = STRIPE_PERIOD_PX_1200 * 108f / 15f
+
+    /**
+     * 按档位取屏幕上的条纹周期（px）—— **三条渲染链共用**（hook / 服务 / AGSL 主体）。
+     *
+     * 只有细线玻璃用自己的 136.8，其余四档仍是 19（含默认档，它不用高度场，取值无妨）。
+     */
+    fun periodPxOf(style: Int, screenW: Float): Float {
+        val base = if (style == STYLE_FINE) FINE_PERIOD_PX_1200 else STRIPE_PERIOD_PX_1200
+        return screenW * (base / STRIPE_BASE_W)
+    }
+
     /** 磨砂颗粒：1200 宽屏上一格约 2 px（d3 的 256×256 图平铺后约 0.5~1 px，取 2 更稳）。 */
     const val FROST_CELL_PX_1200 = 2.0f
 
-    /** 四档的着色参数（vivo `DrawNConfigure` 构造函数里的 const）。 */
+    /** 五档的着色参数（vivo `DrawNConfigure` 构造函数里的 const）。 */
     class StyleParams(
         val bump: Float,
         val refract: Float,
@@ -207,7 +233,9 @@ internal object RasterGlCore {
     fun paramsOf(style: Int): StyleParams = when (style) {
         STYLE_STRIPE -> StyleParams(STRIPE_BUMP, STRIPE_REFRACT, STRIPE_DISP, STRIPE_SHADOW, 0f)
         STYLE_FROST -> StyleParams(FROST_BUMP, FROST_REFRACT, FROST_DISP, FROST_SHADOW, 0f)
-        STYLE_TWIST -> StyleParams(TWIST_BUMP, TWIST_REFRACT, TWIST_DISP, TWIST_SHADOW, TWIST_LIGHT_X)
+        // 3 / 4 是**同一组参数**（vivo d4）：扭曲变形用等宽余弦，细线玻璃用 d4 真实波形。
+        STYLE_TWIST, STYLE_FINE ->
+            StyleParams(TWIST_BUMP, TWIST_REFRACT, TWIST_DISP, TWIST_SHADOW, TWIST_LIGHT_X)
         else -> StyleParams(0f, 0f, 0f, 0f, 0f)
     }
 
@@ -224,7 +252,7 @@ void main() {
     /**
      * 片元着色器（**无字符串插值，可以是 const val**）。
      *
-     * 所有 vivo 参数都从 uniform 进来（一个 shader 服务四档），
+     * 所有 vivo 参数都从 uniform 进来（一个 shader 服务五档），
      * 公式里的 `0.16` / `208.333` 是 vivo 原版的常数，不是可调项。
      */
     const val FRAG = """
@@ -239,8 +267,8 @@ uniform vec4 uToUv;
 uniform float uT;
 uniform float uDir;
 uniform float uDim;
-// ───────── vivo 四档参数（2026-11-06）─────────
-uniform float uStyle;              // 0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲
+// ───────── vivo 五档参数（2026-11-06；11-26 加细线玻璃）─────────
+uniform float uStyle;              // 0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲 / 4 细线
 uniform float uTransWidth;
 uniform float uAlphaTransWidth;
 uniform float uMaskTransWidth;
@@ -281,10 +309,29 @@ float rasterHeight(vec2 uv) {
         // d3：256x256 图实测是纯随机噪点
         vec2 p = vec2(uv.x * uScreenW, uv.y * uScreenH) / max(uFrostCellPx, 0.5);
         return noise2(p);
+    } else if (uStyle < 3.5) {
+        // 扭曲变形：108 点波形 ≈ 余弦 + 10% 扰动（中间那个小鼓包由噪声项带出来）
+        float n = noise2(vec2(x * 5.0, 7.3));
+        return clamp(0.5 + 0.46 * cos(6.2831853 * x) + 0.10 * (n - 0.5), 0.0, 1.0);
     }
-    // d4：108 点波形 ≈ 余弦 + 10% 扰动（中间那个小鼓包由噪声项带出来）
-    float n = noise2(vec2(x * 5.0, 7.3));
-    return clamp(0.5 + 0.46 * cos(6.2831853 * x) + 0.10 * (n - 0.5), 0.0, 1.0);
+    // ───── 细线玻璃：vivo d4 贴图（实测 108x200，纯一维）逐像素解出的波形 ─────
+    // 一个周期内是「两段抛物线 + 谷底一个尖峰」，法线只在尖峰两侧各出一条细线：
+    //   u < 48   → 1 - (u/48)^2                        缓降 48 px
+    //   48..54   → 0.5 * smoothstep(0,1,(u-48)/6)       陡升
+    //   54..59   → 0.5 * (1 - smoothstep(0,1,(u-54)/5)) 陡降
+    //   u >= 59  → 1 - ((108-u)/48)^2                   缓升
+    // 解析式对 108 点实测：RMS 0.031 / 最大偏差 4.7/255。
+    float u = fract(x) * 108.0;
+    if (u < 48.0) {
+        float t = u / 48.0;
+        return 1.0 - t * t;
+    } else if (u < 54.0) {
+        return 0.5 * smoothstep(0.0, 1.0, (u - 48.0) / 6.0);
+    } else if (u < 59.0) {
+        return 0.5 * (1.0 - smoothstep(0.0, 1.0, (u - 54.0) / 5.0));
+    }
+    float t2 = (108.0 - u) / 48.0;
+    return 1.0 - t2 * t2;
 }
 
 // vivo 的 Tx3 色散：三采样错开 0 / 0.2 / 0.4 倍，RGB 各取一套权重。
@@ -300,6 +347,20 @@ vec4 sampleDisperse(sampler2D tex, vec4 uvRect, vec2 uv0, float s) {
             c0.b * 0.02 + c1.b * 0.08 + c2.b * 0.9,
             c0.a
         );
+    }
+    return texture2D(tex, uv0 * uvRect.xy + uvRect.zw);
+}
+
+// vivo d4 自己的色散（`applyDispersionEffect`，STEPS=1）：R 不偏移、G 偏 1.0 倍、B 偏 1.5 倍。
+// 与 d1 的 Tx3「三采样错开 0/0.2/0.4 + RGB 加权」**不是一套算法**，细线玻璃必须走这个分支。
+// ⚠️ vivo 原版 `rColor.g` 没赋初值就直接 `+=`（UB）；这里按它的意图取单次采样，结果等价。
+vec4 sampleDisperseFine(sampler2D tex, vec4 uvRect, vec2 uv0, float s) {
+    vec2 dxy = (uv0 - vUv) * s;
+    if (abs(dxy.x) > 0.001) {
+        vec4 c0 = texture2D(tex, uv0 * uvRect.xy + uvRect.zw);
+        vec4 c1 = texture2D(tex, (uv0 + dxy * 1.0) * uvRect.xy + uvRect.zw);
+        vec4 c2 = texture2D(tex, (uv0 + dxy * 1.5) * uvRect.xy + uvRect.zw);
+        return vec4(c0.r, c1.g, c2.b, c0.a);
     }
     return texture2D(tex, uv0 * uvRect.xy + uvRect.zw);
 }
@@ -344,8 +405,14 @@ void main() {
     vec4 to;
     if (band > 0.001) {
         // 带内才走色散（2 图 × 3 次），带外仍是 2 次 ⇒ 静止不重绘时不会多出常驻开销。
-        from = sampleDisperse(uFrom, uFromUv, ruv, disp);
-        to   = sampleDisperse(uTo,   uToUv,   ruv, disp);
+        // 细线玻璃走 d4 自己的 STEPS=1 三段位移，其余四档走 d1 的 Tx3 加权。
+        if (uStyle > 3.5) {
+            from = sampleDisperseFine(uFrom, uFromUv, ruv, disp);
+            to   = sampleDisperseFine(uTo,   uToUv,   ruv, disp);
+        } else {
+            from = sampleDisperse(uFrom, uFromUv, ruv, disp);
+            to   = sampleDisperse(uTo,   uToUv,   ruv, disp);
+        }
     } else {
         from = texture2D(uFrom, ruv * uFromUv.xy + uFromUv.zw);
         to   = texture2D(uTo,   ruv * uToUv.xy   + uToUv.zw);

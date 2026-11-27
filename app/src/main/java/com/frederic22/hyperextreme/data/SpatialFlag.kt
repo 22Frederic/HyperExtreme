@@ -42,7 +42,7 @@ object SpatialFlag {
     const val PROP_SCOPE = "debug.hyperextreme.spatial_scope"
 
     /**
-     * 「**启用空间壁纸锁屏景深**」：`1` = 开，`0` = 关（2026-10-29）。
+     * 「**空间壁纸锁屏景深**」：`1` = 开，`0` = 关（2026-10-29）。
      *
      * 与 [PROP_SCOPE] 放同一批推送，理由相同：SystemUI 启动渲染器时要把
      * 「active / key / scope / lockdepth」读成**一致的一组**，任何一项晚半拍都会让装配

@@ -431,7 +431,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
 
         Spacer(Modifier.height(BLOCK_GAP))
 
-        // 「启用 Alive 壁纸锁屏景深」（2026-11-08 用户要求：照光栅那项抄过来，取代参数占位卡）。
+        // 「Alive 壁纸锁屏景深」（2026-11-08 用户要求：照光栅那项抄过来，取代参数占位卡）。
         // 语义完全一致：开 = 保留 `keyguard_foreground_layer` 并把我们的主体换上去；
         // 关 = 整层压掉（旧壁纸的人像不能浮在新图上）。
         // Alive 只有 LSPosed 一条链 ⇒ 不存在"服务模式置灰"那档。
@@ -443,7 +443,7 @@ internal fun AliveWallpaperDetail(state: MaskUiState) {
             insideMargin = PaddingValues(0.dp),
         ) {
             SwitchRow(
-                title = "启用 Alive 壁纸锁屏景深",
+                title = "Alive 壁纸锁屏景深",
                 checked = lockDepth,
                 onCheckedChange = { on ->
                     lockDepth = on

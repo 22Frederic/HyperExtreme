@@ -23,11 +23,15 @@
 
 HyperExtreme是一款LSPosed美化模块，支持空间壁纸、光栅壁纸、Alive壁纸等功能，部分功能支持免Root运行。
 
+**模块发布渠道：[夸克网盘](https://pan.quark.cn/s/387bd3bae835)/[百度网盘](https://pan.baidu.com/s/1YIsIfuvBsZwGOQDm40CAeA?pwd=4eid)/[Github Release](https://github.com/22Frederic/HyperExtreme/releases)**
+
+**作者@Frederic22：[哔哩哔哩](https://space.bilibili.com/204757951)/[酷安](https://www.coolapk.com/u/3268364)/[Github](https://github.com/22Frederic)**
+
 ## 兼容性
 
-对于空间壁纸、光栅壁纸：LSPosed模式只在澎湃OS4上测试，也只会对澎湃OS4适配，**不受理任何澎湃OS4以外系统的使用问题**；系统壁纸服务（免Root）模式理论支持到安卓13，但对安卓17之外的安卓版本未测试。
+对于空间壁纸、光栅壁纸：LSPosed模式只在HyperOS4上测试，也只会对HyperOS4适配，**不受理任何HyperOS4以外系统的使用问题**；系统壁纸服务（免Root）模式理论支持到安卓13，但对安卓17之外的安卓版本未测试。
 
-对于Alive壁纸与其他功能：都需要Root与LSPosed，只会对澎湃OS4适配，**不受理任何澎湃OS4以外系统的使用问题**。
+对于Alive壁纸与其他功能：都需要Root与LSPosed，只会对HyperOS4适配，**不受理任何HyperOS4以外系统的使用问题**。
 
 ## 使用说明
 
@@ -41,4 +45,4 @@ HyperExtreme是一款LSPosed美化模块，支持空间壁纸、光栅壁纸、A
 
 ## 开源代码许可
 
-本项目采用AGPL-3.0许可证，有关开源代码许可请在模块的关于页查看。
+本项目使用AGPL-3.0许可协议，有关开源代码许可请在模块的关于>第三方许可证查看。

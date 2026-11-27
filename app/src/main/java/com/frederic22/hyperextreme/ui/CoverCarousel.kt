@@ -202,7 +202,8 @@ internal fun CoverCarousel(
     // ── 尺寸全部由屏幕分辨率推出（见 `RasterCardParts` 文件头的比例表）──
     val cardWPx = screen.width * CARD_WIDTH_RATIO
     val cardHPx = cardWPx * screen.height / screen.width
-    val radiusPx = cardWPx * CARD_RADIUS_RATIO
+    // 圆角 = 系统屏幕圆角 × 卡宽比（2026-11-27，见 rememberCardRadiusPx）。
+    val radiusPx = rememberCardRadiusPx(cardWPx, screen.width.toFloat())
     val cardW: Dp = with(density) { cardWPx.toDp() }
     val cardH: Dp = with(density) { cardHPx.toDp() }
     val radius: Dp = with(density) { radiusPx.toDp() }

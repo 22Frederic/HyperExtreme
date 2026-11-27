@@ -696,8 +696,12 @@ internal object AliveRenderer {
         // MC 让路恢复的过渡由 `fadeBothTo` 在重新启动后显式调用（见 `fadeOutAndStop`）。
         musicFadeTick?.let { handler?.removeCallbacks(it) }
         musicFadeTick = null
-        val lockA = if (showingDesktop) 0f else 1f
-        val deskA = if (showingDesktop) 1f else 0f
+        // **共用 leash 时桌面份已被丢弃**（`attachToLeash` 的 `dropDesk`）⇒ 锁屏份是唯一
+        // 显示份，必须 alpha=1。否则「桌面态启动 + 系统锁屏/桌面同一张壁纸」时：
+        // `showingDesktop=true` ⇒ lockA=0、deskA=1，而桌面份已经丢 ⇒ 两份都没有 = 桌面全空
+        // （2026-11-23 用户报「应用后桌面不显示，要再进锁屏再解锁才行」）。
+        val lockA = if (sharedLeash || !showingDesktop) 1f else 0f
+        val deskA = if (sharedLeash) 0f else if (showingDesktop) 1f else 0f
         currentAlpha = lockA
         deskAlpha = deskA
         applyAlphaBoth(lockA, deskA)
@@ -1252,18 +1256,115 @@ internal object AliveRenderer {
                     //    （tr=0 1000ms），下一帧再重新收球。
                     //    物理判据：屏幕不亮就还在 AOD，KEYGUARD 只是过渡态，别改态。
                     if (!screenOn()) return@post
-                    if (aodActive || mode == 0) {
-                        HookRuntime.log("$TAG scrim=$state ⇒ 回锁屏")
-                        aodActive = false
-                        dim = 1f
-                        changeMode(1, animate = true)
-                        dirty = true
-                        forceDraw()
-                        scheduleFrame()
+                    // 2026-11-23：条件从「只在 AOD」放宽到「当前不在锁屏份」——
+                    // 锁屏角标进相机再退出时，scrim 先报过 UNLOCKED（切到桌面份 mode=2），
+                    // 退出只回一条 KEYGUARD，旧条件 `aodActive || mode == 0` 不成立 ⇒
+                    // 锁屏画面停在桌面图 + 桌面主体（用户 2026-11-23 报）。
+                    // 同时用 [KeyguardContentGate] 的 StatusBarState 做权威校验：
+                    // 只有"真的是锁屏"才切，防止桌面下拉通知中心这类 KEYGUARD 瞬态把桌面图切走。
+                    val lockNow = KeyguardContentGate.state == KeyguardContentGate.STATE_KEYGUARD ||
+                        KeyguardContentGate.state == KeyguardContentGate.STATE_SHADE_LOCKED
+                    if (lockNow) {
+                        if (aodActive || mode == 0) {
+                            // **AOD → 锁屏：保持原路径**（2026-11-23）。这里 ratio 要跑
+                            // `blendDuration(0)=950ms` 的转场（球收拢 / 相片展开），
+                            // 绝不能进 forceBackToLock —— 那个函数在 `mode==1` 时会直接
+                            // 写 `ratio=(0,1,0)`、`ratioDur=0`，把中间帧全跳掉
+                            // （用户 2026-11-23 报「AOD 到锁屏壁纸层有概率不参与小球动画」，
+                            // 真因就是 AOD 退出路径上 KEYGUARD 重复触发，第二次走了硬切分支）。
+                            HookRuntime.log("$TAG scrim=$state ⇒ 回锁屏（AOD，mode=$mode）")
+                            resetAodFlags()
+                            changeMode(1, animate = true)
+                            dirty = true
+                            forceDraw()
+                            scheduleFrame()
+                        } else {
+                            // **桌面份 → 锁屏**（相机 / 快捷方式退出）。
+                            // ⚠️ 判据只能是 `mode == 2 || showingDesktop`，**不能用 ratio**
+                            //    （2026-11-23 二次踩坑）：AOD → 锁屏的 950ms 转场里 `ratio[1]`
+                            //    从 0 涨到 1，任何 `ratio[1] < 0.99` 的判据在整个转场期间恒为真
+                            //    ⇒ 退出路径上多来一条 KEYGUARD 就把动画硬切掉
+                            //    （真机日志：`mode=1 ratio=0.01/0.00 desk=false` 被判成"桌面份"）。
+                            if (mode == 2 || showingDesktop) {
+                                HookRuntime.log(
+                                    "$TAG scrim=$state ⇒ 回锁屏（桌面份，mode=$mode " +
+                                        "ratio=${"%.2f".format(ratio[1])}/${"%.2f".format(ratio[2])} " +
+                                        "desk=$showingDesktop）",
+                                )
+                                forceBackToLock()
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    /**
+     * 回锁屏时复位 AOD 相关标志（2026-11-23 从 `onScrimState` 的 KEYGUARD 分支抽出）。
+     *
+     * `aodActive` 管「是否还在 AOD 里」（`onAodClockYChanged` 等会读），`dim` 是压暗比例；
+     * 回锁屏这两个都必须回到「非 AOD」值。抽出来让「AOD → 锁屏」和「桌面份 → 锁屏」
+     * 两条路径共用同一份复位，不再各写一遍（上一版就是因为两处各写、漏了一处）。
+     */
+    private fun resetAodFlags() {
+        aodActive = false
+        dim = 1f
+    }
+
+    /**
+     * **强制回到锁屏份**（2026-11-23：锁屏快捷方式进相机 → 退出后停在桌面图）。
+     *
+     * 与 [changeMode] 的区别：`changeMode` 只改几何（`mode`）和内容目标（`ratioTo`），
+     * **不碰"现在显示的是哪份 Surface"**（`showingDesktop`）—— 解锁交叉最后一步
+     * `swapToDesktopLayer()` 把桌面份抬到 alpha=1、锁屏份压 0，回锁屏时没有任何代码
+     * 做反向操作，于是屏幕一直停在桌面份（真机探针实证：
+     * `mode=1 / ratio=0.00/1.00/0.00 / desk=true`）。
+     *
+     * 这里一次补齐四件事：停掉还在跑的解锁交叉 → `mode`/`ratio` 回锁屏 →
+     * 层换回锁屏份 → 重画。只在**主线程**调用（`onScrimState` 的 handler 里）。
+     */
+    private fun forceBackToLock() {
+        // ① 停掉解锁交叉 / 音乐让路之类的逐帧写 alpha
+        fadeTick?.let { handler?.removeCallbacks(it) }
+        fadeTick = null
+        unlocking = false
+        musicFadeTick?.let { handler?.removeCallbacks(it) }
+        musicFadeTick = null
+        resetAodFlags()
+
+        // ② 几何 + 内容比例回锁屏（`betweenLockAndHome` 时 changeMode 直接写终值，无动画）
+        if (mode != 1) {
+            changeMode(1, animate = true)
+        } else {
+            ratioFrom[0] = ratio[0]
+            ratioFrom[1] = ratio[1]
+            ratioFrom[2] = ratio[2]
+            ratioTo[0] = 0f
+            ratioTo[1] = 1f
+            ratioTo[2] = 0f
+            ratioStart = SystemClock.elapsedRealtime()
+            ratioDur = 0L
+            ratioEase = false
+            for (i in 0 until 3) ratio[i] = ratioTo[i]
+        }
+
+        // ③ 层：先抬锁屏份，下一拍再压桌面份（同一帧两份都空会露父层 = 白闪）
+        showingDesktop = false
+        deskShown = false
+        if (!sharedLeash && lockScs().isNotEmpty()) {
+            applyAlpha(lockScs(), 1f)
+            handler?.postDelayed({
+                if (runningKey == null) return@postDelayed
+                if (!showingDesktop && !aodActive && mode != 0) applyAlpha(deskScs(), 0f)
+            }, LAYER_SWAP_MS)
+        }
+
+        // ④ 重画
+        dirty = true
+        forceDraw()
+        scheduleFrame()
+        HookRuntime.log("$TAG 已强制回锁屏份（mode=1，ratio=(0,1,0)，层=锁屏）")
     }
 
     /** [onEnterAod] 的主体（已在 handler 里）。 */
@@ -1893,8 +1994,10 @@ internal object AliveRenderer {
                 onDone()
                 return@postDelayed
             }
-            // 中间又灭屏进 AOD ⇒ 别把锁屏份压掉（那时它才是该显示的那份）
-            if (mode != 0 && !aodActive) {
+            // 中间又灭屏进 AOD ⇒ 别把锁屏份压掉（那时它才是该显示的那份）。
+            // 中间已经 `forceBackToLock`（相机退出等）⇒ `showingDesktop` 被置 false，
+            // 这里同样不能压——否则刚抬起来的锁屏份又被打回 0（2026-11-23）。
+            if (mode != 0 && !aodActive && showingDesktop) {
                 applyAlpha(lockScs(), 0f)
             }
             onDone()

@@ -10,8 +10,10 @@ import android.os.Looper
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.frederic22.hyperextreme.data.AliveControl
 import com.frederic22.hyperextreme.data.AppRestarter
 import com.frederic22.hyperextreme.data.ActivationState
 import com.frederic22.hyperextreme.data.MaskPrefs
@@ -19,10 +21,12 @@ import com.frederic22.hyperextreme.data.MaskRole
 import com.frederic22.hyperextreme.data.MaskStore
 import com.frederic22.hyperextreme.data.ParallaxCoverFlag
 import com.frederic22.hyperextreme.data.ParallaxFeed
+import com.frederic22.hyperextreme.data.RasterControl
 import com.frederic22.hyperextreme.data.RestartTargets
 import com.frederic22.hyperextreme.data.RootReplacer
 import com.frederic22.hyperextreme.data.RootShell
 import com.frederic22.hyperextreme.data.RunLog
+import com.frederic22.hyperextreme.data.SpatialControl
 import com.frederic22.hyperextreme.data.SystemUiPackageName
 import com.frederic22.hyperextreme.data.UpdateChecker
 import com.frederic22.hyperextreme.data.WallpaperVersion
@@ -154,8 +158,25 @@ class MaskUiState(
 
     var themeMode by mutableStateOf(ThemeMode.of(prefs.themeMode))
 
-    /** 「启用Monet颜色」（2026-11-07）：只影响应用配色，见 [MaskPrefs.monetColor]。 */
+    /** 「Monet颜色」（2026-11-07）：只影响应用配色，见 [MaskPrefs.monetColor]。 */
     var monetColor by mutableStateOf(prefs.monetColor)
+
+    /** 「隐藏主页激活卡片」（2026-11-25，默认关；仅模块已激活时生效）。 */
+    var hideHomeStatusCard by mutableStateOf(prefs.hideHomeStatusCard)
+
+    /** 「主页背景同步应用状态」（2026-11-25，默认开；见 [MaskPrefs.homeBgFollowApp]）。 */
+    var homeBgFollowApp by mutableStateOf(prefs.homeBgFollowApp)
+
+    /** 「自定义主页背景」的版本戳（2026-11-25，0 = 没选；见 [MaskPrefs.homeBgCustom]）。 */
+    var homeBgCustom by mutableStateOf(prefs.homeBgCustom)
+
+    /**
+     * 「图片选择调用方式」（2026-11-26）：0 相册组件（默认）/ 1 文件管理组件。
+     *
+     * 注意它会**被别处改**：选图拿到空结果时 [ImagePick.consume] 会自动切成文件管理组件，
+     * 所以真正的同步靠 [refreshLocal]（prefs 监听），这里只是状态镜像。
+     */
+    var imagePickMode by mutableIntStateOf(prefs.imagePickMode)
 
     // ─────────────────────────── 检查更新（2026-11-16）───────────────────────────
 
@@ -296,6 +317,10 @@ class MaskUiState(
             frameworkConnected = ActivationState.frameworkConnected
             themeMode = ThemeMode.of(prefs.themeMode)
             monetColor = prefs.monetColor
+            hideHomeStatusCard = prefs.hideHomeStatusCard
+            homeBgFollowApp = prefs.homeBgFollowApp
+            homeBgCustom = prefs.homeBgCustom
+            imagePickMode = prefs.imagePickMode
             autoUpdateCheck = prefs.autoUpdateCheck
             parallaxActive = prefs.parallaxBgActive
             parallaxHasBg = MaskStore.parallaxExists(context)
@@ -317,11 +342,52 @@ class MaskUiState(
         if (ActivationState.frameworkConnected && !XposedProvider.isFrameworkAlive()) {
             ActivationState.markDisconnected()
         }
+        // **模块更新后停用正在生效的壁纸**（2026-11-23）：必须排在 refreshLocal 之前 ——
+        // 它可能清掉 active，后面 refreshLocal 才能把界面同步成「未应用」。
+        resetWallpapersIfUpdated()
         refreshLocal()
         scope.launch { reloadPreviews() }
         // 每天（北京时间）首次回前台补一次自动检测 —— 只挂 `LaunchedEffect` 的话，
         // App 常驻后台跨过零点、第二天回前台不会触发。日期闸门保证重复调用无副作用。
         autoCheckUpdateOnce()
+    }
+
+    /**
+     * 模块更新后停用正在生效的壁纸（2026-11-23，用户要求）。
+     *
+     * ## 为什么在 App 启动时做，而不是 `MY_PACKAGE_REPLACED` 静态广播
+     *
+     * 实测（2026-11-23）：HyperOS 4 上 App 进程不存在时，那个静态 receiver **不会被执行** ——
+     * 广播确实发了（`dumpsys activity broadcasts` 有记录，还带了 20s 临时白名单），
+     * 但 `onReceive` 没跑、run_log 无记录。用户定：更新完总会打开 App，所以改在启动路径检测，
+     * 那套广播已整个砍掉（含 manifest receiver）。
+     *
+     * ## 判据
+     *
+     * `PackageManager.longVersionCode` 与 [MaskPrefs.lastInstalledCode] 不同就触发；
+     * **0（从未记录）也触发一次** —— 全新安装没有 active 壁纸，`*Control.disable` 内部会早退，
+     * 不会误弹 toast；降级安装同样满足 `!=`。
+     *
+     * 三条链按固定顺序，互斥前提下最多一条真的停用 + 弹一条文案。
+     */
+    fun resetWallpapersIfUpdated() {
+        val code = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
+        }.getOrNull() ?: return
+        if (prefs.lastInstalledCode == code) return
+        // 先写：失败也不会每次启动都重来（与自动检测的「先写日期」同款取舍）。
+        prefs.setLastInstalledCode(code)
+        AliveControl.disable(
+            context,
+            "检测到HyperExtreme更新，Alive壁纸已自动关闭",
+            restartProcess = true,
+        )
+        RasterControl.disable(context, "检测到HyperExtreme更新，光栅壁纸已自动关闭")
+        SpatialControl.disable(
+            context,
+            "检测到HyperExtreme更新，空间壁纸已自动关闭",
+            restartProcess = true,
+        )
     }
 
     /**
@@ -454,10 +520,35 @@ class MaskUiState(
         prefs.setThemeMode(mode.id)
     }
 
-    /** 切换「启用Monet颜色」。换配色要重建 ThemeController，所以同 [applyThemeMode] 要往上报一层。 */
+    /** 切换「Monet颜色」。换配色要重建 ThemeController，所以同 [applyThemeMode] 要往上报一层。 */
     fun applyMonetColor(value: Boolean) {
         monetColor = value
         prefs.setMonetColor(value)
+    }
+
+    /** 切换「隐藏主页激活卡片」（2026-11-25）。纯界面选项，只影响主页怎么画。 */
+    fun applyHideHomeStatusCard(value: Boolean) {
+        hideHomeStatusCard = value
+        prefs.setHideHomeStatusCard(value)
+    }
+
+    /** 切换「主页背景同步应用状态」（2026-11-25）。纯界面选项。 */
+    fun applyHomeBgFollowApp(value: Boolean) {
+        homeBgFollowApp = value
+        prefs.setHomeBgFollowApp(value)
+    }
+
+    /** 切换「图片选择调用方式」（2026-11-26）：0 相册组件 / 1 文件管理组件。 */
+    fun applyImagePickMode(value: Int) {
+        val v = value.coerceIn(0, 1)
+        imagePickMode = v
+        prefs.setImagePickMode(v)
+    }
+
+    /** 选好 / 清掉「自定义主页背景」（2026-11-25）：传时间戳，清空传 0。 */
+    fun applyHomeBgCustom(stamp: Long) {
+        homeBgCustom = stamp
+        prefs.setHomeBgCustom(stamp)
     }
 
     fun applyAutoUpdateCheck(value: Boolean) {

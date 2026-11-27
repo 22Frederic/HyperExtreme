@@ -7,86 +7,61 @@ import android.graphics.BitmapShader
 import android.graphics.RuntimeShader
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import com.frederic22.hyperextreme.applyAppSystemBars
 import com.frederic22.hyperextreme.data.MaskPrefs
+import com.frederic22.hyperextreme.hook.SpatialGlCore
 import com.frederic22.hyperextreme.requestHighRefreshRate
 import com.frederic22.hyperextreme.resolveAppDark
 import com.frederic22.hyperextreme.spatial.SpatialCrop
 import com.frederic22.hyperextreme.spatial.SpatialDepth
-import com.frederic22.hyperextreme.hook.SpatialGlCore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
-import top.yukonga.miuix.kmp.basic.Icon
-import top.yukonga.miuix.kmp.basic.IconButton
+import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.SmallTopAppBar
-import top.yukonga.miuix.kmp.blur.BlendColorEntry
-import top.yukonga.miuix.kmp.blur.BlurDefaults
-import top.yukonga.miuix.kmp.material.isRuntimeShaderSupported
+import top.yukonga.miuix.kmp.blur.LayerBackdrop
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
-import top.yukonga.miuix.kmp.blur.textureBlur
-import top.yukonga.miuix.kmp.icon.MiuixIcons
-import top.yukonga.miuix.kmp.icon.extended.ChevronBackward
+import top.yukonga.miuix.kmp.material.isRuntimeShaderSupported
+import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import java.io.File
-import androidx.compose.foundation.layout.size
-import androidx.compose.ui.draw.BlurredEdgeTreatment
-import androidx.compose.ui.draw.blur
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Outline
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.Shape
-import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.unit.Density
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.LayoutDirection
-import top.yukonga.miuix.kmp.squircle.addSquircleRect
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Row
-import top.yukonga.miuix.kmp.blur.Backdrop
-import top.yukonga.miuix.kmp.blur.BlurColors
 
 /**
  * 「调整显示区域」—— **独立 Activity**（2026-11-04），吃系统转场动画。
@@ -94,19 +69,28 @@ import top.yukonga.miuix.kmp.blur.BlurColors
  * ## 为什么是独立 Activity
  *
  * 用户明确要求；顺带解决了两件事：
- * * 全屏沉浸（点图隐藏顶栏 + 状态栏）不会污染二级页的 `DetailTabHost` 状态；
+ * * 全屏沉浸不会污染二级页的 `DetailTabHost` 状态；
  * * 系统默认的进入/退出转场，比 Compose 路由更像系统相册。
+ *
+ * ## 布局（2026-11-27 改版）
+ *
+ * 从「图片铺满全屏 + 玻璃顶栏 + 底部两个按钮」改成**小米锁屏编辑**那套：
+ * 恒定 `#1a1a1a` 背景、中间一张屏幕比例的预览卡、上方一行「显示区域」、顶栏只有两个
+ * 常显玻璃圆钮、底部一个「恢复默认」。骨架全部在 [PreviewCardScaffold] 里 ——
+ * 本文件只负责预览本身（图 + shader + 手势 + 保存），后续任何「导入图片后看大图」的页面
+ * 都复用同一个骨架。
  *
  * ## 预览公式 = 渲染公式
  *
  * AGSL 里那段和 `SpatialGlCore.FRAG` **同一套**球面映射 + `SpatialCrop` 的仿射，
  * 只是去掉了位移场（预览是静止姿态，`uShift = 0`）。所以「预览里看到的就是壁纸上显示的」。
+ * 卡片与屏幕同为屏幕比例 ⇒ `SpatialGlCore.geometry()` 的结果与全屏时**完全一致**，
+ * 手势 clamp 也天然对齐，改版不需要动任何几何。
  *
  * ## 交互
  *
  * * 单指拖动 / 双指缩放（1×~2×，下限保证画面永远铺满）；
- * * 单击画面切顶栏 + 状态栏（`AnimatedVisibility` 淡入淡出，不位移）；
- * * 顶栏玻璃与底部按钮都用 miuix `textureBlur`；设备不支持 AGSL 时按钮退回半透明黑底。
+ * * 顶栏圆钮常显（不再单击切换）；状态栏由骨架常隐。
  */
 internal class SpatialCropActivity : ComponentActivity() {
 
@@ -134,7 +118,7 @@ internal class SpatialCropActivity : ComponentActivity() {
 
     /**
      * 无论「确认」还是返回键退出，都回报 OK —— 空间页那边只拿它当「回来重扫一次」的信号，
-     * 真正的落盘只在「确认显示区域」里发生，所以这里不会造成误保存。
+     * 真正的落盘只在「确认」里发生，所以这里不会造成误保存。
      */
     override fun finish() {
         runCatching { setResult(RESULT_OK) }
@@ -142,7 +126,8 @@ internal class SpatialCropActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        // ⚠️ 沉浸态退出前必须把系统栏恢复回来，否则返回二级页时状态栏不见了。
+        // ⚠️ 骨架在 onDispose 里已经 show 回来了，这里双保险：任何路径退出都别把状态栏
+        // 留在隐藏态（二级页顶栏的高度依赖它）。
         runCatching {
             WindowCompat.getInsetsController(window, window.decorView)
                 .show(WindowInsetsCompat.Type.systemBars())
@@ -189,39 +174,26 @@ private const val CROP_AGSL = """
     }
 """
 
-/** 「确认显示区域」的圆角：与 miuix `Button` 默认圆角同值（16dp），**圆角矩形而非胶囊**。 */
-private val CROP_BUTTON_CORNER = 16.dp
-
-// ── 投影：高斯 28dp / 黑 0.13，自绘（数值沿用旧悬浮底栏） ──
-//
-// 不用 `graphicsLayer.shadowElevation`：那套光源固定在屏幕上方，只有下缘有影，
-// 做不出「光从看屏幕的方向打过来」的四周均匀效果。改成自绘：一个大一圈的圆角块
-// 交给 `Modifier.blur` 模糊，四周同强度、糊度可调（代价只有一个离屏层）。
-
-/** 投影的高斯模糊半径。 */
-private val CROP_SHADOW_BLUR = 28.dp
-
-/** 投影的黑色透明度。 */
-private const val CROP_SHADOW_ALPHA = 0.13f
-
-/**
- * 平滑圆角 Shape 已提到 **`ui/RasterCardParts.kt` 的 [SquircleShape]**（2026-11-13）：
- * 光栅二级页的状态胶囊也要同一颗玻璃，两处共用一份，几何不会漂。
- */
+/** 「恢复默认」按钮宽度（2026-11-27 用户要求保持原值，不跟新卡宽走）。 */
+private val RESET_BUTTON_WIDTH = 150.dp
 
 @Composable
 private fun CropScreen(key: String, onClose: () -> Unit) {
     val ctx = LocalContext.current
     val haptic = rememberClickHaptic()
     val scope = rememberCoroutineScope()
-    val view = LocalView.current
-    val density = LocalDensity.current
 
     var bitmap by remember { mutableStateOf<Bitmap?>(null) }
     var crop by remember { mutableStateOf(SpatialCrop.DEFAULT) }
-    // 顶栏 + 状态栏是否可见（点一下画面切换）。
-    var barsVisible by remember { mutableStateOf(true) }
+    // 「进页时的那一份」—— 只用来判断「动过没有」（小米 `BaseTemplateView.onCancel` 的 `isEdited()`）。
+    // ⚠️ 初值必须是 **null**、不能是 `DEFAULT`：下面 `LaunchedEffect(geo)` 会拿老参数做一次
+    // `clampWith` 修正（旧版本按 0.5/zoom 存过更宽的 cx）。如果这里先记 DEFAULT，
+    // 修正完就会「一进页就 edited」⇒ 返回立刻误弹窗。null = 还没定，修正完才写入。
+    var cropAtEntry by remember { mutableStateOf<SpatialCrop.Crop?>(null) }
+    var showDiscard by remember { mutableStateOf(false) }
+    val edited = cropAtEntry != null && crop != cropAtEntry
     // 画布实际尺寸（物理像素）—— 手势的 clamp 和 shader 必须用**同一个**几何。
+    // 现在画布 = 卡片（0.7243 屏），与屏幕同为屏幕比例 ⇒ geometry 结果与全屏时一致。
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
 
     // 载入：原图副本（没有就退回背景层图）+ 已存参数。
@@ -230,7 +202,7 @@ private fun CropScreen(key: String, onClose: () -> Unit) {
             val dir = File(SpatialDepth.cacheRoot(ctx), key)
             val src = SpatialDepth.sourceFile(dir).takeIf { it.isFile }
                 ?: File(dir, "layers/layer0.png").takeIf { it.isFile }
-            // 2000：屏幕宽 1200，放到 2× 时需要 2400 的有效像素；2000 是内存与清晰度的折中（约 21MB）。
+            // 2000：卡片宽约 870px，放到 2× 时需要 1740 的有效像素；2000 是内存与清晰度的折中（约 21MB）。
             val bmp = src?.let { SpatialDepth.decodePreview(it, 2000) }
             bmp to SpatialCrop.read(ctx, key)
         }
@@ -238,29 +210,13 @@ private fun CropScreen(key: String, onClose: () -> Unit) {
         crop = loaded.second
         android.util.Log.i(
             "HyperExtreme",
-            "CROP 加载 key=$key bitmap=${loaded.first?.width}x${loaded.first?.height} crop=$crop",
+            "CROP 加载 key=$key bitmap=${loaded.first?.width}x${loaded.first?.height} crop=$loaded.second",
         )
     }
 
-    // 状态栏跟随顶栏显隐（拖动不触发，只有单击切）。
-    LaunchedEffect(barsVisible) {
-        val window = (view.context as? ComponentActivity)?.window ?: return@LaunchedEffect
-        val c = WindowCompat.getInsetsController(window, view)
-        c.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        if (barsVisible) c.show(WindowInsetsCompat.Type.systemBars())
-        else c.hide(WindowInsetsCompat.Type.systemBars())
-    }
-
-    // 屏幕尺寸换算（预览 shader 与手势都用它）。
-    val screen = rememberScreenSizePx()
-    val cardWidthDp = with(density) { (screen.width * CARD_WIDTH_RATIO).toDp() }
-    // 按钮宽度 = 「应用」按钮宽（卡宽 5/6 = 150dp）。两个按钮同宽，中间 12dp。
-    val applyButtonWidth = cardWidthDp * 5f / 6f
-    val buttonWidth = applyButtonWidth
-
-    // 几何：**画布实测尺寸** + 纹理尺寸 ⇒ 屏幕可见的 uv 范围（手势 clamp 与 shader 共用）。
-    // 用实测尺寸而不是 `screen`：edge-to-edge 下两者通常相同，但导航栏/挖孔时机可能差几像素，
-    // 差一点就会让 clamp 和实际采样对不上（表现为拖到边上露一丝黑）。
+    // 几何：**卡片实测尺寸** + 纹理尺寸 ⇒ 可见 uv 范围（手势 clamp 与 shader 共用）。
+    // 用实测尺寸而不是屏幕：卡片尺寸由 `PreviewCardScaffold` 算，差一点就会让 clamp
+    // 和实际采样对不上（表现为拖到边上露一丝黑）。
     val geo = remember(canvasSize, bitmap) {
         val b = bitmap
         if (b == null || canvasSize.width <= 0 || canvasSize.height <= 0) {
@@ -275,43 +231,14 @@ private fun CropScreen(key: String, onClose: () -> Unit) {
     LaunchedEffect(geo) {
         val g = geo ?: return@LaunchedEffect
         if (cropCorrected) return@LaunchedEffect
-        crop = SpatialCrop.clampWith(
+        val corrected = SpatialCrop.clampWith(
             crop, g.visibleHalfX, g.visibleHalfY, g.shiftMarginX, g.shiftMarginY,
         )
+        crop = corrected
+        // 入口基准取「修正后」的值 —— 这一下不算用户改动。
+        if (cropAtEntry == null) cropAtEntry = corrected
         cropCorrected = true
     }
-
-    val backdrop = if (isRuntimeShaderSupported()) {
-        rememberLayerBackdrop { drawContent() }
-    } else {
-        null
-    }
-    // 玻璃叠色（2026-11-04 用户定稿，两处**用不同的色**）：
-    // * 顶栏 = `surface`（主题表面色：浅色白、深色深灰）+ alpha 0.5 —— 中性磨砂，不抢画面；
-    // * 按钮 = **主题强调色 `primary`** + alpha 0.6 —— 带色调，让主操作"抓人"。
-    // 透明度一路调过 0.8 → 0.35 → 0.40 → 现在的两档。
-    //
-    // ⚠️ `blurColors` 是 @Composable，**不能**塞进 `remember { }` 的 lambda；
-    // 它内部自带 remember，每次重组调用是安全的。
-    val barTint = MiuixTheme.colorScheme.surface.copy(alpha = 0.5f)
-    val buttonTint = MiuixTheme.colorScheme.primary.copy(alpha = 0.6f)
-    // 「恢复默认」用 `onPrimaryVariant` 那一组（浅色底 + 深色字，见 miuix 官方色板）。
-    // ⚠️ `onPrimaryVariant` 本身是**浅色**，所以字必须用 `primaryVariant`（深），
-    // 两者同色会看不见 —— miuix 没有为这一组提供现成的 `buttonColors*` 封装。
-    val resetTint = MiuixTheme.colorScheme.onPrimaryVariant.copy(alpha = 0.6f)
-    val resetContent = MiuixTheme.colorScheme.primaryVariant
-    val barGlassColors = BlurDefaults.blurColors(
-        blendColors = listOf(BlendColorEntry(color = barTint)),
-    )
-    val buttonGlassColors = BlurDefaults.blurColors(
-        blendColors = listOf(BlendColorEntry(color = buttonTint)),
-    )
-    val resetGlassColors = BlurDefaults.blurColors(
-        blendColors = listOf(BlendColorEntry(color = resetTint)),
-    )
-    // 按钮的**平滑圆角**：玻璃层、投影层、按钮本体三者几何必须完全相同，
-    // 否则圆角处玻璃会比按钮"鼓"出来（用户 2026-11-04 指出）。
-    val buttonShape = remember { SquircleShape(CROP_BUTTON_CORNER) }
 
     val shader = remember { RuntimeShader(CROP_AGSL) }
     // 绘制用的 Paint：用原生 `android.graphics.Paint`（比 Compose 的包装类少一层、
@@ -332,7 +259,6 @@ private fun CropScreen(key: String, onClose: () -> Unit) {
     // LaunchedEffect 在组合提交之后才启动，而 Canvas 的 draw 在同一帧已经画过一遍 ——
     // 那时 uTex 还是空的 ⇒ 全黑；之后又没有东西触发重绘，于是「进页面黑屏、缩放一下才出图」
     //（2026-11-04 用户报的）。`remember(bitmap)` 同步执行，天然早于 draw。
-    //
     val texReady = remember(shader, bitmap) {
         val b = bitmap
         if (b == null) {
@@ -358,232 +284,187 @@ private fun CropScreen(key: String, onClose: () -> Unit) {
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // ── 图片层（content 快照给顶栏 / 按钮做玻璃）──
-        val imageModifier = if (backdrop != null) {
-            Modifier.fillMaxSize().layerBackdrop(backdrop)
-        } else {
-            Modifier.fillMaxSize()
-        }
-        Box(modifier = imageModifier.onSizeChanged { canvasSize = it }) {
-            Canvas(Modifier.fillMaxSize()) {
-                if (!texReady) return@Canvas
-                val bmp = bitmap ?: return@Canvas
-                val g = geo ?: return@Canvas
-                shader.setFloatUniform("uSize", size.width, size.height)
-                shader.setFloatUniform("uTexSize", bmp.width.toFloat(), bmp.height.toFloat())
-                shader.setFloatUniform("uK", g.kx, g.ky)
-                shader.setFloatUniform("uSpan", g.spanX, g.spanY)
-                val sc = SpatialCrop.scaleOf(crop)
-                shader.setFloatUniform("uUvScale", sc, sc)
-                shader.setFloatUniform(
-                    "uUvOffset",
-                    SpatialCrop.offsetXOf(crop),
-                    SpatialCrop.offsetYOf(crop),
-                )
-                // ⚠️ **不能用 `drawRect(brush = brush)`**（2026-11-04 的真根因）：
-                // Compose 的 `Paint()` 默认 `filterQuality = None`，而
-                // `AndroidPaint.setFilterQuality` 的实现就是 `paint.setFilterBitmap(quality != None)`
-                // ⇒ 默认 **setFilterBitmap(false) = 最近邻**；`BitmapShader` 的三参构造传的是
-                // `FILTER_MODE_DEFAULT`（跟随 Paint）⇒ 整条链全程最近邻。
-                // 所以之前 4 taps 只是「4 个硬点取平均」，等于没插值（锯齿自然还在）。
-                // 双线性在 `drawPaint` 构造时就打开了（`isFilterBitmap = true`）。
-                drawPaint.shader = shader
-                drawIntoCanvas { canvas ->
-                    canvas.nativeCanvas.drawRect(0f, 0f, size.width, size.height, drawPaint)
+    // 玻璃弹窗的采样层：整页（含顶栏）。圆钮走 `fill`、不用 backdrop ⇒ 录进去也不会
+    // 「自己采样自己」（对比 2026-11-27 那次 `prepareTreeImpl` 递归的前提）。
+    val pageBackdrop: LayerBackdrop? = if (isRuntimeShaderSupported()) {
+        rememberLayerBackdrop { drawContent() }
+    } else {
+        null
+    }
+
+    // 返回：动过就弹「放弃更改？」，否则直接退出（与 `HomeBgCropActivity` 同一条逻辑）。
+    val handleBack: () -> Unit = {
+        if (edited) showDiscard = true else onClose()
+    }
+    // 系统返回键也走这条（左上角返回钮在骨架里，走 `onBack`）。
+    BackHandler { handleBack() }
+
+    CompositionLocalProvider(LocalPageBackdrop provides pageBackdrop) {
+    // ⚠️ **必须有 `Scaffold`**：miuix 的 `GlassDialog` 只把 `DialogState` 注册进
+    // `LocalDialogStates`，真正渲染它的是 `Scaffold` 里的 `MiuixPopupHost`。
+    // 裸 Activity 不套 Scaffold ⇒ 弹窗静默不出现（不报错、不崩），见《07》§7.15 第 24 条。
+    // 透明容器 + `WindowInsets(0)`：不引底色、不改布局（状态栏是骨架自己隐的）。
+    Scaffold(
+        containerColor = Color.Transparent,
+        contentWindowInsets = WindowInsets(0),
+    ) { insetsPadding ->
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(insetsPadding)
+            .then(if (pageBackdrop != null) Modifier.layerBackdrop(pageBackdrop) else Modifier),
+    ) {
+    PreviewCardScaffold(
+        title = "显示区域",
+        onBack = handleBack,
+        onConfirm = {
+            // 振动在 `GlassIconButtonWithFeedback` 里已经做过一次，这里不再重复。
+            scope.launch {
+                val ok = withContext(Dispatchers.IO) {
+                    SpatialCrop.write(ctx, key, crop)
+                }
+                android.widget.Toast.makeText(
+                    ctx,
+                    // 正在应用的那张本来就点不进来（页面层拦掉了），
+                    // 能改的都是"下一次应用才生效"的卡 —— 不需要再解释生效时机
+                    //（2026-11-05 用户要求）。
+                    if (ok) "显示区域已保存" else "保存失败",
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
+                onClose()
+            }
+        },
+        actions = {
+            // 「恢复默认」：只把**内存里的编辑状态**重置为默认，不写盘、不弹 toast ——
+            // 用户还要点右上角 ✓ 才真正保存（2026-11-05 用户明确）。
+            //
+            // 2026-11-27：不再用玻璃材质 —— 页面背景已经是实色 `#1a1a1a`，透上去什么也看不见，
+            // 直接走 miuix 标准主题色按钮（`buttonColorsPrimary`：`primary` 底 + `onPrimary` 字）。
+            Button(
+                onClick = {
+                    haptic()
+                    crop = SpatialCrop.DEFAULT
+                },
+                modifier = Modifier.width(RESET_BUTTON_WIDTH),
+                colors = ButtonDefaults.buttonColorsPrimary(),
+            ) {
+                Text(text = "恢复默认", style = MiuixTheme.textStyles.button)
+            }
+        },
+    ) {
+        // ── 卡片内容：预览 + 手势 ──
+        // `PreviewCardScaffold` 已经把这块裁到圆角，这里直接铺满。
+        Box(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.fillMaxSize().onSizeChanged { canvasSize = it }) {
+                Canvas(Modifier.fillMaxSize()) {
+                    if (!texReady) return@Canvas
+                    val bmp = bitmap ?: return@Canvas
+                    val g = geo ?: return@Canvas
+                    shader.setFloatUniform("uSize", size.width, size.height)
+                    shader.setFloatUniform("uTexSize", bmp.width.toFloat(), bmp.height.toFloat())
+                    shader.setFloatUniform("uK", g.kx, g.ky)
+                    shader.setFloatUniform("uSpan", g.spanX, g.spanY)
+                    val sc = SpatialCrop.scaleOf(crop)
+                    shader.setFloatUniform("uUvScale", sc, sc)
+                    shader.setFloatUniform(
+                        "uUvOffset",
+                        SpatialCrop.offsetXOf(crop),
+                        SpatialCrop.offsetYOf(crop),
+                    )
+                    // ⚠️ **不能用 `drawRect(brush = brush)`**（2026-11-04 的真根因）：
+                    // Compose 的 `Paint()` 默认 `filterQuality = None`，而
+                    // `AndroidPaint.setFilterQuality` 的实现就是 `paint.setFilterBitmap(quality != None)`
+                    // ⇒ 默认 **setFilterBitmap(false) = 最近邻**；`BitmapShader` 的三参构造传的是
+                    // `FILTER_MODE_DEFAULT`（跟随 Paint）⇒ 整条链全程最近邻。
+                    // 所以之前 4 taps 只是「4 个硬点取平均」，等于没插值（锯齿自然还在）。
+                    // 双线性在 `drawPaint` 构造时就打开了（`isFilterBitmap = true`）。
+                    drawPaint.shader = shader
+                    drawIntoCanvas { canvas ->
+                        canvas.nativeCanvas.drawRect(0f, 0f, size.width, size.height, drawPaint)
+                    }
                 }
             }
-        }
 
-        // ── 手势层（铺满，压在图片上）：拖动 / 缩放 / 单击 ──
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                // key 用 geo：它一变（图 / 画布尺寸就绪）就要重建手势，
-                // 否则闭包捕获的是旧的 null，拖动会直接 return。
-                .pointerInput(geo) {
-                    val g = geo ?: return@pointerInput
-                    detectTransformGestures { centroid, pan, zoomChange, _ ->
-                        val w = size.width.toFloat()
-                        val h = size.height.toFloat()
-                        if (w <= 0f || h <= 0f) return@detectTransformGestures
-                        var c = crop
-                        // 拖动：1px = (1/zoom)/W 的 uv；向右拖 = 显示区域左移。
-                        c = c.copy(
-                            cx = c.cx - pan.x * (1f / c.zoom) / w,
-                            cy = c.cy - pan.y * (1f / c.zoom) / h,
-                        )
-                        if (zoomChange != 1f) {
-                            // 以手势中心为锚点缩放：手指下的 uv 点保持不动。
-                            val px = centroid.x / w
-                            val py = centroid.y / h
-                            val uvX = c.cx + (px - 0.5f) / c.zoom
-                            val uvY = c.cy + (py - 0.5f) / c.zoom
-                            val nz = (c.zoom * zoomChange)
-                                .coerceIn(SpatialCrop.ZOOM_MIN, SpatialCrop.ZOOM_MAX)
+            // 手势层（铺满卡片）：拖动 / 缩放。顶栏常显，所以**没有**单击切换。
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    // key 用 geo：它一变（图 / 画布尺寸就绪）就要重建手势，
+                    // 否则闭包捕获的是旧的 null，拖动会直接 return。
+                    .pointerInput(geo) {
+                        val g = geo ?: return@pointerInput
+                        detectTransformGestures { centroid, pan, zoomChange, _ ->
+                            val w = size.width.toFloat()
+                            val h = size.height.toFloat()
+                            if (w <= 0f || h <= 0f) return@detectTransformGestures
+                            var c = crop
+                            // 拖动：1px = (1/zoom)/W 的 uv；向右拖 = 显示区域左移。
                             c = c.copy(
-                                cx = uvX - (px - 0.5f) / nz,
-                                cy = uvY - (py - 0.5f) / nz,
-                                zoom = nz,
+                                cx = c.cx - pan.x * (1f / c.zoom) / w,
+                                cy = c.cy - pan.y * (1f / c.zoom) / h,
+                            )
+                            if (zoomChange != 1f) {
+                                // 以手势中心为锚点缩放：手指下的 uv 点保持不动。
+                                val px = centroid.x / w
+                                val py = centroid.y / h
+                                val uvX = c.cx + (px - 0.5f) / c.zoom
+                                val uvY = c.cy + (py - 0.5f) / c.zoom
+                                val nz = (c.zoom * zoomChange)
+                                    .coerceIn(SpatialCrop.ZOOM_MIN, SpatialCrop.ZOOM_MAX)
+                                c = c.copy(
+                                    cx = uvX - (px - 0.5f) / nz,
+                                    cy = uvY - (py - 0.5f) / nz,
+                                    zoom = nz,
+                                )
+                            }
+                            // 边界 = 「屏幕可见 uv 半宽 ÷ zoom + 位移余量」，
+                            // 不是旧的 0.5/zoom（那个在 zoom = 1 时把 cx 锁死在 0.5）。
+                            crop = SpatialCrop.clampWith(
+                                c, g.visibleHalfX, g.visibleHalfY, g.shiftMarginX, g.shiftMarginY,
                             )
                         }
-                        // 边界 = 「屏幕可见 uv 半宽 ÷ zoom + 位移余量」，
-                        // 不是旧的 0.5/zoom（那个在 zoom = 1 时把 cx 锁死在 0.5）。
-                        crop = SpatialCrop.clampWith(
-                            c, g.visibleHalfX, g.visibleHalfY, g.shiftMarginX, g.shiftMarginY,
-                        )
-                    }
-                }
-                .pointerInput(Unit) {
-                    // 单击切顶栏；拖动不会走到这里（transform 手势会先消费）。
-                    detectTapGestures { barsVisible = !barsVisible }
-                },
-        )
-
-        // ── 顶栏：淡入淡出（不位移），玻璃保留 ──
-        AnimatedVisibility(
-            visible = barsVisible,
-            enter = fadeIn(tween(200)),
-            exit = fadeOut(tween(200)),
-            modifier = Modifier.align(Alignment.TopCenter),
-        ) {
-            // 玻璃参数 = 官方 `BlurredBar` 的均匀模糊分支：25f + surface 80%。
-            val barModifier = if (backdrop != null) {
-                Modifier
-                    .fillMaxWidth()
-                    .textureBlur(
-                        backdrop = backdrop,
-                        shape = RectangleShape,
-                        blurRadius = 25f,
-                        colors = barGlassColors,
-                    )
-            } else {
-                Modifier.fillMaxWidth().background(barTint)
-            }
-            // **直接用 miuix `TopAppBar`**（2026-11-04 用户要求）：
-            // 标题居中、`title3` 字号、返回钮 16dp padding、内容色走 `onSurface` ——
-            // 高度 52dp / 标题 padding 26dp 全都是 `TopAppBarDefaults` 的规范值，
-            // 与二级页完全一致，不用手写、也不会在浅色模式下白字压白玻璃。
-            SmallTopAppBar(
-                title = "显示区域",
-                modifier = barModifier,
-                color = Color.Transparent,
-                navigationIcon = {
-                    IconButton(onClick = { haptic(); onClose() }) {
-                        Icon(
-                            imageVector = MiuixIcons.ChevronBackward,
-                            contentDescription = "返回",
-                        )
-                    }
-                },
+                    },
             )
         }
+    }
+    }
 
-        // ── 底部两个按钮（2026-11-05）：一行、间距 12dp、各 = 「应用」按钮宽（150dp）──
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(bottom = 24.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                // 「恢复默认」：只把**内存里的编辑状态**重置为默认，不写盘、不弹 toast ——
-                // 用户还要点「确认显示区域」才真正保存（2026-11-05 用户明确）。
-                GlassButton(
-                    text = "恢复默认",
-                    width = buttonWidth,
-                    shape = buttonShape,
-                    backdrop = backdrop,
-                    glassColors = resetGlassColors,
-                    fallbackTint = resetTint,
-                    contentColor = resetContent,
+    // ── 「放弃更改？」── 常驻组合树、用 `show` 控制（条件包裹会让 miuix 来不及播退出动画）。
+    // 结构与配色与 `HomeBgCropActivity` / 「清除所有光栅壁纸组合」那一套完全一致：
+    // `danger = true` 是官方 `Destructive`（淡底 + 红字），不是旧版的红底白字。
+    AppGlassDialog(
+        title = "放弃更改？",
+        summary = null,
+        show = showDiscard,
+        onDismissRequest = { showDiscard = false },
+    ) {
+        val dismissState = LocalDismissState.current
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Spacer(Modifier.height(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                TextButtonLike(
+                    text = "取消",
                     onClick = {
-                        haptic()
-                        crop = SpatialCrop.DEFAULT
+                        showDiscard = false
+                        dismissState?.invoke()
                     },
                 )
-                GlassButton(
-                    text = "确认显示区域",
-                    width = buttonWidth,
-                    shape = buttonShape,
-                    backdrop = backdrop,
-                    glassColors = buttonGlassColors,
-                    fallbackTint = buttonTint,
-                    contentColor = Color.White,
+                Spacer(Modifier.width(20.dp))
+                TextButtonLike(
+                    text = "放弃",
+                    danger = true,
                     onClick = {
-                        haptic()
-                        scope.launch {
-                            val ok = withContext(Dispatchers.IO) {
-                                SpatialCrop.write(ctx, key, crop)
-                            }
-                            android.widget.Toast.makeText(
-                                ctx,
-                                // 正在应用的那张本来就点不进来（页面层拦掉了），
-                                // 能改的都是"下一次应用才生效"的卡 —— 不需要再解释生效时机
-                                //（2026-11-05 用户要求）。
-                                if (ok) "显示区域已保存" else "保存失败",
-                                android.widget.Toast.LENGTH_SHORT,
-                            ).show()
-                            onClose()
-                        }
+                        showDiscard = false
+                        // 不写盘 —— 直接退出，磁盘上还是进来时那份 crop。
+                        onClose()
                     },
                 )
             }
         }
     }
-}
-
-/**
- * 显示区域页的玻璃按钮（2026-11-05）。
- *
- * 两个按钮**几何完全一致**：同一个 `shape`（平滑圆角）、同一个宽度、同一个自然高度
- * （miuix `Button` = `max(MinHeight 40dp, 行高 24 + insideMargin 13×2)` ≈ 50dp）。
- * 只有叠色和字色不同 —— 用户要求它们看起来是一对。
- *
- * 投影参数：高斯 28dp / 黑 0.13（数值沿用旧悬浮底栏）。
- * `matchParentSize()` 不参与 Box 测量 ⇒ 阴影层自动等于按钮尺寸，不改变按钮高度。
- */
-@Composable
-private fun GlassButton(
-    text: String,
-    width: Dp,
-    shape: Shape,
-    backdrop: Backdrop?,
-    glassColors: BlurColors,
-    fallbackTint: Color,
-    contentColor: Color,
-    onClick: () -> Unit,
-) {
-    Box(contentAlignment = Alignment.Center) {
-        Box(
-            modifier = Modifier
-                .matchParentSize()
-                .blur(CROP_SHADOW_BLUR, BlurredEdgeTreatment.Unbounded)
-                .background(Color.Black.copy(alpha = CROP_SHADOW_ALPHA), shape),
-        )
-        val m = if (backdrop != null) {
-            Modifier
-                .width(width)
-                .textureBlur(
-                    backdrop = backdrop,
-                    shape = shape,
-                    blurRadius = 18f,
-                    colors = glassColors,
-                )
-        } else {
-            Modifier.width(width).background(color = fallbackTint, shape = shape)
-        }
-        Button(
-            onClick = onClick,
-            modifier = m,
-            // 按钮自己的底必须透明，否则会把玻璃层整个盖住。
-            colors = ButtonDefaults.buttonColors(
-                color = Color.Transparent,
-                contentColor = contentColor,
-            ),
-        ) {
-            Text(text = text, style = MiuixTheme.textStyles.button)
-        }
+    }
     }
 }

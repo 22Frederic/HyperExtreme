@@ -73,10 +73,20 @@ internal object WallpaperConflict {
      * 顺序就是优先级：视差 → 空间 → 光栅 → Alive。四链互斥，正常最多一条；
      * 脏数据（比如手动改过 prefs）下按这个顺序取第一条。
      */
-    private fun detect(ctx: Context, state: MaskUiState): List<RunningWallpaper> {
+    private fun detect(ctx: Context, state: MaskUiState): List<RunningWallpaper> =
+        detect(ctx, state.parallaxActive)
+
+    /**
+     * 同上，但视差状态由调用方给（2026-11-25）。
+     *
+     * 存在的理由：`HomeCover` 在 **IO 线程**解析封面，那边不能读 Compose 的 [MaskUiState]
+     * （快照状态只在主线程语义下可靠），从 prefs 取一个布尔再传进来即可 —— 两者本来就同源
+     * （`MaskUiState.parallaxActive` 初值就是 `prefs.parallaxBgActive`）。
+     */
+    private fun detect(ctx: Context, parallaxActive: Boolean): List<RunningWallpaper> {
         val prefs = MaskPrefs(ctx)
         val out = ArrayList<RunningWallpaper>(4)
-        if (state.parallaxActive) {
+        if (parallaxActive) {
             out.add(RunningWallpaper(WallpaperChain.PARALLAX, WallpaperMode.HOOK))
         }
         if (prefs.spatialActive) {
@@ -114,7 +124,33 @@ internal object WallpaperConflict {
      * 与 [running] 共用同一份 [detect]：主页与冲突弹窗对「在不在跑」永远同一个答案。
      */
     fun current(ctx: Context, state: MaskUiState): RunningWallpaper? =
-        detect(ctx, state).firstOrNull()
+        current(ctx, state.parallaxActive)
+
+    /** 同上，视差状态由调用方给（IO 线程用，见 [detect] 的重载说明）。 */
+    fun current(ctx: Context, parallaxActive: Boolean): RunningWallpaper? =
+        detect(ctx, parallaxActive).firstOrNull().also {
+            lastKnown = it
+            lastKnownValid = true
+        }
+
+    /**
+     * **组合期用**：有上一次的结果就直接给，没有才真的检测一次（2026-11-25）。
+     *
+     * 为什么要它：主页被 pager 销毁重建时（功能页 ↔ 设置页会把主页踢出/拉进组合树），
+     * `remember { current(...) }` 会在**主线程组合期**重新跑一遍 [detect] —— 服务模式下
+     * 那是 4 次 `WallpaperManager#getWallpaperInfo` 的跨进程调用，一次翻页就能掉帧。
+     * 运行状态不会因为"翻了个页"而变，读缓存足够；真要看最新值的地方（ON_RESUME）
+     * 仍然走 [current] 强制检测。
+     */
+    fun cached(ctx: Context, state: MaskUiState): RunningWallpaper? =
+        if (lastKnownValid) lastKnown else current(ctx, state)
+
+    /** [cached] 的缓存（进程内）。主线程与 IO 线程都会写，用 `@Volatile` 兜可见性。 */
+    @Volatile
+    private var lastKnown: RunningWallpaper? = null
+
+    @Volatile
+    private var lastKnownValid = false
 
     /**
      * 关闭指定那条链（幂等）。

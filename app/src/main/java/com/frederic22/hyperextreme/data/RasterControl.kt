@@ -19,10 +19,19 @@ import android.widget.Toast
  *
  * ## 与 [SpatialControl] 的差异
  *
- * 空间壁纸的层挂在 `miwallpaper` 的 leash 下，关掉后必须重启壁纸进程重建壁纸层；
- * 光栅的层挂在 **SystemUI** 自己的 leash 上，`RasterFlag` 置 0 后渲染器轮询到就会
- * `RasterRenderer.stop()` 自己把层拆干净 —— 不需要杀任何进程（也不该杀：SystemUI
- * 重启的代价远大于空间那条链）。
+ * **三条链挂的是同一个东西**：`WindowManagerGlobal#getWallpaperByShowWhenLocked(displayId,
+ * showWhenLocked).getLeash()` —— 壁纸窗口那条 leash（锁屏 / 桌面各一条），
+ * 我们的 SurfaceControl 都是它的子层。
+ *
+ * ⚠️ 别读成「光栅挂在 SystemUI 的窗口层上」：leash 对象由 SystemUI 的
+ * `WindowManagerGlobal` 暴露，但那个 SurfaceControl 属于壁纸窗口（`miwallpaper` 的
+ * `ImageWallpaper`），三条链的挂载代码逐字同构（见 `RasterRenderer.attachToLeash`）。
+ *
+ * 差别只在**关闭时的清理**：光栅层数少（锁屏 / 桌面各一份贴图 + 一条擦除带），
+ * `RasterRenderer.stopInternal()` 的 `Transaction.remove` 能当场拆干净 —— 所以不需要杀进程
+ * （也不该杀：SystemUI 重启的代价远大于空间那条链）。空间 / Alive 在真机 dump 到过残留子层
+ * （`he-alive-lock#xxxxx`，全屏、alpha 255、冻结画面，见 [AliveControl]），才用
+ * 「重启壁纸进程」做兜底。
  *
  * ## 服务模式
  *

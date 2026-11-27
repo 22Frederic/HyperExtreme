@@ -107,7 +107,7 @@ class MaskPrefs(context: Context) {
         prefs.edit().putInt(KEY_RASTER_SCOPE, value).commit()
     }
 
-    /** 启用光栅壁纸锁屏景深（默认关）；**只对 LSPosed 模式有效**。 */
+    /** 光栅壁纸锁屏景深（默认关）；**只对 LSPosed 模式有效**。 */
     val rasterLockDepth: Boolean
         get() = prefs.getBoolean(KEY_RASTER_LOCK_DEPTH, false)
 
@@ -116,7 +116,7 @@ class MaskPrefs(context: Context) {
     }
 
     /**
-     * 启用 **Alive 壁纸**锁屏景深（默认关）—— 照光栅同一语义（2026-11-08）。
+     * **Alive 壁纸**锁屏景深（默认关）—— 照光栅同一语义（2026-11-08）。
      *
      * 开 = SystemUI 保留 `keyguard_foreground_layer`，把我们抠好的主体换上去；
      * 关 = 整层压掉（旧壁纸的人像不能浮在新图上）。
@@ -159,16 +159,22 @@ class MaskPrefs(context: Context) {
      * | 0 [RASTER_TRANSITION_DEFAULT] | 默认：纯擦除（对应 vivo 的 d2） |
      * | 1 [RASTER_TRANSITION_STRIPE] | 条纹玻璃：一维余弦法线 + 折射 + 色散 + 弱阴影（d1） |
      * | 2 [RASTER_TRANSITION_FROST] | 磨砂玻璃：二维噪声法线 + 折射，无阴影（d3） |
-     * | 3 [RASTER_TRANSITION_TWIST] | 条纹玻璃（扭曲变形）：强法线 + 强折射 + 强阴影 + 漫反射（d4） |
+     * | 3 [RASTER_TRANSITION_TWIST] | 条纹玻璃（扭曲变形）：强法线 + 强折射 + 强阴影 + 漫反射 |
+     * | 4 [RASTER_TRANSITION_FINE] | **细线玻璃**：d4 的真实贴图波形 —— 一个周期里只有一对紧挨的细纹，其余是长平缓区 |
+     *
+     * ⚠️ 3 和 4 **参数完全相同**（vivo `Draw4Configure` 那一组：bump 10 / refract 0.25 / shadow 0.5），
+     * 区别只在高度场：3 是等宽余弦，4 是 d4 贴图实测的「两段抛物线 + 谷底尖峰」。
+     * 所以视觉上 3 是「均匀条纹被强折射掰弯」，4 是「长短短长交替」。
      *
      * 只在**擦除带内**生效（vivo 口径），不是 MIUI moru 那种全屏条纹玻璃（见《99》§99.11）。
      * 2026-11-07 起是**纯渲染参数**：生效中改立即热更新并硬切归位一次，不再等下一次应用。
      */
     val rasterTransition: Int
-        get() = prefs.getInt(KEY_RASTER_TRANSITION, RASTER_TRANSITION_DEFAULT).coerceIn(0, 3)
+        get() = prefs.getInt(KEY_RASTER_TRANSITION, RASTER_TRANSITION_DEFAULT)
+            .coerceIn(0, RASTER_TRANSITION_MAX)
 
     fun setRasterTransition(value: Int) {
-        prefs.edit().putInt(KEY_RASTER_TRANSITION, value.coerceIn(0, 3)).commit()
+        prefs.edit().putInt(KEY_RASTER_TRANSITION, value.coerceIn(0, RASTER_TRANSITION_MAX)).commit()
     }
 
     /**
@@ -219,7 +225,7 @@ class MaskPrefs(context: Context) {
     }
 
     /**
-     * 空间壁纸「**启用空间壁纸锁屏景深**」（默认关，2026-10-29 用户要求）。
+     * 空间壁纸「**空间壁纸锁屏景深**」（默认关，2026-10-29 用户要求）。
      *
      * 开 = 主体层额外画进 SystemUI 窗口的 `keyguard_foreground_layer`，压在锁屏时钟**之上**
      * ⇒ 时钟被主体遮挡，出现"主体在时钟之前"的景深感。
@@ -515,7 +521,7 @@ class MaskPrefs(context: Context) {
         get() = prefs.getString(KEY_THEME_MODE, THEME_SYSTEM) ?: THEME_SYSTEM
 
     /**
-     * 「设置 → 外观 → 启用Monet颜色」开关（2026-11-07 加，默认关）。
+     * 「设置 → 外观 → Monet颜色」开关（2026-11-07 加，默认关）。
      *
      * 打开后主题配色改成**系统的 Monet 动态色**（miuix 的 `platformDynamicColors`，
      * 读 `android.R.color.system_accent*` / `system_neutral*` 再按 miuix 的调色板重算），
@@ -523,6 +529,44 @@ class MaskPrefs(context: Context) {
      */
     val monetColor: Boolean
         get() = prefs.getBoolean(KEY_MONET_COLOR, false)
+
+    /**
+     * 「隐藏主页激活卡片」（2026-11-25 用户要求，**默认关**）。
+     *
+     * 只在**模块已激活**时生效（未激活时那张卡是"为什么没生效"的唯一提示，不能藏）。
+     * 打开后主页不画状态卡，下方那条渐变模糊的满强度终点也随之下移
+     * 「激活卡高 + 一个卡片间距」（见 `HomeTab` 的 `HomeStatusCardBlockHeight`）。纯界面选项。
+     */
+    val hideHomeStatusCard: Boolean
+        get() = prefs.getBoolean(KEY_HIDE_HOME_STATUS_CARD, false)
+
+    /**
+     * 「主页背景同步应用状态」（2026-11-25 用户要求，**默认开**）。
+     *
+     * 开着时主页壁纸换成**正在应用**那条链的卡片封面（空间 / 光栅 / Alive，见 [HomeCover]）；
+     * 没在跑、视差、封面读不出来都回退内置的 `home_sample`。纯界面选项，不碰渲染。
+     */
+    val homeBgFollowApp: Boolean
+        get() = prefs.getBoolean(KEY_HOME_BG_FOLLOW_APP, true)
+
+    /**
+     * 「图片选择调用方式」（2026-11-26）：0 = 系统相册组件（默认）/ 1 = 系统文件管理组件。
+     *
+     * 背景见 [com.frederic22.hyperextreme.ui.ImagePick]：HyperOS 4 的部分机器上
+     * `ACTION_PICK_IMAGES` 不回结果，[com.frederic22.hyperextreme.ui.ImagePick.consume] 会自动
+     * 把它改成 1（= 等效用户手动改）。
+     */
+    val imagePickMode: Int
+        get() = prefs.getInt(KEY_IMAGE_PICK_MODE, IMAGE_PICK_PHOTO).coerceIn(0, 1)
+
+    /**
+     * 「自定义主页背景」的版本戳（2026-11-25，**0 = 没选**）。
+     *
+     * 图本身在 [HomeBg.customFile]；这里只存「选/没选 + 什么时候选的」，
+     * 用来驱动设置页那两行的显隐、以及主页重新解码。
+     */
+    val homeBgCustom: Long
+        get() = prefs.getLong(KEY_HOME_BG_CUSTOM, 0L)
 
     /**
      * 「自动检测更新」（2026-11-16，**默认关**）。
@@ -541,6 +585,20 @@ class MaskPrefs(context: Context) {
      */
     val updateLastAutoDate: String
         get() = prefs.getString(KEY_UPDATE_LAST_AUTO, "") ?: ""
+
+    /**
+     * 上次已处理「模块更新」的 versionCode（**0 = 从未处理过**）。
+     *
+     * 用途：App 启动时与 `PackageManager.longVersionCode` 比对，不同就停用正在生效的壁纸
+     * （见 `MaskUiState.resetWallpapersIfUpdated`）。0 也视为「需要处理一次」——
+     * 全新安装没有 active 壁纸，`*Control.disable` 内部会早退，不会误弹。
+     */
+    val lastInstalledCode: Long
+        get() = prefs.getLong(KEY_LAST_INSTALLED_CODE, 0L)
+
+    fun setLastInstalledCode(value: Long) {
+        prefs.edit().putLong(KEY_LAST_INSTALLED_CODE, value).commit()
+    }
 
     // ---------------------------------------------------------------- 视差壁纸效果（2026-10-12 加）
 
@@ -844,6 +902,22 @@ class MaskPrefs(context: Context) {
         prefs.edit().putBoolean(KEY_MONET_COLOR, value).commit()
     }
 
+    fun setHideHomeStatusCard(value: Boolean) {
+        prefs.edit().putBoolean(KEY_HIDE_HOME_STATUS_CARD, value).commit()
+    }
+
+    fun setHomeBgFollowApp(value: Boolean) {
+        prefs.edit().putBoolean(KEY_HOME_BG_FOLLOW_APP, value).commit()
+    }
+
+    fun setImagePickMode(value: Int) {
+        prefs.edit().putInt(KEY_IMAGE_PICK_MODE, value.coerceIn(0, 1)).commit()
+    }
+
+    fun setHomeBgCustom(stamp: Long) {
+        prefs.edit().putLong(KEY_HOME_BG_CUSTOM, stamp).commit()
+    }
+
     fun setAutoUpdateCheck(value: Boolean) {
         prefs.edit().putBoolean(KEY_AUTO_UPDATE_CHECK, value).commit()
     }
@@ -930,7 +1004,7 @@ class MaskPrefs(context: Context) {
         const val KEY_SPATIAL_CANDIDATE_ORDER = "spatial_candidate_order"
         /** 空间壁纸生效范围（0 锁屏 / 1 桌面 / 2 全局）。 */
         const val KEY_SPATIAL_SCOPE = "spatial_scope"
-        /** 「启用空间壁纸锁屏景深」（默认关；关时渲染逻辑与加它之前完全一致）。 */
+        /** 「空间壁纸锁屏景深」（默认关；关时渲染逻辑与加它之前完全一致）。 */
         const val KEY_SPATIAL_LOCK_DEPTH = "spatial_lock_depth"
 
         /**
@@ -951,8 +1025,14 @@ class MaskPrefs(context: Context) {
         const val KEY_RASTER_TRANSITION = "raster_transition"
         const val KEY_RASTER_SETTLE = "raster_settle"
 
-        /** 「过渡效果」四档：0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃（扭曲变形）。 */
+        /** 「过渡效果」五档：0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃（扭曲变形）/ 4 细线玻璃。 */
         const val RASTER_TRANSITION_DEFAULT = 0
+
+        /** 第 5 档：细线玻璃（2026-11-26，vivo d4 的真实波形）。 */
+        const val RASTER_TRANSITION_FINE = 4
+
+        /** 档位上限（读 / 写 prefs 都夹到它）。 */
+        const val RASTER_TRANSITION_MAX = RASTER_TRANSITION_FINE
 
         /** 光栅组的显示顺序（逗号分隔的组 id）—— 应用 / 新建置顶后持久化，2026-11-05。 */
         const val KEY_RASTER_GROUP_ORDER = "raster_group_order"
@@ -1063,12 +1143,26 @@ class MaskPrefs(context: Context) {
         const val KEY_ROOT_AVAILABLE = "root_available"
         const val KEY_THEME_MODE = "theme_mode"
         const val THEME_SYSTEM = "system"
-        /** 「启用Monet颜色」（2026-11-07）：关 = miuix 自带配色，开 = 系统动态色。 */
+        /** 「Monet颜色」（2026-11-07）：关 = miuix 自带配色，开 = 系统动态色。 */
         const val KEY_MONET_COLOR = "monet_color"
+        /** 「隐藏主页激活卡片」（2026-11-25）：仅模块已激活时生效，默认关。 */
+        const val KEY_HIDE_HOME_STATUS_CARD = "hide_home_status_card"
+        /** 「主页背景同步应用状态」（2026-11-25）：默认开，壁纸跟正在应用的那条链走。 */
+        const val KEY_HOME_BG_FOLLOW_APP = "home_bg_follow_app"
+
+        /** 「图片选择调用方式」：0 = 相册组件（默认）/ 1 = 文件管理组件。 */
+        const val KEY_IMAGE_PICK_MODE = "image_pick_mode"
+        const val IMAGE_PICK_PHOTO = 0
+        const val IMAGE_PICK_FILE = 1
+        /** 「自定义主页背景」的版本戳（2026-11-25）：0 = 没选，否则是选图时刻。 */
+        const val KEY_HOME_BG_CUSTOM = "home_bg_custom"
         /** 「自动检测更新」（2026-11-16）：每天（北京时间）首次进模块查一次 Gitee，默认关。 */
         const val KEY_AUTO_UPDATE_CHECK = "auto_update_check"
         /** 自动检测最后执行那天的北京时间日期（`yyyy-MM-dd`），一天最多一次请求的闸门。 */
         const val KEY_UPDATE_LAST_AUTO = "update_last_auto_date"
+
+        /** 上次已处理过「模块更新」的 versionCode（App 启动时检测，见 `MaskUiState.resetWallpapersIfUpdated`）。 */
+        const val KEY_LAST_INSTALLED_CODE = "last_installed_code"
         const val KEY_INJECTED_WALLPAPER = "injected_wallpaper_md5"
         const val KEY_WALLPAPER_SIZE = "wallpaper_size"
         const val KEY_DISPLAY_WALLPAPER_SIZE = "display_wallpaper_size"

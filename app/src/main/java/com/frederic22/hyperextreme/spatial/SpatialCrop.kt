@@ -126,6 +126,35 @@ internal object SpatialCrop {
         )
     }
 
+    /**
+     * **平面**场景（主页自定义背景）按**实际绘制尺寸**夹紧 `cx/cy`。
+     *
+     * 与球面的 [clampWith] 不同：这里 `halfX/halfY` 必须由调用方算 ——
+     * 图比容器宽还是高取决于**原图比例**，那个信息只有渲染侧有：
+     *
+     * ```
+     * base  = max(容器宽 / 图宽, 容器高 / 图高)     // 铺满所需的最小缩放
+     * s     = base × zoom
+     * halfX = 容器宽 / (2 × 图宽 × s)
+     * halfY = 容器高 / (2 × 图高 × s)
+     * ```
+     *
+     * ⚠️ **不能再用 `0.5/zoom`**（2026-11-27 修）：那条假设「图已经被 cover 成容器比例」，
+     * 而现在是「原图完整保留、手动 cover」—— 4:3 的图在竖屏上横向本来就溢出，
+     * 用 `0.5/zoom` 会把可调范围锁死。
+     *
+     * `zoom` 由调用方先夹紧（[ZOOM_MIN] / [ZOOM_MAX]），本函数只负责 `cx/cy`。
+     */
+    fun clampHalf(c: Crop, halfX: Float, halfY: Float): Crop {
+        val hx = halfX.coerceIn(0f, 0.5f)
+        val hy = halfY.coerceIn(0f, 0.5f)
+        return Crop(
+            cx = c.cx.coerceIn(hx, 1f - hx),
+            cy = c.cy.coerceIn(hy, 1f - hy),
+            zoom = c.zoom,
+        )
+    }
+
     /** shader 的 `uUvScale`：两个方向等比。 */
     fun scaleOf(c: Crop): Float = 1f / c.zoom.coerceIn(ZOOM_MIN, ZOOM_MAX)
 

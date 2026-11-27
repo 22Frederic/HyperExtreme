@@ -44,6 +44,7 @@
     <application
         android:name=".App"
         android:allowBackup="false"
+        android:enableOnBackInvokedCallback="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:largeHeap="true"
@@ -113,6 +114,16 @@
         -->
         <activity
             android:name=".ui.SpatialCropActivity"
+            android:exported="false"
+            android:theme="@style/Theme.MaskSwap" />
+
+        <!--
+          「自定义背景 · 显示区域调整」（2026-11-27）：同一套骨架、平面预览口径。
+          - exported=false：只由设置页内部拉起；
+          - theme 与显示区域页一致（深色下系统栏图标才看得见）。
+        -->
+        <activity
+            android:name=".ui.HomeBgCropActivity"
             android:exported="false"
             android:theme="@style/Theme.MaskSwap" />
 

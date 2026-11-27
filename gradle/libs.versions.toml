@@ -1,11 +1,11 @@
 [versions]
 agp = "9.4.1"
 kotlin = "2.4.20"
-compose-multiplatform = "1.12.2"
+compose-multiplatform = "1.13.0-rc01"
 androidx-activity = "1.13.0"
-# 0.9.5 目前只有 beta01（2026-11-17，commit 6d2554a），Maven Central 无正式版。
-# ⚠️ 它强制 compose.foundation 1.12.2，故 compose-multiplatform 同升。
-miuix = "0.9.5-beta01"
+# 0.9.5-rc01（2026-11-25）：beta02 起强制 compose-multiplatform 1.13.0-rc01，故两者同升。
+# 性能改动集中在 beta02 / beta04（渐进模糊管线、GraphicsLayer 复用、GlassTopAppBar shader 缓存）。
+miuix = "0.9.5-rc01"
 # ONNX Runtime **完整版**（支持 .onnx 与 .ort）：mobile minimal build 缺 ConvInteger /
 # 一堆 custom op，实测跑不动 DA V2 int8，2026-10-22 按用户要求退回完整版。
 onnxruntime-android = "1.31.0"

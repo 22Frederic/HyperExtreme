@@ -51,7 +51,8 @@ object RasterFlag {
     const val PROP_SETTLE = "debug.hyperextreme.raster_settle"
 
     /**
-     * 「过渡效果」：0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃（扭曲变形），2026-11-06。
+     * 「过渡效果」：0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃（扭曲变形）/ 4 细线玻璃，
+     * 2026-11-06 前四档，2026-11-26 加第 5 档。
      *
      * 2026-11-07 起**运行中实时**：生效中改直接走 [push]，轮询检测变化后热更新并硬切
      * 归位一次；启动时也读一次做基线。读不到 / 非法按 0（= 加这个选项之前的行为）。
@@ -89,7 +90,7 @@ object RasterFlag {
             "setprop $PROP_SCOPE $scope; " +
             "setprop $PROP_LOCKDEPTH ${if (lockDepth) 1 else 0}; " +
             "setprop $PROP_PAN_DEG $panDeg; " +
-            "setprop $PROP_TRANSITION ${transition.coerceIn(0, 3)}; " +
+            "setprop $PROP_TRANSITION ${transition.coerceIn(0, MaskPrefs.RASTER_TRANSITION_MAX)}; " +
             "setprop $PROP_SETTLE ${if (settle) 1 else 0}; " +
             "setprop $PROP_MIRROR ${if (mirror) 1 else 0}"
         Thread {

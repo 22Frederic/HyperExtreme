@@ -3,6 +3,8 @@ package com.frederic22.hyperextreme
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import com.frederic22.hyperextreme.data.HomeCover
+import com.frederic22.hyperextreme.data.MaskPrefs
 
 /**
  * 启动遮罩（2026-10-29，照 HyperCeiler 的 `SplashActivity` 抄）。
@@ -32,6 +34,16 @@ class SplashActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 冷启动预热（2026-11-25）：主页封面的「解析 + 解码」提前到这里跑。
+        //
+        // 背景：`MainActivity` 的首帧被主动压到进程创建后 400ms（见
+        // `MainActivity.holdFirstFrameForLaunchAnimation`），遮罩期间界面本来就在等 ——
+        // 正好用这段空窗把首次解码做掉。不预热的话，第一次进模块（或刚换过封面）那一次
+        // 仍会闪一帧 `home_sample`：解码要几十~上百毫秒，赶不上放行那一刻。
+        //
+        // ⚠️ 这里只是**发起**：`HomeCover.request` 内部是 IO 线程 + 单飞合并，
+        // 本方法立刻返回，不影响遮罩窗口的启动时序。
+        runCatching { HomeCover.request(this, MaskPrefs(this).homeBgFollowApp) }
         startActivity(Intent(this, MainActivity::class.java))
         finish()
     }

@@ -48,7 +48,7 @@ internal object RasterServiceTarget {
             val json = org.json.JSONObject()
                 .put("key", key)
                 .put("panDeg", panDeg.coerceIn(15, 60))
-                .put("transition", transition.coerceIn(0, 3))
+                .put("transition", transition.coerceIn(0, com.frederic22.hyperextreme.data.MaskPrefs.RASTER_TRANSITION_MAX))
                 .put("settle", settle)
                 .put("mirror", mirror)
                 .put("at", System.currentTimeMillis())
@@ -87,11 +87,12 @@ internal object RasterServiceTarget {
         org.json.JSONObject(f.readText()).optBoolean("settle", true)
     }.getOrDefault(true)
 
-    /** 「过渡效果」：0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲；没写 / 读不出来按 **0**（= 加这个选项之前的行为）。 */
+    /** 「过渡效果」：0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲 / 4 细线；没写 / 读不出来按 **0**。 */
     fun readTransition(ctx: Context): Int = runCatching {
         val f = file(ctx)
         if (!f.isFile) return 0
-        org.json.JSONObject(f.readText()).optInt("transition", 0).coerceIn(0, 3)
+        org.json.JSONObject(f.readText()).optInt("transition", 0)
+            .coerceIn(0, com.frederic22.hyperextreme.data.MaskPrefs.RASTER_TRANSITION_MAX)
     }.getOrDefault(0)
 
     /** 主进程：点「恢复默认」时清掉，免得壁纸进程下次可见还去加载。 */

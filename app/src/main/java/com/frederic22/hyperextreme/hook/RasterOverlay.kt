@@ -84,6 +84,11 @@ internal object RasterOverlay {
     private const val AGSL = """
         uniform shader uFrom;
         uniform shader uTo;
+        // 色散的 RGB 源：原图（1/2 尺寸、不透明）。主体的透明区 RGB 已被清零，
+        // 且 Skia 采样必预乘（a=0 ⇒ rgb=0），色散跨出轮廓时只能拿到 0 ⇒ 必须换源。
+        uniform shader uFromRGB;
+        uniform shader uToRGB;
+        uniform float2 uRgbScale;
         uniform float2 uViewSize;
         uniform float2 uScale;
         uniform float uT;
@@ -127,9 +132,24 @@ internal object RasterOverlay {
             } else if (uStyle < 2.5) {
                 float2 q = float2(uv.x * uScreenW, uv.y * uScreenH) / max(uFrostCellPx, 0.5);
                 return noise2(q);
+            } else if (uStyle < 3.5) {
+                // 扭曲变形：余弦 + 10% 扰动
+                float n = noise2(float2(x * 5.0, 7.3));
+                return clamp(0.5 + 0.46 * cos(6.2831853 * x) + 0.10 * (n - 0.5), 0.0, 1.0);
             }
-            float n = noise2(float2(x * 5.0, 7.3));
-            return clamp(0.5 + 0.46 * cos(6.2831853 * x) + 0.10 * (n - 0.5), 0.0, 1.0);
+            // 细线玻璃：vivo d4 贴图（实测 108x200）逐像素解出的波形。
+            // 与 GL 的 [RasterGlCore.FRAG] **逐字同源**，否则「背景有细线、主体没有」会露馅。
+            float u = fract(x) * 108.0;
+            if (u < 48.0) {
+                float t = u / 48.0;
+                return 1.0 - t * t;
+            } else if (u < 54.0) {
+                return 0.5 * smoothstep(0.0, 1.0, (u - 48.0) / 6.0);
+            } else if (u < 59.0) {
+                return 0.5 * (1.0 - smoothstep(0.0, 1.0, (u - 54.0) / 5.0));
+            }
+            float t2 = (108.0 - u) / 48.0;
+            return 1.0 - t2 * t2;
         }
 
         half4 main(float2 coord) {
@@ -166,30 +186,72 @@ internal object RasterOverlay {
             half4 cf;
             half4 ct;
             float disp = uDispersionFactor * 0.16 * pMask * 208.333;
-            if (uStyle > 0.5 && abs(ruv.x - uv.x) > 0.0005) {
+            if (uStyle > 3.5 && abs(ruv.x - uv.x) > 0.0005) {
+                // 细线玻璃：d4 的 `applyDispersionEffect`（STEPS=1）——
+                // R 不偏移、G 偏 1.0、B 偏 1.5。与下面 d1 的 Tx3 加权**不是一套算法**。
                 float2 dxy = (ruv - uv) * disp;
-                half4 f0 = uFrom.eval(ruv * uViewSize * uScale);
-                half4 f1 = uFrom.eval((ruv + dxy * 0.2) * uViewSize * uScale);
-                half4 f2 = uFrom.eval((ruv + dxy * 0.4) * uViewSize * uScale);
+                float2 p0 = ruv * uViewSize * uScale;
+                float2 p1 = (ruv + dxy * 1.0) * uViewSize * uScale;
+                float2 p2 = (ruv + dxy * 1.5) * uViewSize * uScale;
+                // alpha 从主体取（ALPHA_8，只读 a）
+                half4 f0 = uFrom.eval(p0);
+                half4 f1 = uFrom.eval(p1);
+                half4 f2 = uFrom.eval(p2);
+                // RGB 从**背景层那份共享原图**取（不透明）：主体的透明区是透明黑，
+                // 色散跨出轮廓时会整条归零 ⇒ 纯红/纯青描边。见《07》§7.15 第 20 条。
+                half3 r0 = uFromRGB.eval(p0 * uRgbScale).rgb;
+                half3 r1 = uFromRGB.eval(p1 * uRgbScale).rgb;
+                half3 r2 = uFromRGB.eval(p2 * uRgbScale).rgb;
+                cf = half4(half3(r0.r, r1.g, r2.b) * f0.a, f0.a);
+                half4 t0 = uTo.eval(p0);
+                half4 t1 = uTo.eval(p1);
+                half4 t2 = uTo.eval(p2);
+                half3 s0 = uToRGB.eval(p0 * uRgbScale).rgb;
+                half3 s1 = uToRGB.eval(p1 * uRgbScale).rgb;
+                half3 s2 = uToRGB.eval(p2 * uRgbScale).rgb;
+                ct = half4(half3(s0.r, s1.g, s2.b) * t0.a, t0.a);
+            } else if (uStyle > 0.5 && abs(ruv.x - uv.x) > 0.0005) {
+                float2 dxy = (ruv - uv) * disp;
+                float2 p0 = ruv * uViewSize * uScale;
+                float2 p1 = (ruv + dxy * 0.2) * uViewSize * uScale;
+                float2 p2 = (ruv + dxy * 0.4) * uViewSize * uScale;
+                // 同细线：alpha 取主体、RGB 取共享原图。
+                half4 f0 = uFrom.eval(p0);
+                half4 f1 = uFrom.eval(p1);
+                half4 f2 = uFrom.eval(p2);
+                half3 c0 = uFromRGB.eval(p0 * uRgbScale).rgb;
+                half3 c1 = uFromRGB.eval(p1 * uRgbScale).rgb;
+                half3 c2 = uFromRGB.eval(p2 * uRgbScale).rgb;
                 cf = half4(
-                    f0.r * 0.9 + f1.r * 0.08 + f2.r * 0.02,
-                    f0.g * 0.1 + f1.g * 0.8  + f2.g * 0.1,
-                    f0.b * 0.02 + f1.b * 0.08 + f2.b * 0.9,
+                    half3(
+                        c0.r * 0.9 + c1.r * 0.08 + c2.r * 0.02,
+                        c0.g * 0.1 + c1.g * 0.8  + c2.g * 0.1,
+                        c0.b * 0.02 + c1.b * 0.08 + c2.b * 0.9
+                    ) * f0.a,
                     f0.a
                 );
-                half4 t0 = uTo.eval(ruv * uViewSize * uScale);
-                half4 t1 = uTo.eval((ruv + dxy * 0.2) * uViewSize * uScale);
-                half4 t2 = uTo.eval((ruv + dxy * 0.4) * uViewSize * uScale);
+                half4 t0 = uTo.eval(p0);
+                half4 t1 = uTo.eval(p1);
+                half4 t2 = uTo.eval(p2);
+                half3 d0 = uToRGB.eval(p0 * uRgbScale).rgb;
+                half3 d1 = uToRGB.eval(p1 * uRgbScale).rgb;
+                half3 d2 = uToRGB.eval(p2 * uRgbScale).rgb;
                 ct = half4(
-                    t0.r * 0.9 + t1.r * 0.08 + t2.r * 0.02,
-                    t0.g * 0.1 + t1.g * 0.8  + t2.g * 0.1,
-                    t0.b * 0.02 + t1.b * 0.08 + t2.b * 0.9,
+                    half3(
+                        d0.r * 0.9 + d1.r * 0.08 + d2.r * 0.02,
+                        d0.g * 0.1 + d1.g * 0.8  + d2.g * 0.1,
+                        d0.b * 0.02 + d1.b * 0.08 + d2.b * 0.9
+                    ) * t0.a,
                     t0.a
                 );
             } else {
                 float2 p = ruv * uViewSize * uScale;
-                cf = uFrom.eval(p);
-                ct = uTo.eval(p);
+                // ⚠️ uFrom/uTo 是 **ALPHA_8**（只有 alpha），RGB 一律来自共享原图，
+                // 否则这一支会输出纯黑。2026-11-26。
+                half a0 = uFrom.eval(p).a;
+                half a1 = uTo.eval(p).a;
+                cf = half4(uFromRGB.eval(p * uRgbScale).rgb * a0, a0);
+                ct = half4(uToRGB.eval(p * uRgbScale).rgb * a1, a1);
             }
             // ⚠️ 顺序必须与背景层 [RasterGlCore.FRAG] 的 `mix(to, from, mixFactor)` **同构**：
             // factor/a 小时显示的是**新图**。2026-11-06 真机「主体和图顺序错位（差一张）」
@@ -278,6 +340,7 @@ internal object RasterOverlay {
         sceneT = t
         sceneDir = dir
         sceneStyle = style
+        repin(from, to)
         if (invalidatePending) return
         invalidatePending = true
         mainHandler.post {
@@ -561,6 +624,14 @@ internal object RasterOverlay {
         private val bitmaps = LinkedHashMap<Int, Bitmap>()
         private val shaders = HashMap<Int, BitmapShader>()
 
+        /**
+         * 色散 RGB 源的 shader 缓存 —— 位图本身**不是我们的**：直接引用
+         * [RasterRenderer.sharedBitmap] 那份（与 GL 纹理同源，全分辨率）。
+         * 用 [sharedRefs] 记身份，池淘汰后换过对象就重建。
+         */
+        private val sharedShaders = HashMap<Int, BitmapShader>()
+        private val sharedRefs = HashMap<Int, Bitmap>()
+
         /** 已确认"这张没有主体"的序号，避免反复请求 provider。 */
         private val missing = HashSet<Int>()
 
@@ -590,6 +661,17 @@ internal object RasterOverlay {
 
         private fun shaderOf(index: Int): BitmapShader = shaders[index] ?: empty()
 
+        /** 共享原图的 shader；返回 null = 背景层还没解好，这一帧先不画。 */
+        private fun rgbShaderOf(index: Int): BitmapShader? {
+            val bmp = RasterRenderer.sharedBitmap(index) ?: return null
+            val cached = sharedShaders[index]
+            if (cached != null && sharedRefs[index] === bmp) return cached
+            val sh = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+            sharedShaders[index] = sh
+            sharedRefs[index] = bmp
+            return sh
+        }
+
         /** 确保 from / to 两张主体在位图缓存里；缺的异步加载。主线程调用。 */
         fun ensureBitmaps(from: Int, to: Int) {
             if (groupKey.isEmpty()) return
@@ -597,41 +679,47 @@ internal object RasterOverlay {
             val h = height
             if (w <= 0 || h <= 0) return
             for (idx in intArrayOf(from, to)) {
-                if (idx < 0 || shaders.containsKey(idx) || idx in missing || idx in loading) continue
-                loading.add(idx)
-                val token = loadTokenSnapshot()
-                val ctx = context.applicationContext
-                Thread {
-                    val bmp = loadSubject(ctx, groupKey, idx, w, h)
-                    mainHandler.post {
-                        loading.remove(idx)
-                        if (token != loadTokenSnapshot() || this !== view) {
-                            bmp?.recycle()
-                            return@post
+                if (idx < 0) continue
+
+                // 主体抠像 → 只留 alpha（RGB 由背景层那份共享位图提供）
+                if (!shaders.containsKey(idx) && idx !in missing && idx !in loading) {
+                    loading.add(idx)
+                    val token = loadTokenSnapshot()
+                    val ctx = context.applicationContext
+                    Thread {
+                        val bmp = loadSubjectAlpha(ctx, groupKey, idx, w, h)
+                        mainHandler.post {
+                            loading.remove(idx)
+                            if (token != loadTokenSnapshot() || this !== view) {
+                                bmp?.recycle()
+                                return@post
+                            }
+                            if (bmp == null) {
+                                missing.add(idx)
+                            } else {
+                                bitmaps[idx] = bmp
+                                shaders[idx] = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                                evictIfNeeded()
+                            }
+                            invalidate()
                         }
-                        if (bmp == null) {
-                            missing.add(idx)
-                        } else {
-                            bitmaps[idx] = bmp
-                            shaders[idx] = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-                            evictIfNeeded()
-                        }
-                        invalidate()
-                    }
-                }.apply { isDaemon = true }.start()
+                    }.apply { isDaemon = true }.start()
+                }
+
             }
         }
 
-        /** 只留 3 张（每张约 12.8MB）；超出优先丢**不在当前场景里**的最旧项。 */
+        /** alpha 留 3 张（3.2MB/张）；超出优先丢**不在当前场景里**的最旧项。 */
         private fun evictIfNeeded() {
-            if (bitmaps.size <= 3) return
             val keep = hashSetOf(sceneFrom, sceneTo)
             // ⚠️ 不能用 `keys.iterator().remove()` 再 `remove()` 一次：第二次拿到 null，
             // 位图就漏了 recycle（2026-11-04 写的时候差点踩到）。
-            val victims = bitmaps.keys.filter { it !in keep }.take(bitmaps.size - 3)
-            for (k in victims) {
-                shaders.remove(k)
-                bitmaps.remove(k)?.recycle()
+            if (bitmaps.size > 3) {
+                val victims = bitmaps.keys.filter { it !in keep }.take(bitmaps.size - 3)
+                for (k in victims) {
+                    shaders.remove(k)
+                    bitmaps.remove(k)?.recycle()
+                }
             }
         }
 
@@ -639,6 +727,14 @@ internal object RasterOverlay {
             bitmaps.values.forEach { runCatching { it.recycle() } }
             bitmaps.clear()
             shaders.clear()
+            // ⚠️ 共享位图**不归我们回收** —— 那是背景层的池（`RasterRenderer.preloaded`），
+            // GL 纹理还在用。这里只丢 shader 引用，并把 pin 还回去。
+            pinnedFrom?.let { RasterRenderer.unpinBitmap(it) }
+            pinnedTo?.let { RasterRenderer.unpinBitmap(it) }
+            pinnedFrom = null
+            pinnedTo = null
+            sharedShaders.clear()
+            sharedRefs.clear()
             missing.clear()
             loading.clear()
             emptyShader = null
@@ -659,6 +755,10 @@ internal object RasterOverlay {
             // 一张都没有也画：empty 会让整层透明，等于没开（用户 2026-11-04 明确）。
             val fromS = shaderOf(sceneFrom)
             val toS = shaderOf(sceneTo)
+            // 共享 RGB 源（背景层的全分辨率位图）。没解好就**整帧不画** —— 宁可透明，
+            // 也不要画错（主体会变成纯黑/纯色块）。
+            val fromRgb = rgbShaderOf(sceneFrom) ?: return
+            val toRgb = rgbShaderOf(sceneTo) ?: return
 
             val s = shader ?: run {
                 if (shaderFailed) return
@@ -675,6 +775,9 @@ internal object RasterOverlay {
             runCatching {
                 s.setInputShader("uFrom", fromS)
                 s.setInputShader("uTo", toS)
+                // 色散的 RGB 源（1/2 原图，不透明）—— 缺失时由 uRgbScale=0 触发降级。
+                s.setInputShader("uFromRGB", fromRgb)
+                s.setInputShader("uToRGB", toRgb)
                 s.setFloatUniform("uViewSize", w, h)
                 // 位图已按屏幕 cover 裁好 ⇒ 正常是 1:1；留这个比值是防止 View 尺寸被系统改。
                 val bw = bitmaps[sceneFrom]?.width ?: bitmaps[sceneTo]?.width ?: 0
@@ -684,9 +787,18 @@ internal object RasterOverlay {
                 } else {
                     s.setFloatUniform("uScale", 1f, 1f)
                 }
+                // 共享位图是「屏幕尺寸 + cover 已裁好」⇒ 与 View 同尺寸，正常就是 1。
+                // 留这个比值是防 View 被系统改尺寸。
+                val rb = RasterRenderer.sharedBitmap(sceneFrom)
+                    ?: RasterRenderer.sharedBitmap(sceneTo)
+                if (rb != null) {
+                    s.setFloatUniform("uRgbScale", rb.width / w, rb.height / h)
+                } else {
+                    s.setFloatUniform("uRgbScale", 1f, 1f)
+                }
                 s.setFloatUniform("uT", sceneT)
                 s.setFloatUniform("uDir", sceneDir)
-                // 2026-11-06：与背景层 [RasterGlCore.FRAG] 逐字一致 —— 擦除带 + 四档玻璃。
+                // 2026-11-06：与背景层 [RasterGlCore.FRAG] 逐字一致 —— 擦除带 + 五档玻璃。
                 s.setFloatUniform("uBand", RasterGlCore.VIVO_ALPHA_TRANS_WIDTH)
                 s.setFloatUniform("uTransWidth", RasterGlCore.VIVO_TRANS_WIDTH)
                 s.setFloatUniform("uMaskTransWidth", RasterGlCore.VIVO_MASK_TRANS_WIDTH)
@@ -698,8 +810,7 @@ internal object RasterOverlay {
                 s.setFloatUniform("uShadowStrength", sp.shadow)
                 s.setFloatUniform(
                     "uStripePeriodPx",
-                    (w * RasterGlCore.STRIPE_PERIOD_PX_1200 / RasterGlCore.STRIPE_BASE_W)
-                        .coerceAtLeast(1f),
+                    RasterGlCore.periodPxOf(sceneStyle, w).coerceAtLeast(1f),
                 )
                 s.setFloatUniform(
                     "uFrostCellPx",
@@ -738,16 +849,61 @@ internal object RasterOverlay {
     private fun loadTokenSnapshot(): Int = loadToken.get()
 
     /**
-     * 读 `raster/<组id>/subject/<序号>` 并**按与背景相同的 cover 裁到屏幕尺寸**。
+     * 景深层正在采样的两张序号 —— 告诉背景层的池「别把这两张回收了」。
      *
-     * 背景 GL 用 `RasterRenderer.loadBitmap` 做同一件事；主体图与原图同尺寸（用户
-     * 2026-11-04 确认），所以两边算出来的 cover 矩形完全一致 ⇒ 主体与背景严丝合缝。
+     * 共享位图是**别人的**（`RasterRenderer.preloaded`），池在预取时按 LRU 淘汰；
+     * 如果不 pin，`BitmapShader` 正指着的位图会被 `recycle()`，当帧直接空白。
+     */
+    private var pinnedFrom: Int? = null
+    private var pinnedTo: Int? = null
+
+    private fun repin(from: Int, to: Int) {
+        if (pinnedFrom != from) {
+            pinnedFrom?.let { RasterRenderer.unpinBitmap(it) }
+            RasterRenderer.pinBitmap(from)
+            pinnedFrom = from
+        }
+        if (pinnedTo != to) {
+            pinnedTo?.let { RasterRenderer.unpinBitmap(it) }
+            RasterRenderer.pinBitmap(to)
+            pinnedTo = to
+        }
+    }
+
+    /**
+     * 读 `raster/<组id>/subject/<序号>`，**只提取 alpha**（`ALPHA_8`，3.2MB）。
+     *
+     * 生成端继续存 RGBA（存储不差这点，也免了迁移旧数据）；内存侧只要 alpha ——
+     * 色散的 RGB 全部由背景层那份共享位图提供（[RasterRenderer.sharedBitmap]），
+     * 因为两者内容本来就一模一样。提取完立刻把 RGBA 副本回收，峰值只多 16MB 一瞬。
      *
      * 读不到（没算过主体）= 返回 null，上层按"透明"处理。
      */
-    private fun loadSubject(ctx: Context, key: String, index: Int, tw: Int, th: Int): Bitmap? =
+    private fun loadSubjectAlpha(ctx: Context, key: String, index: Int, tw: Int, th: Int): Bitmap? {
+        val rgba = loadCovered(
+            ctx,
+            Uri.parse("content://$AUTHORITY/raster/$key/subject/$index"),
+            tw,
+            th,
+        ) ?: return null
+        return runCatching {
+            val a = rgba.extractAlpha()
+            rgba.recycle()
+            a
+        }.getOrElse {
+            runCatching { rgba.recycle() }
+            null
+        }
+    }
+
+    /**
+     * 通用：解码后**按与背景相同的 cover 裁到 tw×th**。
+     *
+     * 背景 GL 用 `RasterRenderer.loadBitmap` 做同一件事；主体图与原图同尺寸（用户
+     * 2026-11-04 确认），所以两边算出来的 cover 矩形完全一致 ⇒ 主体与背景严丝合缝。
+     */
+    private fun loadCovered(ctx: Context, uri: Uri, tw: Int, th: Int): Bitmap? =
         runCatching {
-            val uri = Uri.parse("content://$AUTHORITY/raster/$key/subject/$index")
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
             val sw = bounds.outWidth

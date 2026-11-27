@@ -50,6 +50,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import com.frederic22.hyperextreme.R
 import com.frederic22.hyperextreme.aicr.AicrVision
@@ -83,7 +84,7 @@ private val ALIVE_SLOT_GAP = 12.dp
 /** 息屏样式的下拉选项（下标即 [AliveStore.STYLE_QIHANG] / [AliveStore.STYLE_LIUGUANG]）。 */
 private val ALIVE_STYLE_LABELS = listOf("启航", "留光")
 
-/** 卡片圆角（与光栅浮页槽位一致）。 */
+/** 「参数调整卡」的圆角（miuix 功能卡标准 16dp；图片槽位另有自己的口径，见 [AliveSlot]）。 */
 private val ALIVE_CARD_RADIUS = 16.dp
 
 /**
@@ -285,15 +286,15 @@ internal fun AliveGroupSheet(
         }
     }
 
-    val lockPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia(),
-    ) { handlePick(AliveStore.Slot.LOCK, it) }
-    val deskPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia(),
-    ) { handlePick(AliveStore.Slot.DESKTOP, it) }
-    val aodPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia(),
-    ) { handlePick(AliveStore.Slot.AOD, it) }
+    val lockPicker = rememberLauncherForActivityResult(ImagePick.One()) { r ->
+        handlePick(AliveStore.Slot.LOCK, ImagePick.consume(ctx, r).firstOrNull())
+    }
+    val deskPicker = rememberLauncherForActivityResult(ImagePick.One()) { r ->
+        handlePick(AliveStore.Slot.DESKTOP, ImagePick.consume(ctx, r).firstOrNull())
+    }
+    val aodPicker = rememberLauncherForActivityResult(ImagePick.One()) { r ->
+        handlePick(AliveStore.Slot.AOD, ImagePick.consume(ctx, r).firstOrNull())
+    }
 
     /**
      * 遮罩 / 主体导入（只对锁屏那张）。
@@ -328,10 +329,9 @@ internal fun AliveGroupSheet(
      * 3. 落盘：主体直接缩放到锁屏图尺寸；**遮罩走 `MaskComposer.compose` 合成成主体**
      *    （黑→透明、白→保留），与光栅 `applySubject` 是同一套算法。
      */
-    val maskPicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia(),
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+    val maskPicker = rememberLauncherForActivityResult(ImagePick.One()) { r ->
+        val uri = ImagePick.consume(ctx, r).firstOrNull()
+            ?: return@rememberLauncherForActivityResult
         val g = working ?: return@rememberLauncherForActivityResult
         scope.launch {
             maskBusy = true
@@ -462,6 +462,10 @@ internal fun AliveGroupSheet(
         show = show,
         backdrop = LocalPageBackdrop.current,
         title = if (isNew) "新建Alive壁纸组合" else "编辑Alive壁纸组合",
+        // **横向 24dp**（beta01 的观感，2026-11-25 用户要求恢复）：
+        // rc01 把 `GlassBottomSheet` 的默认内边距抽成 `GlassBottomSheetDefaults.InsideMargin`
+        // 并砍到 12dp ⇒ 卡片流贴边。写死旧值，不跟上游默认。
+        insideMargin = DpSize(24.dp, 0.dp),
         startAction = {
             IconButton(onClick = { haptic(); close() }) {
                 AliveSheetIcon(AliveIconKind.Close, "关闭")
@@ -472,7 +476,10 @@ internal fun AliveGroupSheet(
                 AliveSheetIcon(AliveIconKind.Check, "完成")
             }
         },
-    ) {
+    ) { innerPadding ->
+        // ⚠️ rc01（2026-11-25）起 `GlassBottomSheet` 的标题栏是**覆盖式**（内部固定
+        // `overlayHeader = true`）：`PaddingValues` 的 top = 实测 header 高度，内容必须自己吃
+        //（见下面 Column 的 `.padding(innerPadding)`），否则卡片流会顶到标题栏下面。
         val g = working
         val idle = runningTask == null && !importing && !generating && !maskBusy
         val hasSubject = g?.lockSubject != null
@@ -481,6 +488,8 @@ internal fun AliveGroupSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                // 覆盖式标题栏留出的 top（rc01 起必须吃，见上面 lambda 的说明）。
+                .padding(innerPadding)
                 .padding(bottom = NavBarBottomGap),
         ) {
             // ── 三张卡 ──（尺寸 / 间距与光栅浮页的槽位逐值一致：0.45×0.8 屏宽、12dp 间距）
@@ -935,6 +944,15 @@ private fun AliveSlot(
     onClick: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    // 缩略图圆角 = 系统屏幕圆角 × 卡宽比（2026-11-27，与卡片流 / 光栅槽位同一口径）。
+    // 不是固定 16dp：卡片是「缩小的一屏」，换台圆角不同的设备必须跟着走。
+    val slotDensity = LocalDensity.current
+    val screen = rememberScreenSizePx()
+    val slotRadiusPx = rememberCardRadiusPx(
+        with(slotDensity) { width.toPx() },
+        screen.width.toFloat(),
+    )
+    val slotRadius: Dp = with(slotDensity) { slotRadiusPx.toDp() }
     // 徽标淡出（点击后 150ms 才真的清数据，让缩放/淡出播完 —— 与光栅同一条动画）
     var removing by remember(bitmap) { mutableStateOf(false) }
     val badge by androidx.compose.animation.core.animateFloatAsState(
@@ -952,7 +970,7 @@ private fun AliveSlot(
             Box(
                 modifier = Modifier
                     .size(width, height)
-                    .squircleClip(ALIVE_CARD_RADIUS)
+                    .squircleClip(slotRadius)
                     // 内描边：与光栅 `SlotCard` 同一条（1dp 纯黑 alpha 0.1，画在内容之上）。
                     // `squircleStroke` 必须在 `squircleClip` 之后 —— 它用 `onDrawWithContent`
                     // 先画内容再描边，所以图片铺满时也盖不掉（2026-11-09 用户要求补齐）。
@@ -963,7 +981,7 @@ private fun AliveSlot(
                     .then(
                         if (bitmap != null) {
                             Modifier.squircleStroke(
-                                { CARD_STROKE_WIDTH }, { CARD_STROKE }, ALIVE_CARD_RADIUS,
+                                { CARD_STROKE_WIDTH }, { CARD_STROKE }, slotRadius,
                             )
                         } else {
                             Modifier
@@ -984,7 +1002,7 @@ private fun AliveSlot(
                         NewCard(
                             cardW = width,
                             cardH = height,
-                            radius = ALIVE_CARD_RADIUS,
+                            radius = slotRadius,
                             modifier = Modifier,
                             surface = rememberGlassCardSurface(),
                             // 玻璃浮页里的新建卡才加边（见 NEW_CARD_STROKE 的说明）。

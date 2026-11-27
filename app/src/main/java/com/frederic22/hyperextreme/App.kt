@@ -153,7 +153,8 @@ class App : Application() {
                 }
             }
 
-            // 「使用自定义背景」（设置页那个测试开关）2026-11-07 整链删除 —— 老版本留下的
+            // 「使用自定义背景」（**设置页测试卡**里的旧开关，与 2026-11-25 主页背景无关）
+            // 2026-11-07 整链删除 —— 老版本留下的
             // `filesDir/navbg/` 缓存目录顺手清一次（只删这一个固定目录，不做任何递归扫描）。
             runCatching { File(filesDir, "navbg").deleteRecursively() }
             val cleared = MaskStore.clearCandidates(this)

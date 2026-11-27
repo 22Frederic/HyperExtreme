@@ -86,7 +86,7 @@ class MaskDetailActivity : ComponentActivity() {
         setContent {
             val prefs = remember { MaskPrefs(this) }
             val themeMode = remember { ThemeMode.of(prefs.themeMode) }
-            // 「启用Monet颜色」二级页只读一次（本页不提供切换入口，重开生效），与 themeMode 同一口径。
+            // 「Monet颜色」二级页只读一次（本页不提供切换入口，重开生效），与 themeMode 同一口径。
             val controller = rememberThemeController(themeMode, remember { prefs.monetColor })
             // textStyles 与一级页面一致（[HyperTextStyles]，见该文件里的说明）。
             MiuixTheme(controller = controller, textStyles = HyperTextStyles) {
@@ -166,9 +166,10 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
     }
 
     val picker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia(),
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        contract = ImagePick.One(),
+    ) { r ->
+        val uri = ImagePick.consume(context, r).firstOrNull()
+            ?: return@rememberLauncherForActivityResult
 
         scope.launch {
             // 兜底：从点"选择图片"到选完图之间 root 可能被撤销，没 root 就别导入（选了也不生效）。
@@ -239,9 +240,10 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
      * 导入后即"候选就绪"，等用户点「立即替换」才在锁屏生效。
      */
     val parallaxPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia(),
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        contract = ImagePick.One(),
+    ) { r ->
+        val uri = ImagePick.consume(context, r).firstOrNull()
+            ?: return@rememberLauncherForActivityResult
         scope.launch {
             val cached = withContext(Dispatchers.IO) { MaskStore.cachePicked(context, uri) }
             if (cached == null) {
@@ -292,6 +294,7 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                     DetailPage.RasterWallpaper -> "光栅壁纸"
                     DetailPage.AliveWallpaper -> "Alive壁纸"
                     DetailPage.SystemUi -> "系统界面"
+                    DetailPage.Licenses -> "第三方许可证"
                 },
                 onBack = onClose,
                 onRestartAod = { askRestartAod = true },
@@ -366,6 +369,7 @@ internal fun MaskDetailScreen(page: DetailPage, onClose: () -> Unit) {
                     // 「Alive壁纸」（2026-11-07）：照片透镜「启航」，三态（AOD / 锁屏 / 桌面）。
                     DetailPage.AliveWallpaper -> AliveWallpaperDetail(state)
                     DetailPage.SystemUi -> SystemUiDetail(state)
+                    DetailPage.Licenses -> LicensesDetail()
                 }
             }
         }

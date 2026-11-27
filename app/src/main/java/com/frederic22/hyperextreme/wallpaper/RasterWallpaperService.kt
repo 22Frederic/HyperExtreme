@@ -245,6 +245,7 @@ class RasterWallpaperService : WallpaperService() {
                     1 -> "条纹玻璃"
                     2 -> "磨砂玻璃"
                     3 -> "条纹玻璃（扭曲变形）"
+                    4 -> "细线玻璃"
                     else -> "默认"
                 } + " 停顿时就近归位=${if (settle) 1 else 0}" +
                     " 左右镜像展示=${if (mirror) 1 else 0}（归位点 #$baseIndex）",
@@ -271,8 +272,8 @@ class RasterWallpaperService : WallpaperService() {
                 val resized = width != screenW || height != screenH
                 screenW = width
                 screenH = height
-                // 条纹周期按**屏宽等比**（19 px @1200）：与 hook 链同一口径，换个屏幕不会变粗。
-                stripePeriodPx = width * (RasterGlCore.STRIPE_PERIOD_PX_1200 / RasterGlCore.STRIPE_BASE_W)
+                // 条纹周期按**屏宽等比**（19 px @1200；细线玻璃 136.8 px）：与 hook 链同一口径。
+                stripePeriodPx = RasterGlCore.periodPxOf(style, width.toFloat())
                 frostCellPx = width * (RasterGlCore.FROST_CELL_PX_1200 / RasterGlCore.STRIPE_BASE_W)
                 log("surface ${width}x$height")
                 runCatching {
@@ -684,6 +685,7 @@ class RasterWallpaperService : WallpaperService() {
                         1 -> "条纹玻璃"
                         2 -> "磨砂玻璃"
                         3 -> "条纹玻璃（扭曲变形）"
+                        4 -> "细线玻璃"
                         else -> "默认"
                     },
                 )
@@ -967,7 +969,7 @@ class RasterWallpaperService : WallpaperService() {
             GLES20.glUniform4f(uToUv, uvT[0], uvT[1], uvT[2], uvT[3])
             // 系统壁纸服务链由**系统**做 AOD 压暗（setWallPaperAnimProcess），这里恒 1.0。
             GLES20.glUniform1f(uDim, 1f)
-            // 「过渡效果」四档：与 hook 链同一份 shader、同一套像素口径。
+            // 「过渡效果」五档：与 hook 链同一份 shader、同一套像素口径。
             val sp = RasterGlCore.paramsOf(style)
             GLES20.glUniform1f(uStyle, style.toFloat())
             GLES20.glUniform1f(uTransWidth, RasterGlCore.VIVO_TRANS_WIDTH)
@@ -977,7 +979,10 @@ class RasterWallpaperService : WallpaperService() {
             GLES20.glUniform1f(uRefractionScale, sp.refract)
             GLES20.glUniform1f(uDispersionFactor, sp.dispersion)
             GLES20.glUniform1f(uShadowStrength, sp.shadow)
-            GLES20.glUniform1f(uStripePeriodPx, stripePeriodPx.coerceAtLeast(1f))
+            GLES20.glUniform1f(
+                uStripePeriodPx,
+                RasterGlCore.periodPxOf(style, screenW.toFloat()).coerceAtLeast(1f),
+            )
             GLES20.glUniform1f(uFrostCellPx, frostCellPx.coerceAtLeast(0.5f))
             GLES20.glUniform1f(uScreenW, screenW.toFloat().coerceAtLeast(1f))
             GLES20.glUniform1f(uScreenH, screenH.toFloat().coerceAtLeast(1f))

@@ -274,7 +274,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
     var maxAngle by remember { mutableIntStateOf(prefs.rasterMaxAngle) }
     // 「停顿时就近归位」（默认开）：关掉后可以停在两张之间不动。
     var settle by remember { mutableStateOf(prefs.rasterSettle) }
-    // 「过渡效果」四档（0 默认 / 1 条纹玻璃 / 2 磨砂玻璃 / 3 条纹玻璃·扭曲）：擦除带里叠哪种玻璃。
+    // 「过渡效果」五档（0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲 / 4 细线）：擦除带里叠哪种玻璃。
     var transitionChoice by remember { mutableIntStateOf(prefs.rasterTransition) }
 
     // ───────────── 系统壁纸服务模式（2026-11-04）─────────────
@@ -800,7 +800,7 @@ internal fun RasterWallpaperDetail(state: MaskUiState) {
                 },
             )
             SwitchRow(
-                title = "启用光栅壁纸锁屏景深",
+                title = "光栅壁纸锁屏景深",
                 checked = lockDepth,
                 enabled = mountMode == RASTER_MOUNT_LSPOSED,
                 onCheckedChange = { on ->
@@ -1120,8 +1120,9 @@ private const val RASTER_MOUNT_SERVICE = MaskPrefs.RASTER_MOUNT_SERVICE
 /** 「光栅壁纸生效范围」的选项（锁屏 / 桌面 / 全局）。 */
 private val RASTER_SCOPE_LABELS = listOf("锁屏", "桌面", "全局")
 
-/** 「过渡效果」四档：0 默认 / 1 条纹 / 2 磨砂 / 3 条纹（扭曲变形）。 */
-private val RASTER_TRANSITION_LABELS = listOf("默认", "条纹玻璃", "磨砂玻璃", "条纹玻璃（扭曲变形）")
+/** 「过渡效果」五档：0 默认 / 1 条纹 / 2 磨砂 / 3 条纹（扭曲变形）/ 4 细线玻璃。 */
+private val RASTER_TRANSITION_LABELS =
+    listOf("默认", "条纹玻璃", "磨砂玻璃", "条纹玻璃（扭曲变形）", "细线玻璃")
 
 /** 取值 → 文案；越界时回退到默认档（锁屏），绝不抛。与空间壁纸页同名同语义。 */
 private fun scopeLabel(v: Int): String =

@@ -337,20 +337,15 @@ internal object SpatialForegroundHider {
             return
         }
         AliveOverlay.onDisabled()
-        val view = layer as View
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            view.visibility = View.INVISIBLE
-            logOnce()
-        } else {
-            mainHandler.post {
-                runCatching {
-                    if (view.visibility == View.VISIBLE) {
-                        view.visibility = View.INVISIBLE
-                        logOnce()
-                    }
-                }
-            }
-        }
+        // **无景深：不压整层**（2026-11-23，issue #6）。
+        //
+        // 从前这里把整层设 INVISIBLE，用来顺手藏掉「系统主体 + 色带 + 装饰」。但这一层是**公共的**：
+        // HyperMusicCover 在「保留壁纸」模式下把歌词层也挂在这里，一压就连歌词一起消失
+        // （用户 2026-11-23 复现：Alive 不开锁屏景深 ⇒ 歌词空、不滚动；开景深 ⇒ 正常）。
+        // 现在与「有景深」分支统一：只 `detachSystemSubject`（它记了 parent/index/visibility，
+        // `onDisabled` 时会插回），层可见性完全交还系统 —— 我们不额外设 VISIBLE / INVISIBLE。
+        val detached = SpatialOverlay.detachSystemSubject(layer)
+        if (detached) logOnceNoDepth() else logNotDepthLayer()
     }
 
     /** 反射取 `keyguardForegroundLayer`（层会被锁屏树重建，别缓存）。 */
@@ -438,9 +433,20 @@ internal object SpatialForegroundHider {
             .isInteractive
     }.getOrDefault(true)
 
-    private fun logOnce() {
-        if (logged.putIfAbsent("hidden", true) == null) {
-            log("锁屏景深关：景深前景层已撤（keyguard_foreground_layer → INVISIBLE）")
+    /** 无景深：已摘掉系统主体（层保持系统可见性）。 */
+    private fun logOnceNoDepth() {
+        if (logged.putIfAbsent("nodepth-detach", true) == null) {
+            log(
+                "无景深：已摘系统主体；前景层保持系统可见性" +
+                    "（不再压整层 —— 避免误伤 MC 歌词等第三方 View，issue #6）",
+            )
+        }
+    }
+
+    /** 无景深但这一层里没找到系统主体（不是景深层 / 已被别人处理）—— 只记一次。 */
+    private fun logNotDepthLayer() {
+        if (logged.putIfAbsent("nodepth-noop", true) == null) {
+            log("无景深：这一层里没有系统主体可摘，保持原样（不压整层）")
         }
     }
 

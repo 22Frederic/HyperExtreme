@@ -125,7 +125,7 @@ internal object RasterRenderer {
 
     /**
      * 本次运行的「过渡效果」（`RasterFlag.PROP_TRANSITION`）：0 默认 / 1 条纹 / 2 磨砂 / 3 扭曲 ——
-     * 2026-11-06 按 vivo 的 `styleId` 扩到四档。
+     * 2026-11-06 按 vivo 的 `styleId` 扩到四档；2026-11-26 加第 5 档「细线玻璃」。
      *
      * 2026-11-07 起运行中可由 [applyRealtime] 热更新（启动时仍读一次做基线）。
      */
@@ -137,11 +137,12 @@ internal object RasterRenderer {
     /** 磨砂颗粒（屏幕像素）= `screenW × 2/1200`。 */
     private var frostCellPx = 0f
 
-    /** 四档的中文名（日志用）。 */
+    /** 五档的中文名（日志用）。 */
     private fun styleLabel(): String = when (style) {
         RasterGlCore.STYLE_STRIPE -> "条纹玻璃"
         RasterGlCore.STYLE_FROST -> "磨砂玻璃"
         RasterGlCore.STYLE_TWIST -> "条纹玻璃（扭曲变形）"
+        RasterGlCore.STYLE_FINE -> "细线玻璃"
         else -> "默认"
     }
 
@@ -336,6 +337,9 @@ internal object RasterRenderer {
 
     private const val FADE_MS = 380f
 
+    /** **仅锁屏档**解锁时的淡出时长（2026-11-26）：260ms，落在「MC 让路 150ms」与「[FADE_MS] 380ms」之间。 */
+    private const val UNLOCK_FADE_MS = 260f
+
     /**
      * **探测窗口**（2026-11-15）：解锁后这段时间先只看「系统壁纸真值」有没有下降，不动 alpha。
      *
@@ -416,6 +420,23 @@ internal object RasterRenderer {
      * 能透出来，而系统切 leash 那一帧桌面份就是最新内容。
      */
     @Volatile private var mirrorToDesk = false
+
+    /**
+     * 仅锁屏档解锁时的淡出 tick（2026-11-26）。
+     *
+     * 独立槽位，**不共用** `musicFadeTick`（MC 让路）—— 两边会互相 `removeCallbacks`。
+     * 回锁屏 / AOD 抬 alpha 前必须由 [cancelUnlockFade] 掐掉。
+     */
+    private var unlockFadeTick: Runnable? = null
+
+    /**
+     * **应用时因为「当前在桌面」而把锁屏份隐掉了**（2026-11-26）。
+     *
+     * 只有「仅锁屏档 + 当前桌面」会在挂载后 `applyAlphaTo(lockScs, 0f)`；那一下不是淡出、
+     * 不设 `fadeDoneAt`，所以第一次进锁屏时可能被复位闸挡住 ⇒ 背景停在 0、只剩前景主体。
+     * 这个标记让那次复位可以绕过闸门。
+     */
+    @Volatile private var lockHiddenForDesktop = false
 
     /**
      * **过渡期冻结**（与 `SpatialRenderer.transitionFrozen` 同义）。
@@ -566,6 +587,8 @@ internal object RasterRenderer {
         showingDesktop = readShowingDesktop(ctx)
         sharedLeash = false
         desktopOnlyShared = false
+        // 每次重建都从「没隐过」开始（2026-11-26），避免上次应用时的标记残留。
+        lockHiddenForDesktop = false
         deskOnlyAlpha = -1f
         unfreezeTransition()
         fadeDoneAt = 0L
@@ -614,9 +637,9 @@ internal object RasterRenderer {
         // 「过渡效果」：同样只读一次；属性没写 / 非法按 0（= 加这个选项之前的行为）。
         style = HookRuntime.systemProperty(
             com.frederic22.hyperextreme.data.RasterFlag.PROP_TRANSITION,
-        ).trim().toIntOrNull()?.coerceIn(0, 3) ?: 0
-        // 周期 / 颗粒都按**屏宽等比**（19px、2px @1200）。像素口径 ⇒ AOD 的 5% 缩放不会变形。
-        stripePeriodPx = screenW * (RasterGlCore.STRIPE_PERIOD_PX_1200 / RasterGlCore.STRIPE_BASE_W)
+        ).trim().toIntOrNull()?.coerceIn(0, RasterGlCore.STYLE_FINE) ?: 0
+        // 周期 / 颗粒都按**屏宽等比**（19px、2px @1200；细线玻璃 136.8px）。像素口径 ⇒ AOD 的 5% 缩放不会变形。
+        stripePeriodPx = RasterGlCore.periodPxOf(style, screenW.toFloat())
         frostCellPx = screenW * (RasterGlCore.FROST_CELL_PX_1200 / RasterGlCore.STRIPE_BASE_W)
         HookRuntime.log(
             "RASTER 过渡效果=${styleLabel()}" +
@@ -733,6 +756,17 @@ internal object RasterRenderer {
                     "按锁屏态设 alpha（当前=${if (showingDesktop) "桌面 1.0" else "锁屏 0.0"}）",
             )
             setDeskOnlyAlpha(if (showingDesktop) 1f else 0f, force = true)
+        }
+        // **仅锁屏档 + 当前在桌面**（2026-11-26 用户报）：壁纸相同 + 未开景深时系统只有一条 leash，
+        // 桌面复用的是锁屏那条 ⇒ 刚「立即替换」回到桌面就直接看到我们的图。这里按挂载时的显示态先隐掉。
+        // ⚠️ 判据用 **scope**（不能用 `mounts` 形态：全局档共用 leash 时会退化）。
+        // ⚠️ 背景 SC 与前景主体是两套通道：`RasterOverlay` 是系统前景层的 View，`applyAlphaTo` 管不到
+        // ⇒ 必须单独 `fadeOutOnUnlock()`，否则第一次进锁屏只剩主体。
+        if (scope == MaskPrefs.SPATIAL_SCOPE_LOCK && showingDesktop) {
+            HookRuntime.log("RASTER 仅锁屏档：当前在桌面 → 锁屏份 + 前景主体一起隐（回锁屏再抬）")
+            forceSetAlpha(lockScs, 0f)
+            RasterOverlay.fadeOutOnUnlock()
+            lockHiddenForDesktop = true
         }
         if (kept.size != mounts.size && kept.isNotEmpty()) {
             val drop = mounts.filter { it !in kept }
@@ -1203,7 +1237,7 @@ internal object RasterRenderer {
         handler?.post {
             if (runningKey == null) return@post
             if (newStyle == style && newSettle == settleOnIdle) return@post
-            style = newStyle.coerceIn(0, 3)
+            style = newStyle.coerceIn(0, RasterGlCore.STYLE_FINE)
             settleOnIdle = newSettle
             HookRuntime.log(
                 "RASTER 参数热更新：过渡效果=${styleLabel()}" +
@@ -1502,6 +1536,24 @@ internal object RasterRenderer {
             // **景深主体同步退场**（2026-11-04）：它是窗口内的 View，系统那 200ms 的
             // self-blur ramp 照样糊到它 ⇒ 任何时候都要退（必须在 sharedLeash 之前）。
             runCatching { RasterOverlay.fadeOutOnUnlock() }
+            // **仅锁屏档**（没有任何桌面份）：镜像没有意义 —— 没有第二份可画。
+            // 系统那套淡出只作用于 miwallpaper 自己的 Surface，我们是 leash 的兄弟 ⇒
+            // 会一直不透明到 leash 消失 = 硬切（用户 2026-11-26 报「进桌面没有过渡、
+            // 半秒内硬切」；壁纸相同时那条 leash 就是桌面层，桌面一直显示）。
+            // 判据用 **scope**，不是 `mounts` 的形态（2026-11-26 修）：全局档在「壁纸相同 + 未开景深」
+            // 时会被共用 leash 降级成只剩锁屏份，用形态判断会误伤它的桌面份。
+            if (runningScope == MaskPrefs.SPATIAL_SCOPE_LOCK) {
+                showingDesktop = true
+                mirrorToDesk = false
+                // 解锁后不需要「应用时隐过」这条复位了（2026-11-26），避免标记残留。
+                lockHiddenForDesktop = false
+                HookRuntime.log(
+                    "RASTER 解锁：仅锁屏档 → " + UNLOCK_FADE_MS +
+                        "ms 淡出锁屏份（无桌面份可镜像）",
+                )
+                fadeOutLockedForUnlock()
+                return@post
+            }
             // **共用一条 leash ⇒ 不动任何东西**：它解锁后还要当桌面壁纸用。
             if (sharedLeash) {
                 HookRuntime.log("RASTER 解锁 跳过（共用一条 leash，交给系统连续过渡）")
@@ -1567,6 +1619,32 @@ internal object RasterRenderer {
 
     private fun requestRaiseLocked(h: Handler) {
         if (runningKey == null) return
+        // 回锁屏复位：先掐掉仅锁屏档的解锁淡出（2026-11-26），否则它会继续把 alpha 拉回 0。
+        cancelUnlockFade()
+        // **应用时隐过锁屏份 ⇒ 这一次绕过所有闸抬回**（2026-11-26）：那一下是 `applyAlphaTo(0f)`
+        // 硬设、没有 `fadeDoneAt`，正常路径可能被灭屏闸/幂等挡掉 ⇒ 背景停在 0、只剩主体。
+        if (lockHiddenForDesktop) {
+            fadeDoneAt = 0L
+            pendingRaise = false
+            // 强制通道：现场证明 `applyAlphaTo` 会因 `currentAlpha` 脱节而早退（SC 停在 0）。
+            forceSetAlpha(lockScs, 1f)
+            RasterOverlay.resetAlpha()
+            // ⚠️ **灭屏态不能消耗标记**（2026-11-26 真机）：那时 `forceDraw` 会阻塞，只能抬 alpha；
+            // 若这里就清标记，亮屏进锁屏时 `currentAlpha` 已是 1 ⇒ 正常路径不补帧
+            // ⇒「alpha 1 + 空 buffer」⇒ 只看得见前景主体。
+            if (screenOn()) {
+                lockHiddenForDesktop = false
+                forceDraw()
+                HookRuntime.log(
+                    "RASTER 复位：应用时隐过锁屏份 → 抬回 1.0 + 补帧" +
+                        "（alpha=%.2f scs=${lockScs.size} frozen=$aodFrozen）"
+                            .format(currentAlpha),
+                )
+            } else {
+                HookRuntime.log("RASTER 复位：灭屏态只抬 alpha，标记保留、补帧等亮屏")
+            }
+            return
+        }
         // **AOD 里没有「锁屏界面」**（v1.20.5，2026-11-07）：这里同时是「锁存泵 ~817ms 落地」
         // 和「亮屏兜底」的必经之路。AOD 期间到达的复位只允许抬 GL 份（AOD 显示的就是它），
         // **绝不能碰景深主体** —— 主体由 `RasterOverlay.onEnterAod()` 淡到 0，被这里一拉就
@@ -1621,6 +1699,10 @@ internal object RasterRenderer {
             applyAlphaTo(scs, 1f)
             // 复位只写了 alpha，内容还是淡出前那一帧 ⇒ 必须重画（否则锁屏静止时永远是旧图）。
             forceDraw()
+        } else if (!showingDesktop && screenOn()) {
+            // **alpha 本来就是 1 也要补一帧**（2026-11-26）：应用时隐过、灭屏那趟只抬了 alpha，
+            // buffer 可能还是空的。只在锁屏态补（桌面态对不可见的锁屏 leash swap 会阻塞）。
+            forceDraw()
         }
     }
 
@@ -1640,6 +1722,8 @@ internal object RasterRenderer {
         // 正在跑淡出就先掐掉：它的 tick 每 16ms 用**自己记的** lastA 覆写 alpha，
         // 不掐的话我们抬到 1 会被下一帧拉回去（AOD 里 = 继续露系统壁纸）。
         cancelFade()
+        // 仅锁屏档的解锁淡出是另一条通道，同样要掐（2026-11-26）。
+        cancelUnlockFade()
         // 淡出是在 `fadeOutOnUnlock` 里 `freezeTransition()` 开的、跑完才解 —— 半路掐掉就
         // 永远停着，接下来 2s 的所有重绘都被闸掉（屏上停在旧帧）。必须在这里解（v1.20.6）。
         unfreezeTransition()
@@ -1753,9 +1837,36 @@ internal object RasterRenderer {
             handler?.let { scheduleRaisePump(it, 16L) }
             return
         }
-        if (target2 == currentAlpha) return
+        // 诊断（2026-11-26）：端点值（≈0 / ≈1）必须留痕 —— 现场 SF 里 `he-raster-lock` 的
+        // alpha 是 0，而软件 `currentAlpha` 是 1.00，两者脱节。这条日志能区分三种可能：
+        // 「没打 ⇒ a == currentAlpha 早退」「打 0→1 但 SF 仍 0 ⇒ sc 是死对象 / 事务没生效」
+        // 「打 1→1 ⇒ musicYielded 把目标压回」。只打端点，不刷屏。
+        if (target2 == currentAlpha) {
+            if ((target2 < 0.01f || target2 > 0.99f) && musicYielded) {
+                HookRuntime.log(
+                    "RASTER 设 alpha 被 MC 让路压回（目标 %.2f，当前 %.2f）"
+                        .format(target2, currentAlpha),
+                )
+            }
+            return
+        }
+        if (target2 < 0.01f || target2 > 0.99f) {
+            HookRuntime.log(
+                "RASTER 设 alpha：%.2f → %.2f（scs=${scs.size} musicYielded=$musicYielded）"
+                    .format(currentAlpha, target2),
+            )
+        }
         runCatching {
-            val t = txAlpha ?: return
+            // 诊断（2026-11-26）：`txAlpha` 没就绪时原来是**静默 return**，
+            // 结果「设 0 没生效 / 抬 1 没生效」都查不出来。必须留痕。
+            val t = txAlpha
+            if (t == null) {
+                HookRuntime.log(
+                    "RASTER 设 alpha 跳过：txAlpha 未就绪（目标 " +
+                        "%.2f，当前 %.2f）".format(target2, currentAlpha),
+                )
+                return
+            }
             val tx = t.first.getConstructor().newInstance()
             scs.forEach { t.second.invoke(tx, it, target2) }
             t.third.invoke(tx)
@@ -1830,6 +1941,67 @@ internal object RasterRenderer {
         }
         musicFadeTick = r
         handler?.post(r)
+    }
+
+    /**
+     * **仅锁屏档解锁时的淡出**（2026-11-26）。只作用于 [lockScs]，走独立 tick。
+     *
+     * 镜像双画是给"两份都在"的全局档准备的；只有锁屏份时镜像没有对象，
+     * 而系统自己的淡出只作用于 miwallpaper 的 Surface ⇒ 不淡就是硬切。
+     */
+    private fun fadeOutLockedForUnlock() {
+        val h = ensureHandler()
+        cancelUnlockFade()
+        val from = currentAlpha
+        if (from <= 0.001f) return
+        val t0 = SystemClock.elapsedRealtime()
+        val r = object : Runnable {
+            override fun run() {
+                val p = ((SystemClock.elapsedRealtime() - t0).toFloat() / UNLOCK_FADE_MS)
+                    .coerceIn(0f, 1f)
+                applyAlphaTo(lockScs, from * (1f - p))
+                if (p < 1f) {
+                    h.postDelayed(this, 16L)
+                } else {
+                    unlockFadeTick = null
+                }
+            }
+        }
+        unlockFadeTick = r
+        h.post(r)
+    }
+
+    /** 掐掉解锁淡出（回锁屏 / AOD 抬 alpha 之前必须调，否则它会把 alpha 又拉回 0）。 */
+    private fun cancelUnlockFade() {
+        unlockFadeTick?.let { ensureHandler().removeCallbacks(it) }
+        unlockFadeTick = null
+    }
+
+    /**
+     * **强制设 alpha，绕过 [currentAlpha] 幂等**（2026-11-26）。
+     *
+     * 现场证据：`复位…（alpha=1.00）` 那行出现时**没有**对应的 `设 alpha` 日志，
+     * 而 SF 里 `he-raster-lock` 是 `a:0` —— `currentAlpha` 被渲染器重建/多次应用带回 1，
+     * SC 实际却停在 0，`applyAlphaTo` 的 `if (target2 == currentAlpha) return` 直接早退，
+     * 从此再也抬不回来（「第一次进锁屏只有主体」的根因）。
+     *
+     * 这条通道不查 `currentAlpha`、也不走 MC 让路门 —— 只给「应用时隐藏 / 进锁屏抬回」
+     * 这两个状态切换点用。
+     */
+    private fun forceSetAlpha(scs: List<android.view.SurfaceControl>, a: Float) {
+        if (scs.isEmpty()) return
+        runCatching {
+            val t = txAlpha ?: return
+            val tx = t.first.getConstructor().newInstance()
+            scs.forEach { t.second.invoke(tx, it, a) }
+            t.third.invoke(tx)
+            currentAlpha = a
+            HookRuntime.log(
+                "RASTER 强制设 alpha：→ %.2f（scs=${scs.size}）".format(a),
+            )
+        }.onFailure {
+            HookRuntime.log("RASTER 强制设 alpha 失败：${it.javaClass.simpleName}: ${it.message}")
+        }
     }
 
     /**
@@ -1977,9 +2149,18 @@ internal object RasterRenderer {
 
     /** 画指定的一份（返回是否成功；失败计入 [swapErrors]）。 */
     private fun drawMount(m: Mount): Boolean {
-        val d = display ?: return false
-        val c = context ?: return false
-        val es = m.eglSurface ?: return false
+        // 诊断（2026-11-26）：原来的三个 `?: return false` 是**静默**的，日志里只看到
+        // 「切换补帧 耗时 1ms」却不知道为什么。这里留痕（只在缺件时打，不刷屏）。
+        val d = display
+        val c = context
+        val es = m.eglSurface
+        if (d == null || c == null || es == null) {
+            HookRuntime.log(
+                "RASTER 空绘制：display=${d != null} context=${c != null} " +
+                    "eglSurface=${es != null}（locked=${m.locked}）",
+            )
+            return false
+        }
         val t0 = SystemClock.elapsedRealtime()
         if (!EGL14.eglMakeCurrent(d, es, es, c)) {
             swapErrors++
@@ -2102,8 +2283,9 @@ internal object RasterRenderer {
         GLES20.glUniform4f(uFromUv, uvF[0], uvF[1], uvF[2], uvF[3])
         GLES20.glUniform4f(uToUv, uvT[0], uvT[1], uvT[2], uvT[3])
         GLES20.glUniform1f(uDim, dim)
-        // 「过渡效果」四档：两条链共用同一份 shader ⇒ 参数含义唯一。
+        // 「过渡效果」五档：两条链共用同一份 shader ⇒ 参数含义唯一。
         // 周期 / 颗粒 / 屏宽都按像素传，shader 里不用 uv（AOD 的 5% leash 缩放不影响条纹粗细）。
+        // ⚠️ 周期按**当前 style** 现算：细线玻璃是 136.8px@1200，其余四档 19px。
         val sp = RasterGlCore.paramsOf(style)
         GLES20.glUniform1f(uStyle, style.toFloat())
         GLES20.glUniform1f(uTransWidth, RasterGlCore.VIVO_TRANS_WIDTH)
@@ -2113,7 +2295,10 @@ internal object RasterRenderer {
         GLES20.glUniform1f(uRefractionScale, sp.refract)
         GLES20.glUniform1f(uDispersionFactor, sp.dispersion)
         GLES20.glUniform1f(uShadowStrength, sp.shadow)
-        GLES20.glUniform1f(uStripePeriodPx, stripePeriodPx.coerceAtLeast(1f))
+        GLES20.glUniform1f(
+            uStripePeriodPx,
+            RasterGlCore.periodPxOf(style, screenW.toFloat()).coerceAtLeast(1f),
+        )
         GLES20.glUniform1f(uFrostCellPx, frostCellPx.coerceAtLeast(0.5f))
         GLES20.glUniform1f(uScreenW, screenW.toFloat().coerceAtLeast(1f))
         GLES20.glUniform1f(uScreenH, screenH.toFloat().coerceAtLeast(1f))
@@ -2155,7 +2340,9 @@ internal object RasterRenderer {
         val tex = upload(bmp)
         val bw = bmp.width
         val bh = bmp.height
-        bmp.recycle()
+        // 2026-11-26：**不再回收** —— 锁屏景深层（[RasterOverlay]）的色散要拿它当 RGB 源。
+        // 纹理已经复制进 GPU，这份 CPU 副本只服务 AGSL；池的淘汰见 [putPreloaded]。
+        putPreloaded(index, bmp)
         // cover 已经在 [loadBitmap] 里**按 CPU 裁好**了 ⇒ 纹理就是屏幕尺寸，uv 恒等。
         // （shader 里的 uFromUv/uToUv 留着给将来做缩放动画，现在恒等。）
         slotUv[target] = floatArrayOf(1f, 1f, 0f, 0f)
@@ -2244,20 +2431,42 @@ internal object RasterRenderer {
     }
 
     /**
-     * 只保留最近 **4** 张（2026-11-13 从 2 扩上来：预取 ±2），多的立刻回收。
+     * 只保留最近 **4** 张（2026-11-13 从 2 扩上来：预取 ±2），多的回收。
      *
      * 每张 = 屏幕尺寸的 ARGB_8888，本机 1200×2670 ≈ 12.8MB ⇒ 上限约 51MB。
-     * 只在 SystemUI 里短暂持有，转过去就 upload 完回收。
+     * 2026-11-26 起**不再「upload 完就回收」**：锁屏景深层的色散要拿同一份 Bitmap 当 RGB 源，
+     * 删掉 recycle 等于零重复解码、零重复存储。正在被采样的序号由 [pinBitmap] 保护。
      */
     private fun putPreloaded(index: Int, bmp: Bitmap) {
         preloaded[index] = bmp
         if (preloaded.size > PRELOAD_KEEP) {
             for (k in preloaded.keys.toList()) {
                 if (preloaded.size <= PRELOAD_KEEP) break
-                if (k != index) preloaded.remove(k)?.recycle()
+                // pinned = 景深层正在采样（`BitmapShader` 指着它），recycle 会让当帧空白。
+                if (k != index && k !in pinned) preloaded.remove(k)?.recycle()
             }
         }
     }
+
+    /** 景深层正在用的序号（`from` / `to`）—— 淘汰时必须跳过。 */
+    private val pinned = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+
+    internal fun pinBitmap(index: Int) {
+        if (index >= 0) pinned.add(index)
+    }
+
+    internal fun unpinBitmap(index: Int) {
+        if (index >= 0) pinned.remove(index)
+    }
+
+    /**
+     * 给锁屏景深层当 **RGB 源**用的位图（与 GL 纹理同一份，屏幕尺寸、cover 已裁好）。
+     *
+     * 2026-11-26：主体只保留 alpha（`ALPHA_8`），色散的 RGB 全部从这里取 —— 省的是一份
+     * 「内容完全相同」的重复解码与 12.8MB/张。返回 null 表示还没加载好，上层应跳过这一帧。
+     */
+    internal fun sharedBitmap(index: Int): Bitmap? =
+        preloaded[index]?.takeIf { !it.isRecycled }
 
     private fun clearPreloaded() {
         for (b in preloaded.values) runCatching { b.recycle() }

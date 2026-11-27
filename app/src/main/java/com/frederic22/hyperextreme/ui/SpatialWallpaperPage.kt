@@ -125,7 +125,7 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     var shortSide by remember { mutableStateOf(prefs.spatialShortSide) }
     // 「空间壁纸生效范围」：0 锁屏（默认）/ 1 桌面 / 2 全局。**不影响层图生成**，只决定渲染器挂哪条 leash。
     var scopeChoice by remember { mutableStateOf(prefs.spatialScope) }
-    // 「启用空间壁纸锁屏景深」（2026-10-29）：默认关；关时渲染逻辑与加它之前完全一致。
+    // 「空间壁纸锁屏景深」（2026-10-29）：默认关；关时渲染逻辑与加它之前完全一致。
     // 生效时机与上面的「生效范围」一样 —— 生效中改只记下来，下一次替换才随属性一起推。
     var lockDepthChoice by remember { mutableStateOf(prefs.spatialLockDepth) }
 
@@ -434,9 +434,10 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
     ) { reload++ }
 
     val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia(),
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        ImagePick.One(),
+    ) { r ->
+        val uri = ImagePick.consume(ctx, r).firstOrNull()
+            ?: return@rememberLauncherForActivityResult
         scope.launch {
             // 算 key + 把**原图原始字节**拷进缓存目录（不重编码、不缩放）。
             val k = withContext(Dispatchers.IO) {
@@ -667,13 +668,17 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                     // 没选中 / 正在推理 / 生效中（会覆盖正在渲染的层图）⇒ 不可点。
                     // **判据与可点性保持原样**，这次只改配色。
                     enabled = selected != null && !busy && !locked,
-                    // 与光栅浮页的「计算选中景深」**完全同一个形态**（用户 2026-11-04）：
-                    // 只给常态的「正常底 + 主体字」，**禁用时的字色完全交给 miuix 默认**。
-                    // 于是「新建页（没选中）」与「生成中（busy）」这两种不可点状态会自动置灰，
-                    // 不需要自己判断是哪种禁用 —— 也不该自己传 disabledContentColor。
+                    // **改用主题色**（2026-11-23 用户定）。原来是 `surfaceContainerHigh` 灰底 +
+                    // primary 字，但 0.9.5 适配把页面 `surface` 改成 #F3F3F3 之后，禁用态的
+                    // 默认 `disabledSecondaryVariant` ≈ #EDEDED，与页面只差 6 级 ⇒ 按钮完全
+                    // 看不见（用户截图：生成深度缓存 / 处理中 与背景融为一体）。
+                    // 现在：常态 primary 底 + onPrimary 字；禁用态 30% 的 primary（淡蓝），
+                    // 既保留「不可点」的视觉暗示，也不会和背景融为一体。
                     colors = ButtonDefaults.buttonColors(
-                        color = MiuixTheme.colorScheme.surfaceContainerHigh,
-                        contentColor = MiuixTheme.colorScheme.primary,
+                        color = MiuixTheme.colorScheme.primary,
+                        contentColor = MiuixTheme.colorScheme.onPrimary,
+                        disabledColor = MiuixTheme.colorScheme.primary.copy(alpha = 0.3f),
+                        disabledContentColor = MiuixTheme.colorScheme.onPrimary.copy(alpha = 0.7f),
                     ),
                 ) {
                     Text(
@@ -775,7 +780,13 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                             isActive -> {
                                 SpatialControl.disable(ctx)
                                 activeKey = ""
-                                reload++
+                                // **不 reload**（2026-11-23 用户报）：`应用` 时
+                                // `enableSpatialNow` 已把 key 写进 `spatialCandidateOrder` 第一位
+                                // （「应用即置顶」，但那一刻刻意不重排）；取消后再重扫等于让
+                                // 新 order 立刻生效 ⇒ 卡片从原位跳到第一个。
+                                // 这里只清 `activeKey`：卡片上的「已应用」标记与按钮文案都按
+                                // `inUseKey` 算，会自动刷新；列表保持原位。
+                                // 「下次进页面置顶」仍由进入时的 `LaunchedEffect(reload)` 完成。
                             }
                             else -> {
                                 // 激活保险：未激活时点「应用」只会静默失败。
@@ -886,13 +897,13 @@ internal fun SpatialWallpaperDetail(state: MaskUiState) {
                     }
                 },
             )
-            // 「启用空间壁纸锁屏景深」（2026-10-29 用户要求，**排在「生效范围」下面**）：
+            // 「空间壁纸锁屏景深」（2026-10-29 用户要求，**排在「生效范围」下面**）：
             // 开 = 主体层再画一份进 SystemUI 窗口的 keyguard_foreground_layer，压在锁屏时钟之上；
             // **无 summary**（用户指定）；默认关；关时渲染逻辑与加它之前完全一致。
             // 生效时机同「生效范围」：生效中改只写 prefs，下一次替换才随属性推送 —— 同一条 toast。
             // 「生效范围 = 桌面」时它没有作用对象（桌面没有时钟），按用户要求**照常可点、静默无效果**。
             SwitchRow(
-                title = "启用空间壁纸锁屏景深",
+                title = "空间壁纸锁屏景深",
                 checked = lockDepthChoice,
                 // 系统壁纸服务模式下**不可用**（那是 hook 链的能力）⇒ 变灰，值保留
                 enabled = mountMode == MaskPrefs.SPATIAL_MOUNT_LSPOSED,

@@ -177,7 +177,7 @@ internal object LockScreenButton {
     private var cachedSwitchAt = 0L
 
     /**
-     * 「详细过程写入LSPosed日志」。
+     * 「详细LSPosed日志」（开关名，2026-11-27 改名）。
      *
      * 自己缓存一份而不复用 `HookRuntime.vlog`：那个用的是 aod 侧的配置快照，而本进程（SystemUI）
      * 从不调用 `HookRuntime.config()`，那个字段永远是 null —— 直接用它这里的日志根本不会输出。
